@@ -31,6 +31,15 @@ A remote desktop application with UltraViewer/AnyDesk-like interface, designed f
 - Custom password option
 - Password refresh button
 
+
+## Build Environment
+
+- Windows 2000 DDK (Driver Development Kit)
+- Windows 2000 SDK (Software Development Kit)
+- Microsoft Visual C++ (cl.exe) from DDK
+- Standard C (C89/C90) language
+
+> **Note:** The build uses `build.bat` (Windows batch) and does not require a Makefile. All code is written in portable C for Windows 2000.
 ## Building
 
 ### Requirements
