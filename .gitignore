@@ -1,0 +1,15 @@
+# Build artifacts
+*.obj
+*.exe
+*.pdb
+*.ilk
+
+# Windows shortcuts
+*.lnk
+
+# VS Code
+.vscode/
+
+# Backup files
+*.bak
+*~
