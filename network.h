@@ -17,6 +17,8 @@ typedef struct _RD2K_NETWORK {
     DWORD       recvBufferSize;
     BYTE       *sendBuffer;
     DWORD       sendBufferSize;
+    BOOL        bRelayMode;     /* TRUE if connected through relay server */
+    SOCKET      relaySocket;    /* Socket to relay server (if relay mode) */
 } RD2K_NETWORK, *PRD2K_NETWORK;
 
 PRD2K_NETWORK Network_Create(WORD port);

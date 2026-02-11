@@ -16,6 +16,7 @@
 #include "clipboard.h"
 #include "filetransfer.h"
 #include "progress.h"
+#include "relay.h"
 #include <commctrl.h>
 #include <commdlg.h>
 #include <windowsx.h>
@@ -44,6 +45,8 @@
 #define IDC_SET_PWD_BTN         109
 #define IDC_AUTOSTART_CHK       110
 #define IDC_PREVENT_SLEEP_CHK   111
+#define IDC_LEFT_HEADER         112   /* Allow Remote Control header */
+#define IDC_LEFT_INSTR          113   /* Left panel instructions */
 
 /* Control IDs - Right Panel (Control Remote Computer) */
 #define IDC_RIGHT_PANEL         200
@@ -52,6 +55,21 @@
 #define IDC_PARTNER_PWD_LABEL   203
 #define IDC_PARTNER_PWD         204
 #define IDC_CONNECT_BTN         205
+#define IDC_TAB_CTRL            206
+
+/* Control IDs - Server Config Tab (Relay Connect) */
+#define IDC_SERVER_IP_LABEL     210
+#define IDC_SERVER_IP           211
+#define IDC_SERVER_PORT_LABEL   212
+#define IDC_SERVER_PORT         213
+#define IDC_RELAY_PARTNER_ID_LABEL  216
+#define IDC_RELAY_PARTNER_ID    217
+#define IDC_RELAY_PARTNER_PWD_LABEL 218
+#define IDC_RELAY_PARTNER_PWD   219
+#define IDC_RELAY_CONNECT_SVR_BTN   220   /* Step 1: Connect to server */
+#define IDC_RELAY_CONNECT_PARTNER_BTN 221 /* Step 2: Connect to partner */
+#define IDC_INSTR_TAB1              222   /* Instruction for Direct Connect tab */
+#define IDC_INSTR_TAB2              223   /* Instruction for Server tab */
 
 /* Status and Menu */
 #define IDC_STATUSBAR           300
@@ -89,6 +107,7 @@
 #define TIMER_LISTEN_CHECK      4
 #define TIMER_TOOLBAR_HIDE      5
 #define TIMER_CLIPBOARD_REQUEST 6
+#define TIMER_RELAY_CHECK       7
 
 /* Intervals */
 #define NETWORK_INTERVAL        10
@@ -96,9 +115,10 @@
 #define PING_INTERVAL           5000
 #define LISTEN_CHECK_INTERVAL   100
 #define TOOLBAR_HIDE_DELAY      3000
+#define RELAY_CHECK_INTERVAL    3000  /* Check relay connection every 3 seconds */
 
 /* Colors */
-#define COLOR_PANEL_BG          RGB(240, 248, 255)  /* AliceBlue */
+#define COLOR_PANEL_BG          GetSysColor(COLOR_INFOBK)  /* Windows classic InfoBackground */
 #define COLOR_HEADER_BG         RGB(100, 149, 237)  /* CornflowerBlue */
 #define COLOR_HEADER_TEXT       RGB(255, 255, 255)
 #define COLOR_ID_BG             RGB(255, 255, 255)
@@ -128,10 +148,29 @@ static HWND             g_hRefreshPwdBtn = NULL;
 static HWND             g_hCustomPwd = NULL;
 static HWND             g_hSetPwdBtn = NULL;
 
-/* Right Panel Controls */
+/* Right Panel Controls - Tab 1: Control Remote */
 static HWND             g_hPartnerId = NULL;
 static HWND             g_hPartnerPwd = NULL;
 static HWND             g_hConnectBtn = NULL;
+
+/* Right Panel Controls - Tab Control */
+static HWND             g_hTabCtrl = NULL;
+static int              g_nCurrentTab = 0;
+
+/* Right Panel Controls - Tab 2: Relay Connect */
+static HWND             g_hRelayPartnerId = NULL;   /* Partner ID for relay connection */
+static HWND             g_hRelayPartnerPwd = NULL;  /* Password for relay connection */
+static HWND             g_hServerIp = NULL;          /* Relay server IP */
+static HWND             g_hServerPort = NULL;        /* Relay server port */
+static HWND             g_hRelayConnectSvrBtn = NULL;  /* Step 1: Connect to server */
+static HWND             g_hRelayConnectPartnerBtn = NULL; /* Step 2: Connect to partner */
+static BOOL             g_bConnectedToRelay = FALSE;  /* TRUE when registered with relay */
+
+/* Relay connection settings (address of external relay server to connect TO) */
+static char             g_szRelayServerIp[64] = "";  /* IP of relay server to connect to */
+static WORD             g_wRelayServerPort = 5900;   /* Port of relay server */
+static SOCKET           g_relaySocket = INVALID_SOCKET;
+static CRITICAL_SECTION g_csRelay;
 
 /* Connection State */
 static DWORD            g_myId = 0;
@@ -177,6 +216,9 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK ViewerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK ToolbarWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 void CreateMainControls(HWND hwnd);
+void SwitchTab(int tabIndex);
+void ConnectToRelayServer(void);
+void ConnectToPartnerViaRelay(void);
 void UpdateStatusBar(const char *text, BOOL connected);
 void StartServer(void);
 void StopServer(void);
@@ -211,6 +253,20 @@ void ShowFullscreenToolbar(void);
 void HideFullscreenToolbar(void);
 void CheckClipboardAndSync(void);
 
+/* Reconnection state */
+static BOOL             g_bReconnecting = FALSE;
+static int              g_nReconnectAttempt = 0;
+static HWND             g_hReconnectDlg = NULL;
+static DWORD            g_dwLastPartnerId = 0;
+static DWORD            g_dwLastPartnerPwd = 0;
+
+/* Reconnection function prototypes */
+void HandleRelayServerLost(void);
+void HandlePartnerDisconnect(BOOL isServerSide);
+BOOL AttemptRelayReconnection(void);
+INT_PTR CALLBACK ReconnectDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+void DisconnectFromRelayServer(BOOL silent);
+
 /* Entry Point */
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                    LPSTR lpCmdLine, int nCmdShow)
@@ -230,6 +286,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Initialize crypto module for secure ID encoding */
     Crypto_Init(NULL);
     
+    /* Initialize relay critical section for thread safety */
+    InitializeCriticalSection(&g_csRelay);
+    
     /* Initialize common controls */
     icc.dwSize = sizeof(icc);
     icc.dwICC = ICC_WIN95_CLASSES | ICC_BAR_CLASSES;
@@ -246,8 +305,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                               DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, "Tahoma");
     
-    /* Create brushes */
-    g_hBrushPanel = CreateSolidBrush(COLOR_PANEL_BG);
+    /* Create brushes - use system color brush for proper matching */
+    g_hBrushPanel = GetSysColorBrush(COLOR_INFOBK);
     g_hBrushHeader = CreateSolidBrush(COLOR_HEADER_BG);
     
     /* Generate ID and password */
@@ -321,10 +380,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     Clipboard_Cleanup();
     Crypto_Cleanup();
     
+    /* Cleanup relay resources */
+    if (g_relaySocket != INVALID_SOCKET) {
+        closesocket(g_relaySocket);
+        g_relaySocket = INVALID_SOCKET;
+    }
+    DeleteCriticalSection(&g_csRelay);
+    
     DeleteObject(g_hFontNormal);
     DeleteObject(g_hFontBold);
     DeleteObject(g_hFontLarge);
-    DeleteObject(g_hBrushPanel);
+    /* Note: g_hBrushPanel is a system brush - do not delete */
     DeleteObject(g_hBrushHeader);
     
     CleanupNetwork();
@@ -339,19 +405,29 @@ void CreateMainControls(HWND hwnd)
     int panelWidth = 295;
     int leftX = 10, rightX = 320;
     int y;
+    HWND hLeftPanel;
+
+    /* Create left panel background */
+    hLeftPanel = CreateWindowExA(0, "STATIC", "",
+        WS_CHILD | WS_VISIBLE,
+        leftX, 10, panelWidth, MAIN_HEIGHT - 40,
+        hwnd, (HMENU)IDC_LEFT_PANEL, g_hInstance, NULL);
     
+    /* Suppress unused variable warning */
+    (void)hLeftPanel;
+
     /* --- LEFT PANEL: Allow Remote Control --- */
     
     /* Header */
     CreateWindowExA(0, "STATIC", "  Allow Remote Control",
                    WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
-                   leftX, 10, panelWidth, 30, hwnd, (HMENU)IDC_LEFT_PANEL, g_hInstance, NULL);
+                   leftX, 10, panelWidth, 30, hwnd, (HMENU)IDC_LEFT_HEADER, g_hInstance, NULL);
     
     /* Instructions */
     CreateWindowExA(0, "STATIC", 
                    "Please tell your partner the following ID\nand Password to allow remote control",
                    WS_CHILD | WS_VISIBLE | SS_LEFT,
-                   leftX + 10, 50, panelWidth - 20, 36, hwnd, NULL, g_hInstance, NULL);
+                   leftX + 10, 50, panelWidth - 20, 36, hwnd, (HMENU)IDC_LEFT_INSTR, g_hInstance, NULL);
     
     y = 95;
     
@@ -360,7 +436,7 @@ void CreateMainControls(HWND hwnd)
                    WS_CHILD | WS_VISIBLE | SS_LEFT,
                    leftX + 10, y, 70, 20, hwnd, (HMENU)IDC_YOUR_ID_LABEL, g_hInstance, NULL);
     
-    /* Your ID display (XXX XXX XXX XXX = 15 chars) */
+    /* Your ID display */
     FormatId(g_myId, idStr);
     g_hYourId = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", idStr,
                                WS_CHILD | WS_VISIBLE | ES_READONLY | ES_CENTER,
@@ -385,7 +461,7 @@ void CreateMainControls(HWND hwnd)
                                 leftX + 80, y - 2, 160, 24, hwnd, (HMENU)IDC_YOUR_PWD, g_hInstance, NULL);
     
     /* Refresh button */
-    g_hRefreshPwdBtn = CreateWindowExA(0, "BUTTON", "\x21",  /* Refresh symbol */
+    g_hRefreshPwdBtn = CreateWindowExA(0, "BUTTON", "!",
                                       WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                                       leftX + 245, y - 2, 24, 24, hwnd, (HMENU)IDC_REFRESH_PWD_BTN, g_hInstance, NULL);
     
@@ -399,9 +475,9 @@ void CreateMainControls(HWND hwnd)
     y += 15;
     
     /* Custom Password section */
-    CreateWindowExA(0, "STATIC", "Custom Password",
+    CreateWindowExA(0, "STATIC", "Custom",
                    WS_CHILD | WS_VISIBLE | SS_LEFT,
-                   leftX + 10, y, 100, 20, hwnd, (HMENU)IDC_CUSTOM_PWD_LABEL, g_hInstance, NULL);
+                   leftX + 10, y, 80, 20, hwnd, (HMENU)IDC_CUSTOM_PWD_LABEL, g_hInstance, NULL);
     
     y += 22;
     
@@ -412,52 +488,139 @@ void CreateMainControls(HWND hwnd)
     g_hSetPwdBtn = CreateWindowExA(0, "BUTTON", "Set",
                                   WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                                   leftX + 175, y, 50, 24, hwnd, (HMENU)IDC_SET_PWD_BTN, g_hInstance, NULL);
-    
+
     /* --- RIGHT PANEL: Control a Remote Computer --- */
+    {
+        TCITEMA tabItem;
+        int tabY = 45;
+        int contentY;
+        
+        /* Header - use IDC_RIGHT_PANEL for blue coloring */
+        CreateWindowExA(0, "STATIC", "  Control a Remote Computer",
+                       WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
+                       rightX, 10, panelWidth, 30, hwnd, (HMENU)IDC_RIGHT_PANEL, g_hInstance, NULL);
+
+        /* Tab Control - placed below header */
+        g_hTabCtrl = CreateWindowExA(0, WC_TABCONTROLA, "",
+                       WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_TABS,
+                       rightX, tabY, panelWidth, 25, hwnd, (HMENU)IDC_TAB_CTRL, g_hInstance, NULL);
+        SendMessage(g_hTabCtrl, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+        
+        /* Add tabs */
+        ZeroMemory(&tabItem, sizeof(tabItem));
+        tabItem.mask = TCIF_TEXT;
+        tabItem.pszText = "Direct Connect";
+        TabCtrl_InsertItem(g_hTabCtrl, 0, &tabItem);
+        tabItem.pszText = "Server";
+        TabCtrl_InsertItem(g_hTabCtrl, 1, &tabItem);
+        
+        contentY = tabY + 30;
+
+        /* Instructions for Tab 1: Direct Connect */
+        CreateWindowExA(0, "STATIC",
+                       "Please enter your partner's ID to remote\ncontrol your partner's computer",
+                       WS_CHILD | WS_VISIBLE | SS_LEFT,
+                       rightX + 10, contentY, panelWidth - 20, 36, hwnd, (HMENU)IDC_INSTR_TAB1, g_hInstance, NULL);
+
+        /* Instructions for Tab 2: Server (hidden initially) */
+        CreateWindowExA(0, "STATIC",
+                       "Please enter your partner's ID to remote\ncontrol your partner's computer",
+                       WS_CHILD | SS_LEFT,
+                       rightX + 10, contentY, panelWidth - 20, 36, hwnd, (HMENU)IDC_INSTR_TAB2, g_hInstance, NULL);
+
+        /* ---- TAB 1: Direct Connect Controls ---- */
+        y = contentY + 45;
+        
+        /* Partner ID label and input */
+        CreateWindowExA(0, "STATIC", "Partner ID",
+                       WS_CHILD | WS_VISIBLE | SS_LEFT,
+                       rightX + 10, y, 70, 20, hwnd, (HMENU)IDC_PARTNER_ID_LABEL, g_hInstance, NULL);
+        g_hPartnerId = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
+                                      WS_CHILD | WS_VISIBLE | ES_CENTER,
+                                      rightX + 80, y - 2, 200, 24, hwnd, (HMENU)IDC_PARTNER_ID, g_hInstance, NULL);
+        
+        y += 35;
+        
+        /* Partner Password label and input */
+        CreateWindowExA(0, "STATIC", "Password",
+                       WS_CHILD | WS_VISIBLE | SS_LEFT,
+                       rightX + 10, y, 70, 20, hwnd, (HMENU)IDC_PARTNER_PWD_LABEL, g_hInstance, NULL);
+        g_hPartnerPwd = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
+                                       WS_CHILD | WS_VISIBLE | ES_PASSWORD | ES_CENTER,
+                                       rightX + 80, y - 2, 200, 24, hwnd, (HMENU)IDC_PARTNER_PWD, g_hInstance, NULL);
+        
+        y += 45;
+        
+        /* Connect button */
+        g_hConnectBtn = CreateWindowExA(0, "BUTTON", "Connect Direct",
+                                       WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                       rightX + 70, y, 160, 30, hwnd, (HMENU)IDC_CONNECT_BTN, g_hInstance, NULL);
+
+        /* ---- TAB 2: Relay Connect Controls (initially hidden) ---- */
+        /* Step 1: Connect to relay server first */
+        /* Step 2: Then connect to partner by ID */
+        y = contentY + 45;
+        
+        /* Server IP (the relay server to connect through) */
+        CreateWindowExA(0, "STATIC", "Server IP",
+                       WS_CHILD | SS_LEFT,
+                       rightX + 10, y, 70, 20, hwnd, (HMENU)IDC_SERVER_IP_LABEL, g_hInstance, NULL);
+        g_hServerIp = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
+                                     WS_CHILD | ES_LEFT,
+                                     rightX + 80, y - 2, 120, 24, hwnd, (HMENU)IDC_SERVER_IP, g_hInstance, NULL);
+        
+        /* Relay Server Port */
+        CreateWindowExA(0, "STATIC", "Port",
+                       WS_CHILD | SS_LEFT,
+                       rightX + 205, y, 30, 20, hwnd, (HMENU)IDC_SERVER_PORT_LABEL, g_hInstance, NULL);
+        g_hServerPort = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "5900",
+                                       WS_CHILD | ES_NUMBER | ES_CENTER,
+                                       rightX + 235, y - 2, 45, 24, hwnd, (HMENU)IDC_SERVER_PORT, g_hInstance, NULL);
+        
+        y += 30;
+        
+        /* Step 1: Connect to Server button */
+        g_hRelayConnectSvrBtn = CreateWindowExA(0, "BUTTON", "Connect to Server",
+                                               WS_CHILD | BS_PUSHBUTTON,
+                                               rightX + 70, y, 160, 26, hwnd, (HMENU)IDC_RELAY_CONNECT_SVR_BTN, g_hInstance, NULL);
+        
+        y += 35;
+        
+        /* Partner ID for relay connection */
+        CreateWindowExA(0, "STATIC", "Partner ID",
+                       WS_CHILD | SS_LEFT,
+                       rightX + 10, y, 70, 20, hwnd, (HMENU)IDC_RELAY_PARTNER_ID_LABEL, g_hInstance, NULL);
+        g_hRelayPartnerId = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
+                                           WS_CHILD | ES_CENTER,
+                                           rightX + 80, y - 2, 200, 24, hwnd, (HMENU)IDC_RELAY_PARTNER_ID, g_hInstance, NULL);
+        
+        y += 30;
+        
+        /* Password for relay connection */
+        CreateWindowExA(0, "STATIC", "Password",
+                       WS_CHILD | SS_LEFT,
+                       rightX + 10, y, 70, 20, hwnd, (HMENU)IDC_RELAY_PARTNER_PWD_LABEL, g_hInstance, NULL);
+        g_hRelayPartnerPwd = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
+                                            WS_CHILD | ES_PASSWORD | ES_CENTER,
+                                            rightX + 80, y - 2, 200, 24, hwnd, (HMENU)IDC_RELAY_PARTNER_PWD, g_hInstance, NULL);
+        
+        y += 35;
+        
+        /* Step 2: Connect to Partner button (disabled until connected to server) */
+        g_hRelayConnectPartnerBtn = CreateWindowExA(0, "BUTTON", "Connect to Partner",
+                                                   WS_CHILD | BS_PUSHBUTTON | WS_DISABLED,
+                                                   rightX + 70, y, 160, 26, hwnd, (HMENU)IDC_RELAY_CONNECT_PARTNER_BTN, g_hInstance, NULL);
+        
+        /* Set fonts for relay connect controls */
+        SendMessage(g_hServerIp, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+        SendMessage(g_hServerPort, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+        SendMessage(g_hRelayConnectSvrBtn, WM_SETFONT, (WPARAM)g_hFontBold, TRUE);
+        SendMessage(g_hRelayPartnerId, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+        SendMessage(g_hRelayPartnerPwd, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+        SendMessage(g_hRelayConnectPartnerBtn, WM_SETFONT, (WPARAM)g_hFontBold, TRUE);
+    }
     
-    /* Header */
-    CreateWindowExA(0, "STATIC", "  Control a Remote Computer",
-                   WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
-                   rightX, 10, panelWidth, 30, hwnd, (HMENU)IDC_RIGHT_PANEL, g_hInstance, NULL);
-    
-    /* Instructions */
-    CreateWindowExA(0, "STATIC",
-                   "Please enter your partner's ID to remote\ncontrol your partner's computer",
-                   WS_CHILD | WS_VISIBLE | SS_LEFT,
-                   rightX + 10, 50, panelWidth - 20, 36, hwnd, NULL, g_hInstance, NULL);
-    
-    y = 95;
-    
-    /* Partner ID label */
-    CreateWindowExA(0, "STATIC", "Partner ID",
-                   WS_CHILD | WS_VISIBLE | SS_LEFT,
-                   rightX + 10, y, 70, 20, hwnd, (HMENU)IDC_PARTNER_ID_LABEL, g_hInstance, NULL);
-    
-    /* Partner ID input (XXX XXX XXX XXX = 15 chars) */
-    g_hPartnerId = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
-                                  WS_CHILD | WS_VISIBLE | ES_CENTER,
-                                  rightX + 80, y - 2, 200, 24, hwnd, (HMENU)IDC_PARTNER_ID, g_hInstance, NULL);
-    
-    y += 35;
-    
-    /* Partner Password label */
-    CreateWindowExA(0, "STATIC", "Password",
-                   WS_CHILD | WS_VISIBLE | SS_LEFT,
-                   rightX + 10, y, 70, 20, hwnd, (HMENU)IDC_PARTNER_PWD_LABEL, g_hInstance, NULL);
-    
-    /* Partner Password input */
-    g_hPartnerPwd = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
-                                   WS_CHILD | WS_VISIBLE | ES_PASSWORD | ES_CENTER,
-                                   rightX + 80, y - 2, 200, 24, hwnd, (HMENU)IDC_PARTNER_PWD, g_hInstance, NULL);
-    
-    y += 45;
-    
-    /* Connect button */
-    g_hConnectBtn = CreateWindowExA(0, "BUTTON", "Connect to partner",
-                                   WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                   rightX + 70, y, 160, 30, hwnd, (HMENU)IDC_CONNECT_BTN, g_hInstance, NULL);
-    
-    /* Set fonts */
+    /* Set fonts for left panel controls */
     SendMessage(g_hYourId, WM_SETFONT, (WPARAM)g_hFontLarge, TRUE);
     SendMessage(g_hYourPwd, WM_SETFONT, (WPARAM)g_hFontLarge, TRUE);
     SendMessage(g_hPartnerId, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
@@ -467,6 +630,528 @@ void CreateMainControls(HWND hwnd)
     /* Create status bar */
     g_hStatusBar = CreateStatusWindowA(WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
                                       "Ready to connect", hwnd, IDC_STATUSBAR);
+}
+
+/* Switch between tabs in the right panel */
+void SwitchTab(int tabIndex)
+{
+    int showTab1, showTab2;
+    
+    g_nCurrentTab = tabIndex;
+    
+    if (tabIndex == 0) {
+        /* Direct Connect tab */
+        showTab1 = SW_SHOW;
+        showTab2 = SW_HIDE;
+    } else {
+        /* Relay tab - for connecting TO a relay server */
+        showTab1 = SW_HIDE;
+        showTab2 = SW_SHOW;
+    }
+    
+    /* Tab 1: Direct Connect controls */
+    ShowWindow(GetDlgItem(g_hMainWnd, IDC_INSTR_TAB1), showTab1);
+    ShowWindow(GetDlgItem(g_hMainWnd, IDC_PARTNER_ID_LABEL), showTab1);
+    ShowWindow(g_hPartnerId, showTab1);
+    ShowWindow(GetDlgItem(g_hMainWnd, IDC_PARTNER_PWD_LABEL), showTab1);
+    ShowWindow(g_hPartnerPwd, showTab1);
+    ShowWindow(g_hConnectBtn, showTab1);
+    
+    /* Tab 2: Server Connect controls */
+    ShowWindow(GetDlgItem(g_hMainWnd, IDC_INSTR_TAB2), showTab2);
+    ShowWindow(GetDlgItem(g_hMainWnd, IDC_SERVER_IP_LABEL), showTab2);
+    ShowWindow(g_hServerIp, showTab2);
+    ShowWindow(GetDlgItem(g_hMainWnd, IDC_SERVER_PORT_LABEL), showTab2);
+    ShowWindow(g_hServerPort, showTab2);
+    ShowWindow(g_hRelayConnectSvrBtn, showTab2);
+    ShowWindow(GetDlgItem(g_hMainWnd, IDC_RELAY_PARTNER_ID_LABEL), showTab2);
+    ShowWindow(g_hRelayPartnerId, showTab2);
+    ShowWindow(GetDlgItem(g_hMainWnd, IDC_RELAY_PARTNER_PWD_LABEL), showTab2);
+    ShowWindow(g_hRelayPartnerPwd, showTab2);
+    ShowWindow(g_hRelayConnectPartnerBtn, showTab2);
+}
+
+/* Step 1: Connect to relay server and register */
+void ConnectToRelayServer(void)
+{
+    char portStr[16];
+    int result;
+    SOCKET relaySocket = INVALID_SOCKET;
+    
+    /* If already connected, disconnect first */
+    if (g_bConnectedToRelay) {
+        /* Stop relay check timer */
+        KillTimer(g_hMainWnd, TIMER_RELAY_CHECK);
+        
+        EnterCriticalSection(&g_csRelay);
+        if (g_relaySocket != INVALID_SOCKET) {
+            closesocket(g_relaySocket);
+            g_relaySocket = INVALID_SOCKET;
+        }
+        g_bConnectedToRelay = FALSE;
+        LeaveCriticalSection(&g_csRelay);
+        
+        SetWindowTextA(g_hRelayConnectSvrBtn, "Connect to Server");
+        EnableWindow(g_hRelayConnectPartnerBtn, FALSE);
+        UpdateStatusBar("Disconnected from relay", FALSE);
+        return;
+    }
+    
+    /* Get Relay Server IP and Port */
+    GetWindowTextA(g_hServerIp, g_szRelayServerIp, sizeof(g_szRelayServerIp));
+    GetWindowTextA(g_hServerPort, portStr, sizeof(portStr));
+    g_wRelayServerPort = (WORD)atoi(portStr);
+    if (g_wRelayServerPort == 0) {
+        g_wRelayServerPort = 5900;
+    }
+    
+    if (g_szRelayServerIp[0] == '\0') {
+        MessageBoxA(g_hMainWnd, "Please enter the Relay Server IP address!", APP_TITLE, MB_ICONWARNING);
+        return;
+    }
+    
+    UpdateStatusBar("Connecting to relay...", FALSE);
+    SetWindowTextA(g_hRelayConnectSvrBtn, "Connecting...");
+    EnableWindow(g_hRelayConnectSvrBtn, FALSE);
+    
+    EnterCriticalSection(&g_csRelay);
+    
+    /* Close any existing relay connection */
+    if (g_relaySocket != INVALID_SOCKET) {
+        closesocket(g_relaySocket);
+        g_relaySocket = INVALID_SOCKET;
+    }
+    
+    /* Connect to relay server */
+    result = Relay_ConnectToServer(g_szRelayServerIp, g_wRelayServerPort, g_myId, &relaySocket);
+    if (result != RD2K_SUCCESS) {
+        LeaveCriticalSection(&g_csRelay);
+        UpdateStatusBar("Failed to connect to relay", FALSE);
+        SetWindowTextA(g_hRelayConnectSvrBtn, "Connect to Server");
+        EnableWindow(g_hRelayConnectSvrBtn, TRUE);
+        MessageBoxA(g_hMainWnd, 
+                   "Failed to connect to relay server!\n\n"
+                   "Check:\n- Relay server IP and port\n- Relay server is running",
+                   APP_TITLE, MB_ICONERROR);
+        return;
+    }
+    
+    /* Register our ID with relay */
+    UpdateStatusBar("Registering with relay...", FALSE);
+    result = Relay_Register(relaySocket, g_myId);
+    if (result != RD2K_SUCCESS) {
+        closesocket(relaySocket);
+        LeaveCriticalSection(&g_csRelay);
+        UpdateStatusBar("Failed to register", FALSE);
+        SetWindowTextA(g_hRelayConnectSvrBtn, "Connect to Server");
+        EnableWindow(g_hRelayConnectSvrBtn, TRUE);
+        MessageBoxA(g_hMainWnd, "Failed to register with relay server!", APP_TITLE, MB_ICONERROR);
+        return;
+    }
+    
+    g_relaySocket = relaySocket;
+    g_bConnectedToRelay = TRUE;
+    LeaveCriticalSection(&g_csRelay);
+    
+    /* Start timer to check relay connection health */
+    SetTimer(g_hMainWnd, TIMER_RELAY_CHECK, RELAY_CHECK_INTERVAL, NULL);
+    
+    /* Update UI - connected to server, now enable partner connection */
+    SetWindowTextA(g_hRelayConnectSvrBtn, "Disconnect Server");
+    EnableWindow(g_hRelayConnectSvrBtn, TRUE);
+    EnableWindow(g_hRelayConnectPartnerBtn, TRUE);
+    UpdateStatusBar("Connected to relay - enter partner ID", TRUE);
+}
+
+/* Step 2: Connect to partner through relay */
+void ConnectToPartnerViaRelay(void)
+{
+    char idStr[64], pwdStr[32];
+    DWORD partnerId, partnerPwd;
+    int result;
+    int screenW, screenH;
+    RD2K_HANDSHAKE handshake;
+    RD2K_HEADER header;
+    
+    if (!g_bConnectedToRelay || g_relaySocket == INVALID_SOCKET) {
+        MessageBoxA(g_hMainWnd, "Please connect to relay server first!", APP_TITLE, MB_ICONWARNING);
+        return;
+    }
+    
+    /* Get Partner ID and Password from Relay tab */
+    GetWindowTextA(g_hRelayPartnerId, idStr, sizeof(idStr));
+    GetWindowTextA(g_hRelayPartnerPwd, pwdStr, sizeof(pwdStr));
+    
+    partnerId = ParseId(idStr);
+    partnerPwd = atoi(pwdStr);
+    
+    /* Validate Partner ID */
+    if (partnerId == 0) {
+        MessageBoxA(g_hMainWnd, "Please enter a valid Partner ID!\n\n"
+                   "The ID should be in format: XXX XXX XXX XXX",
+                   APP_TITLE, MB_ICONWARNING);
+        return;
+    }
+    
+    if (partnerId == g_myId) {
+        MessageBoxA(g_hMainWnd, "You cannot connect to yourself!\n\n"
+                   "Please enter a different Partner ID.",
+                   APP_TITLE, MB_ICONWARNING);
+        return;
+    }
+    
+    if (partnerPwd == 0) {
+        MessageBoxA(g_hMainWnd, "Please enter the password!", APP_TITLE, MB_ICONWARNING);
+        return;
+    }
+    
+    UpdateStatusBar("Requesting partner...", FALSE);
+    SetWindowTextA(g_hRelayConnectPartnerBtn, "Connecting...");
+    EnableWindow(g_hRelayConnectPartnerBtn, FALSE);
+    EnableWindow(g_hRelayConnectSvrBtn, FALSE);
+    
+    EnterCriticalSection(&g_csRelay);
+    
+    /* Request connection to partner */
+    result = Relay_RequestPartner(g_relaySocket, partnerId, partnerPwd);
+    if (result != RD2K_SUCCESS) {
+        LeaveCriticalSection(&g_csRelay);
+        UpdateStatusBar("Partner not found", FALSE);
+        SetWindowTextA(g_hRelayConnectPartnerBtn, "Connect to Partner");
+        EnableWindow(g_hRelayConnectPartnerBtn, TRUE);
+        EnableWindow(g_hRelayConnectSvrBtn, TRUE);
+        MessageBoxA(g_hMainWnd, 
+                   "Partner not found on relay server!\n\n"
+                   "Make sure partner is connected to the same relay\n"
+                   "and has registered with their ID.",
+                   APP_TITLE, MB_ICONERROR);
+        return;
+    }
+    
+    /* Wait for relay to pair us */
+    UpdateStatusBar("Waiting for partner...", FALSE);
+    result = Relay_WaitForConnection(g_relaySocket, 30000);
+    if (result != RD2K_SUCCESS) {
+        LeaveCriticalSection(&g_csRelay);
+        UpdateStatusBar("Connection timeout", FALSE);
+        SetWindowTextA(g_hRelayConnectPartnerBtn, "Connect to Partner");
+        EnableWindow(g_hRelayConnectPartnerBtn, TRUE);
+        EnableWindow(g_hRelayConnectSvrBtn, TRUE);
+        MessageBoxA(g_hMainWnd, "Relay connection timed out!", APP_TITLE, MB_ICONERROR);
+        return;
+    }
+    
+    LeaveCriticalSection(&g_csRelay);
+    
+    /* Create client network structure for relay mode */
+    g_pClientNet = Network_Create(RD2K_LISTEN_PORT);
+    if (!g_pClientNet) {
+        UpdateStatusBar("Failed to create connection", FALSE);
+        SetWindowTextA(g_hRelayConnectPartnerBtn, "Connect to Partner");
+        EnableWindow(g_hRelayConnectPartnerBtn, TRUE);
+        EnableWindow(g_hRelayConnectSvrBtn, TRUE);
+        return;
+    }
+    
+    /* Set relay mode on network structure */
+    g_pClientNet->bRelayMode = TRUE;
+    g_pClientNet->relaySocket = g_relaySocket;
+    
+    /* Send handshake through relay */
+    ScreenCapture_GetDimensions(&screenW, &screenH);
+    
+    handshake.magic = RD2K_MAGIC;
+    handshake.yourId = g_myId;
+    handshake.password = partnerPwd;
+    handshake.screenWidth = (WORD)screenW;
+    handshake.screenHeight = (WORD)screenH;
+    handshake.colorDepth = 24;
+    handshake.compression = COMPRESS_RLE;
+    handshake.versionMajor = RD2K_VERSION_MAJOR;
+    handshake.versionMinor = RD2K_VERSION_MINOR;
+    
+    Network_SendPacket(g_pClientNet, MSG_HANDSHAKE,
+                      (const BYTE*)&handshake, sizeof(handshake));
+    
+    /* Receive response */
+    result = Network_RecvPacket(g_pClientNet, &header,
+                               g_pClientNet->recvBuffer,
+                               g_pClientNet->recvBufferSize);
+    
+    if (result != RD2K_SUCCESS || header.msgType != MSG_HANDSHAKE_ACK) {
+        Network_Destroy(g_pClientNet);
+        g_pClientNet = NULL;
+        UpdateStatusBar("Authentication failed", FALSE);
+        SetWindowTextA(g_hRelayConnectPartnerBtn, "Connect to Partner");
+        EnableWindow(g_hRelayConnectPartnerBtn, TRUE);
+        EnableWindow(g_hRelayConnectSvrBtn, TRUE);
+        MessageBoxA(g_hMainWnd, "Authentication failed!\n\nWrong password or partner refused.",
+                   APP_TITLE, MB_ICONERROR);
+        return;
+    }
+    
+    /* Parse response */
+    {
+        RD2K_HANDSHAKE *pResponse = (RD2K_HANDSHAKE*)g_pClientNet->recvBuffer;
+        g_remoteScreen.width = pResponse->screenWidth;
+        g_remoteScreen.height = pResponse->screenHeight;
+        g_remoteScreen.bitsPerPixel = pResponse->colorDepth;
+        g_remoteScreen.compression = pResponse->compression;
+    }
+    
+    /* Create viewer window */
+    if (!CreateViewerWindow()) {
+        Network_Destroy(g_pClientNet);
+        g_pClientNet = NULL;
+        UpdateStatusBar("Failed to create viewer", FALSE);
+        SetWindowTextA(g_hRelayConnectPartnerBtn, "Connect to Partner");
+        EnableWindow(g_hRelayConnectPartnerBtn, TRUE);
+        EnableWindow(g_hRelayConnectSvrBtn, TRUE);
+        return;
+    }
+    
+    g_bClientConnected2 = TRUE;
+    g_pClientNet->state = STATE_CONNECTED;
+    
+    /* Start timers for network processing */
+    SetTimer(g_hMainWnd, TIMER_NETWORK, NETWORK_INTERVAL, NULL);
+    SetTimer(g_hMainWnd, TIMER_PING, PING_INTERVAL, NULL);
+    
+    /* Request full screen */
+    Network_SendPacket(g_pClientNet, MSG_FULL_SCREEN_REQ, NULL, 0);
+    
+    SetWindowTextA(g_hRelayConnectPartnerBtn, "Disconnect");
+    EnableWindow(g_hRelayConnectPartnerBtn, TRUE);
+    EnableWindow(g_hRelayConnectSvrBtn, FALSE);  /* Can't disconnect server while in session */
+    UpdateStatusBar("Connected via relay", TRUE);
+}
+
+/* Disconnect from relay server cleanly */
+void DisconnectFromRelayServer(BOOL silent)
+{
+    /* Stop relay health check timer */
+    KillTimer(g_hMainWnd, TIMER_RELAY_CHECK);
+    
+    EnterCriticalSection(&g_csRelay);
+    
+    if (g_relaySocket != INVALID_SOCKET) {
+        closesocket(g_relaySocket);
+        g_relaySocket = INVALID_SOCKET;
+    }
+    g_bConnectedToRelay = FALSE;
+    
+    LeaveCriticalSection(&g_csRelay);
+    
+    /* Reset UI */
+    SetWindowTextA(g_hRelayConnectSvrBtn, "Connect to Server");
+    EnableWindow(g_hRelayConnectSvrBtn, TRUE);
+    EnableWindow(g_hRelayConnectPartnerBtn, FALSE);
+    
+    if (!silent) {
+        UpdateStatusBar("Disconnected from relay server", FALSE);
+    }
+}
+
+/* Reconnection dialog procedure */
+INT_PTR CALLBACK ReconnectDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+        case WM_INITDIALOG:
+        {
+            RECT rcOwner, rcDlg;
+            int x, y;
+            
+            /* Center on owner */
+            GetWindowRect(g_hMainWnd, &rcOwner);
+            GetWindowRect(hwnd, &rcDlg);
+            x = rcOwner.left + ((rcOwner.right - rcOwner.left) - (rcDlg.right - rcDlg.left)) / 2;
+            y = rcOwner.top + ((rcOwner.bottom - rcOwner.top) - (rcDlg.bottom - rcDlg.top)) / 2;
+            SetWindowPos(hwnd, HWND_TOP, x, y, 0, 0, SWP_NOSIZE);
+            
+            return TRUE;
+        }
+        
+        case WM_COMMAND:
+            if (LOWORD(wParam) == IDCANCEL) {
+                g_bReconnecting = FALSE;
+                EndDialog(hwnd, IDCANCEL);
+                return TRUE;
+            }
+            break;
+            
+        case WM_CLOSE:
+            g_bReconnecting = FALSE;
+            EndDialog(hwnd, IDCANCEL);
+            return TRUE;
+    }
+    return FALSE;
+}
+
+/* Attempt to reconnect to relay server */
+BOOL AttemptRelayReconnection(void)
+{
+    int result;
+    SOCKET relaySocket = INVALID_SOCKET;
+    
+    /* Try to connect to relay server */
+    result = Relay_ConnectToServer(g_szRelayServerIp, g_wRelayServerPort, g_myId, &relaySocket);
+    if (result != RD2K_SUCCESS) {
+        return FALSE;
+    }
+    
+    /* Register with relay */
+    result = Relay_Register(relaySocket, g_myId);
+    if (result != RD2K_SUCCESS) {
+        closesocket(relaySocket);
+        return FALSE;
+    }
+    
+    EnterCriticalSection(&g_csRelay);
+    g_relaySocket = relaySocket;
+    g_bConnectedToRelay = TRUE;
+    LeaveCriticalSection(&g_csRelay);
+    
+    return TRUE;
+}
+
+/* Handle relay server connection lost */
+void HandleRelayServerLost(void)
+{
+    int attempt;
+    char msg[256];
+    BOOL reconnected = FALSE;
+    
+    /* Cancel any pending file transfer */
+    FileTransfer_Cancel();
+    
+    /* Stop all timers */
+    KillTimer(g_hMainWnd, TIMER_NETWORK);
+    KillTimer(g_hMainWnd, TIMER_PING);
+    KillTimer(g_hMainWnd, TIMER_RELAY_CHECK);
+    
+    /* Mark as disconnected */
+    g_bClientConnected2 = FALSE;
+    g_bClientConnected = FALSE;
+    
+    /* Close network structures */
+    if (g_pClientNet) {
+        Network_Destroy(g_pClientNet);
+        g_pClientNet = NULL;
+    }
+    
+    /* Close viewer window */
+    DestroyViewerWindow();
+    
+    /* Close existing relay socket */
+    EnterCriticalSection(&g_csRelay);
+    if (g_relaySocket != INVALID_SOCKET) {
+        closesocket(g_relaySocket);
+        g_relaySocket = INVALID_SOCKET;
+    }
+    g_bConnectedToRelay = FALSE;
+    LeaveCriticalSection(&g_csRelay);
+    
+    /* Start reconnection attempts */
+    g_bReconnecting = TRUE;
+    UpdateStatusBar("Relay server lost - reconnecting...", FALSE);
+    
+    for (attempt = 1; attempt <= RECONNECT_MAX_ATTEMPTS && g_bReconnecting; attempt++) {
+        sprintf(msg, "Relay server disconnected.\n\nReconnecting... Attempt %d of %d", 
+                attempt, RECONNECT_MAX_ATTEMPTS);
+        
+        /* Show/update message box for this attempt */
+        if (attempt == 1) {
+            /* For first attempt, update status and wait */
+            UpdateStatusBar(msg + 28, FALSE);  /* Skip the first line */
+        } else {
+            sprintf(msg, "Reconnecting... Attempt %d of %d", attempt, RECONNECT_MAX_ATTEMPTS);
+            UpdateStatusBar(msg, FALSE);
+        }
+        
+        /* Try to reconnect */
+        if (AttemptRelayReconnection()) {
+            reconnected = TRUE;
+            break;
+        }
+        
+        /* Wait before next attempt */
+        if (attempt < RECONNECT_MAX_ATTEMPTS) {
+            Sleep(RECONNECT_DELAY_MS);
+        }
+    }
+    
+    g_bReconnecting = FALSE;
+    
+    if (reconnected) {
+        /* Successfully reconnected to relay server */
+        UpdateStatusBar("Reconnected to relay server", TRUE);
+        SetWindowTextA(g_hRelayConnectSvrBtn, "Disconnect Server");
+        EnableWindow(g_hRelayConnectSvrBtn, TRUE);
+        EnableWindow(g_hRelayConnectPartnerBtn, TRUE);
+        
+        /* Restart relay health check timer */
+        SetTimer(g_hMainWnd, TIMER_RELAY_CHECK, RELAY_CHECK_INTERVAL, NULL);
+        
+        MessageBoxA(g_hMainWnd, 
+                   "Reconnected to relay server.\n\n"
+                   "Note: Your partner connection was lost.\n"
+                   "You need to reconnect to your partner.",
+                   APP_TITLE, MB_ICONINFORMATION);
+    } else {
+        /* Failed to reconnect after all attempts */
+        DisconnectFromRelayServer(TRUE);
+        UpdateStatusBar("Failed to reconnect to relay", FALSE);
+        
+        sprintf(msg, "Failed to reconnect to relay server after %d attempts.\n\n"
+                    "Please check:\n"
+                    "- Relay server is running\n"
+                    "- Network connection\n"
+                    "- Server IP and port",
+                RECONNECT_MAX_ATTEMPTS);
+        MessageBoxA(g_hMainWnd, msg, APP_TITLE, MB_ICONERROR);
+    }
+}
+
+/* Handle partner disconnect from relay */
+void HandlePartnerDisconnect(BOOL isServerSide)
+{
+    /* Cancel any pending file transfer */
+    FileTransfer_Cancel();
+    
+    /* Stop network timers */
+    KillTimer(g_hMainWnd, TIMER_NETWORK);
+    KillTimer(g_hMainWnd, TIMER_PING);
+    if (isServerSide) {
+        KillTimer(g_hMainWnd, TIMER_SCREEN);
+    }
+    
+    /* Mark connection state */
+    if (isServerSide) {
+        g_bClientConnected = FALSE;
+        if (g_pServerNet) {
+            Network_Disconnect(g_pServerNet);
+            Network_Listen(g_pServerNet);
+        }
+    } else {
+        g_bClientConnected2 = FALSE;
+        if (g_pClientNet) {
+            Network_Destroy(g_pClientNet);
+            g_pClientNet = NULL;
+        }
+        DestroyViewerWindow();
+    }
+    
+    /* Update UI - still connected to relay, but partner is gone */
+    SetWindowTextA(g_hRelayConnectPartnerBtn, "Connect to Partner");
+    EnableWindow(g_hRelayConnectPartnerBtn, TRUE);
+    EnableWindow(g_hRelayConnectSvrBtn, TRUE);
+    
+    UpdateStatusBar("Partner disconnected from relay", TRUE);
+    MessageBoxA(g_hMainWnd, 
+               "Your partner has disconnected from the relay.\n\n"
+               "You are still connected to the relay server.\n"
+               "You can connect to a new partner.",
+               APP_TITLE, MB_ICONINFORMATION);
 }
 
 /* Update status bar */
@@ -531,8 +1216,17 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             HWND hCtrl = (HWND)lParam;
             int id = GetDlgCtrlID(hCtrl);
             
-            /* Header panels */
+            /* Header panels - blue bg, white text */
             if (id == IDC_LEFT_PANEL || id == IDC_RIGHT_PANEL) {
+                SetTextColor(hdc, COLOR_HEADER_TEXT);
+                SetBkColor(hdc, COLOR_HEADER_BG);
+                return (LRESULT)g_hBrushHeader;
+            }
+            
+            /* Left panel labels - blue bg, white text */
+            if (id == IDC_LEFT_HEADER || id == IDC_LEFT_INSTR ||
+                id == IDC_YOUR_ID_LABEL || id == IDC_YOUR_PWD_LABEL ||
+                id == IDC_CUSTOM_PWD_LABEL) {
                 SetTextColor(hdc, COLOR_HEADER_TEXT);
                 SetBkColor(hdc, COLOR_HEADER_BG);
                 return (LRESULT)g_hBrushHeader;
@@ -547,6 +1241,16 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             HDC hdc = (HDC)wParam;
             SetBkColor(hdc, COLOR_ID_BG);
             return (LRESULT)GetStockObject(WHITE_BRUSH);
+        }
+        
+        case WM_NOTIFY:
+        {
+            LPNMHDR pnmh = (LPNMHDR)lParam;
+            if (pnmh->idFrom == IDC_TAB_CTRL && pnmh->code == TCN_SELCHANGE) {
+                int tabIndex = TabCtrl_GetCurSel(g_hTabCtrl);
+                SwitchTab(tabIndex);
+            }
+            return 0;
         }
         
         case WM_COMMAND:
@@ -576,6 +1280,21 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                         DisconnectFromPartner();
                     } else {
                         ConnectToPartner();
+                    }
+                    break;
+                
+                case IDC_RELAY_CONNECT_SVR_BTN:
+                    /* Toggle connection to relay server */
+                    ConnectToRelayServer();
+                    break;
+                
+                case IDC_RELAY_CONNECT_PARTNER_BTN:
+                    if (g_bClientConnected2) {
+                        DisconnectFromPartner();
+                        SetWindowTextA(g_hRelayConnectPartnerBtn, "Connect to Partner");
+                        EnableWindow(g_hRelayConnectSvrBtn, TRUE);  /* Re-enable server disconnect */
+                    } else {
+                        ConnectToPartnerViaRelay();
                     }
                     break;
             }
@@ -614,6 +1333,21 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                         if (seq != g_lastClipboardSeq) {
                             g_lastClipboardSeq = seq;
                             SendClipboardData(g_pServerNet);
+                        }
+                    }
+                    break;
+                
+                case TIMER_RELAY_CHECK:
+                    /* Check if relay server is still alive (only when not in active session) */
+                    if (g_bConnectedToRelay && g_relaySocket != INVALID_SOCKET) {
+                        /* Don't check during active partner session - data flow will detect issues */
+                        if (!g_bClientConnected2 && !g_bClientConnected) {
+                            int result = Relay_CheckConnection(g_relaySocket);
+                            if (result != RD2K_SUCCESS) {
+                                /* Relay server disconnected */
+                                KillTimer(g_hMainWnd, TIMER_RELAY_CHECK);
+                                HandleRelayServerLost();
+                            }
                         }
                     }
                     break;
@@ -731,10 +1465,91 @@ void ProcessServerNetwork(void)
     struct timeval timeout;
     RD2K_HEADER header;
     int result;
+    BYTE headerBuf[sizeof(RD2K_HEADER)];
+    int recvLen;
     
     if (!g_pServerNet) return;
     
-    /* Check for new connections */
+    /* Check for incoming relay connection (when connected to relay server) */
+    if (!g_bClientConnected && g_bConnectedToRelay && g_relaySocket != INVALID_SOCKET) {
+        FD_ZERO(&readSet);
+        FD_SET(g_relaySocket, &readSet);
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 0;
+        
+        if (select(0, &readSet, NULL, NULL, &timeout) > 0) {
+            /* Data available on relay socket - try to receive handshake
+             * Network_SendPacket sends header and data as TWO separate relay packets:
+             * 1. First packet: RD2K_HEADER (8 bytes)
+             * 2. Second packet: actual data (e.g., RD2K_HANDSHAKE, 24 bytes)
+             */
+            recvLen = Relay_RecvData(g_relaySocket, headerBuf, sizeof(RD2K_HEADER), 500);
+            
+            if (recvLen == sizeof(RD2K_HEADER)) {
+                CopyMemory(&header, headerBuf, sizeof(RD2K_HEADER));
+                
+                if (header.msgType == MSG_HANDSHAKE && header.dataLength == sizeof(RD2K_HANDSHAKE)) {
+                    /* Now receive the handshake data (comes in second relay packet) */
+                    recvLen = Relay_RecvData(g_relaySocket, g_pServerNet->recvBuffer, 
+                                            header.dataLength, 2000);
+                    
+                    if (recvLen == (int)header.dataLength) {
+                        RD2K_HANDSHAKE *pHandshake = (RD2K_HANDSHAKE*)g_pServerNet->recvBuffer;
+                        BOOL authOk = FALSE;
+                        
+                        /* Check password */
+                        if (pHandshake->magic == RD2K_MAGIC) {
+                            if (g_useCustomPassword) {
+                                authOk = (atoi(g_customPassword) == (int)pHandshake->password);
+                            } else {
+                                authOk = (pHandshake->password == g_myPassword);
+                            }
+                        }
+                        
+                        if (authOk) {
+                            /* Set up network structure for relay mode */
+                            g_pServerNet->bRelayMode = TRUE;
+                            g_pServerNet->relaySocket = g_relaySocket;
+                            g_pServerNet->socket = g_relaySocket;
+                            
+                            /* Send handshake response through relay */
+                            {
+                                RD2K_HANDSHAKE response;
+                                int screenW, screenH;
+                                
+                                ScreenCapture_GetDimensions(&screenW, &screenH);
+                                
+                                response.magic = RD2K_MAGIC;
+                                response.yourId = g_myId;
+                                response.password = 0;
+                                response.screenWidth = (WORD)screenW;
+                                response.screenHeight = (WORD)screenH;
+                                response.colorDepth = 24;
+                                response.compression = COMPRESS_RLE;
+                                response.versionMajor = RD2K_VERSION_MAJOR;
+                                response.versionMinor = RD2K_VERSION_MINOR;
+                                
+                                Network_SendPacket(g_pServerNet, MSG_HANDSHAKE_ACK,
+                                                  (const BYTE*)&response, sizeof(response));
+                            }
+                            
+                            g_bClientConnected = TRUE;
+                            g_pServerNet->state = STATE_CONNECTED;
+                            
+                            SetTimer(g_hMainWnd, TIMER_NETWORK, NETWORK_INTERVAL, NULL);
+                            SetTimer(g_hMainWnd, TIMER_SCREEN, SCREEN_INTERVAL, NULL);
+                            
+                            UpdateStatusBar("Partner connected via relay", TRUE);
+                            return;
+                        }
+                    }
+                }
+            }
+            /* If we didn't get a valid handshake, just return - will try again next timer tick */
+        }
+    }
+    
+    /* Check for new direct connections */
     if (!g_bClientConnected && g_pServerNet->listenSocket != INVALID_SOCKET) {
         FD_ZERO(&readSet);
         FD_SET(g_pServerNet->listenSocket, &readSet);
@@ -808,7 +1623,19 @@ void ProcessServerNetwork(void)
                                        g_pServerNet->recvBufferSize);
             
             if (result != RD2K_SUCCESS) {
-                /* Connection lost */
+                /* Check if this is a relay mode connection */
+                if (g_pServerNet && g_pServerNet->bRelayMode) {
+                    if (result == RD2K_ERR_SERVER_LOST) {
+                        /* Relay server disconnected - attempt reconnection */
+                        HandleRelayServerLost();
+                        return;
+                    } else if (result == RD2K_ERR_PARTNER_LEFT) {
+                        /* Partner disconnected from relay */
+                        HandlePartnerDisconnect(TRUE);
+                        return;
+                    }
+                }
+                /* Direct connection or other error - connection lost */
                 g_bClientConnected = FALSE;
                 Network_Disconnect(g_pServerNet);
                 Network_Listen(g_pServerNet);
@@ -1045,7 +1872,7 @@ void ConnectToPartner(void)
         return;
     }
     
-    /* Connect to partner */
+    /* Direct P2P connection (Tab 1 mode) */
     result = Network_Connect(g_pClientNet, host, RD2K_LISTEN_PORT);
     if (result != RD2K_SUCCESS) {
         Network_Destroy(g_pClientNet);
@@ -1056,10 +1883,12 @@ void ConnectToPartner(void)
         MessageBoxA(g_hMainWnd, 
                    "Failed to connect to partner!\n\n"
                    "Please check:\n"
-                   "- Partner ID is correct\n"
+                   "- Partner ID/IP is correct\n"
                    "- Partner is running RemoteDesk2K\n"
                    "- Both computers are on the same network\n"
-                   "- No firewall blocking the connection",
+                   "- No firewall blocking the connection\n\n"
+                   "For connections across the internet,\n"
+                   "use the 'Relay Server' tab instead.",
                    APP_TITLE, MB_ICONERROR);
         return;
     }
@@ -1133,12 +1962,15 @@ void ConnectToPartner(void)
 /* Disconnect from partner */
 void DisconnectFromPartner(void)
 {
+    BOOL wasRelayMode = FALSE;
+    
     if (!g_bClientConnected2) return;
     
     KillTimer(g_hMainWnd, TIMER_NETWORK);
     KillTimer(g_hMainWnd, TIMER_PING);
     
     if (g_pClientNet) {
+        wasRelayMode = g_pClientNet->bRelayMode;
         Network_SendPacket(g_pClientNet, MSG_DISCONNECT, NULL, 0);
         Network_Destroy(g_pClientNet);
         g_pClientNet = NULL;
@@ -1148,8 +1980,17 @@ void DisconnectFromPartner(void)
     
     g_bClientConnected2 = FALSE;
     
-    SetWindowTextA(g_hConnectBtn, "Connect to partner");
-    UpdateStatusBar("Ready to connect", TRUE);
+    /* Update UI based on connection type */
+    if (wasRelayMode && g_bConnectedToRelay) {
+        /* Was relay mode - restore relay UI state */
+        SetWindowTextA(g_hRelayConnectPartnerBtn, "Connect to Partner");
+        EnableWindow(g_hRelayConnectPartnerBtn, TRUE);
+        EnableWindow(g_hRelayConnectSvrBtn, TRUE);
+        UpdateStatusBar("Disconnected from partner - relay available", TRUE);
+    } else {
+        SetWindowTextA(g_hConnectBtn, "Connect to partner");
+        UpdateStatusBar("Ready to connect", TRUE);
+    }
 }
 
 /* Process client network events */
@@ -1166,7 +2007,21 @@ void ProcessClientNetwork(void)
                                    g_pClientNet->recvBufferSize);
         
         if (result != RD2K_SUCCESS) {
+            /* Check if this is a relay mode connection */
+            if (g_pClientNet && g_pClientNet->bRelayMode) {
+                if (result == RD2K_ERR_SERVER_LOST) {
+                    /* Relay server disconnected - attempt reconnection */
+                    HandleRelayServerLost();
+                    return;
+                } else if (result == RD2K_ERR_PARTNER_LEFT) {
+                    /* Partner disconnected from relay */
+                    HandlePartnerDisconnect(FALSE);
+                    return;
+                }
+            }
+            /* Direct connection or other error */
             DisconnectFromPartner();
+            UpdateStatusBar("Connection to partner lost", TRUE);
             MessageBoxA(g_hMainWnd, "Connection to partner lost!", APP_TITLE, MB_ICONWARNING);
             return;
         }

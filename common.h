@@ -6,10 +6,15 @@
 #ifndef _REMOTEDESK2K_COMMON_H_
 #define _REMOTEDESK2K_COMMON_H_
 
+
+// Use DDK w2k headers for strict compatibility
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <winsock2.h>
+#endif
+// Always include winsock2.h before windows.h to prevent winsock.h conflicts
+#include <winsock2.h> // from 3790.1830/inc/w2k
 #include <ws2tcpip.h>
+#include <windows.h>   // from 3790.1830/inc/w2k
 #include <shlobj.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,6 +48,14 @@
 #define RD2K_MAX_PACKET_SIZE    (256 * 1024)
 #define RD2K_BUFFER_SIZE        (4 * 1024 * 1024)
 #define RD2K_FILE_CHUNK_SIZE    (32 * 1024)
+
+/* Connection Modes */
+#define RD2K_MODE_DIRECT        0   /* Direct P2P connection (LAN) */
+#define RD2K_MODE_RELAY         1   /* Relay server connection (Internet) */
+
+/* Relay Server Configuration (when using relay mode) */
+#define RD2K_RELAY_PORT         5900
+#define RD2K_RELAY_TIMEOUT      30000   /* 30 seconds connect timeout */
 
 /* Protocol Message Types */
 #define MSG_SCREEN_UPDATE       0x01
@@ -99,6 +112,13 @@
 #define RD2K_ERR_SCREEN         -6
 #define RD2K_ERR_PROTOCOL       -7
 #define RD2K_ERR_AUTH           -8
+#define RD2K_ERR_DISCONNECTED   -10 /* Connection disconnected */
+#define RD2K_ERR_PARTNER_LEFT   -11 /* Partner disconnected from relay */
+#define RD2K_ERR_SERVER_LOST    -12 /* Relay server connection lost */
+
+/* Reconnection settings */
+#define RECONNECT_MAX_ATTEMPTS  5
+#define RECONNECT_DELAY_MS      2000  /* 2 seconds between attempts */
 
 #pragma pack(push, 1)
 

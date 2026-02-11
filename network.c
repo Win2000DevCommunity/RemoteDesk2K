@@ -4,6 +4,7 @@
  */
 
 #include "network.h"
+#include "relay.h"
 
 /* Socket timeout values (milliseconds) */
 #define SOCKET_SEND_TIMEOUT     60000   /* 60 seconds for large files */
@@ -88,6 +89,8 @@ PRD2K_NETWORK Network_Create(WORD port)
     pNet->socket = INVALID_SOCKET;
     pNet->state = STATE_DISCONNECTED;
     pNet->port = port;
+    pNet->bRelayMode = FALSE;
+    pNet->relaySocket = INVALID_SOCKET;
     
     pNet->recvBufferSize = RD2K_BUFFER_SIZE;
     pNet->recvBuffer = (BYTE*)malloc(pNet->recvBufferSize);
@@ -221,6 +224,13 @@ void Network_Disconnect(PRD2K_NETWORK pNet)
         SAFE_CLOSE_SOCKET(pNet->listenSocket);
     }
     
+    /* Close relay socket if in relay mode */
+    if (pNet->relaySocket != INVALID_SOCKET) {
+        shutdown(pNet->relaySocket, SD_BOTH);
+        SAFE_CLOSE_SOCKET(pNet->relaySocket);
+    }
+    pNet->bRelayMode = FALSE;
+    
     pNet->state = STATE_DISCONNECTED;
 }
 
@@ -231,7 +241,14 @@ int Network_Send(PRD2K_NETWORK pNet, const BYTE *data, DWORD length)
     int lastError;
     int selectResult;
     
-    if (!pNet || pNet->socket == INVALID_SOCKET || !data) return RD2K_ERR_SEND;
+    if (!pNet || !data) return RD2K_ERR_SEND;
+    
+    /* Handle relay mode - use relay protocol to send data */
+    if (pNet->bRelayMode && pNet->relaySocket != INVALID_SOCKET) {
+        return Relay_SendData(pNet->relaySocket, data, length);
+    }
+    
+    if (pNet->socket == INVALID_SOCKET) return RD2K_ERR_SEND;
     
     while (totalSent < (int)length) {
         /* Wait for socket to be ready for writing */
@@ -310,7 +327,30 @@ int Network_RecvExact(PRD2K_NETWORK pNet, BYTE *buffer, DWORD length)
     int lastError;
     int selectResult;
     
-    if (!pNet || pNet->socket == INVALID_SOCKET || !buffer) return RD2K_ERR_RECV;
+    if (!pNet || !buffer) return RD2K_ERR_RECV;
+    
+    /* Handle relay mode - use relay protocol to receive data */
+    if (pNet->bRelayMode && pNet->relaySocket != INVALID_SOCKET) {
+        while (totalRecv < (int)length) {
+            int toRecv = length - totalRecv;
+            recv_bytes = Relay_RecvData(pNet->relaySocket, buffer + totalRecv, toRecv, 60000);
+            if (recv_bytes < 0) {
+                return recv_bytes;  /* Return specific error (e.g., RD2K_ERR_PARTNER_LEFT) */
+            }
+            if (recv_bytes == 0) {
+                /* Timeout - retry */
+                if (++retryCount >= 10) {
+                    return RD2K_ERR_RECV;
+                }
+                continue;
+            }
+            totalRecv += recv_bytes;
+            retryCount = 0;
+        }
+        return RD2K_SUCCESS;
+    }
+    
+    if (pNet->socket == INVALID_SOCKET) return RD2K_ERR_RECV;
     
     while (totalRecv < (int)length) {
         /* Wait for socket to have data available */
@@ -419,11 +459,21 @@ BOOL Network_DataAvailable(PRD2K_NETWORK pNet)
 {
     fd_set readSet;
     struct timeval timeout;
+    SOCKET sock;
     
-    if (!pNet || pNet->socket == INVALID_SOCKET) return FALSE;
+    if (!pNet) return FALSE;
+    
+    /* Use relay socket if in relay mode */
+    if (pNet->bRelayMode && pNet->relaySocket != INVALID_SOCKET) {
+        sock = pNet->relaySocket;
+    } else if (pNet->socket != INVALID_SOCKET) {
+        sock = pNet->socket;
+    } else {
+        return FALSE;
+    }
     
     FD_ZERO(&readSet);
-    FD_SET(pNet->socket, &readSet);
+    FD_SET(sock, &readSet);
     timeout.tv_sec = 0;
     timeout.tv_usec = 1000;
     

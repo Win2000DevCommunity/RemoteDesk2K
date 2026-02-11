@@ -1,0 +1,406 @@
+/*
+ * relay_client.c - Client-side Relay Connection Functions
+ * 
+ * This file contains ONLY the client-side functions for connecting
+ * TO an external relay server. The relay server itself (relay.exe)
+ * is built separately with relay.c.
+ * 
+ * Used by: RemoteDesk2K.exe (client)
+ * NOT used by: relay.exe (server)
+ */
+
+#include "relay.h"
+#include "crypto.h"
+
+/* Helper: Wait for socket to be ready */
+static int WaitForSocketReady(SOCKET sock, BOOL bWrite, int timeoutMs)
+{
+    fd_set fds;
+    struct timeval tv;
+    int result;
+    
+    if (sock == INVALID_SOCKET) return -1;
+    
+    FD_ZERO(&fds);
+    FD_SET(sock, &fds);
+    
+    tv.tv_sec = timeoutMs / 1000;
+    tv.tv_usec = (timeoutMs % 1000) * 1000;
+    
+    if (bWrite) {
+        result = select(0, NULL, &fds, NULL, &tv);
+    } else {
+        result = select(0, &fds, NULL, NULL, &tv);
+    }
+    
+    if (result == SOCKET_ERROR) return -1;
+    if (result == 0) return 0;
+    return 1;
+}
+
+/* Helper: Send a relay packet with XOR encryption */
+static int SendRelayPacket(SOCKET sock, BYTE msgType, const BYTE *data, DWORD dataLength)
+{
+    RELAY_HEADER header;
+    BYTE *packet;
+    DWORD packetSize;
+    int result;
+    
+    if (sock == INVALID_SOCKET) return RD2K_ERR_SOCKET;
+    
+    packetSize = sizeof(RELAY_HEADER) + dataLength;
+    packet = (BYTE*)malloc(packetSize);
+    if (!packet) return RD2K_ERR_MEMORY;
+    
+    header.msgType = msgType;
+    header.flags = 0x01;  /* Flag: encrypted */
+    header.reserved = 0;
+    header.dataLength = dataLength;
+    
+    CopyMemory(packet, &header, sizeof(RELAY_HEADER));
+    if (data && dataLength > 0) {
+        CopyMemory(packet + sizeof(RELAY_HEADER), data, dataLength);
+        /* XOR encrypt the data portion */
+        Crypto_Encrypt(packet + sizeof(RELAY_HEADER), dataLength);
+    }
+    
+    result = send(sock, (const char*)packet, packetSize, 0);
+    free(packet);
+    
+    if (result == SOCKET_ERROR) {
+        return RD2K_ERR_SEND;
+    }
+    
+    return RD2K_SUCCESS;
+}
+
+/* ===== Client-side relay API ===== */
+
+/* Configure socket for optimal relay performance */
+static void ConfigureRelaySocket(SOCKET sock)
+{
+    int opt;
+    
+    /* Disable Nagle's algorithm for lower latency */
+    opt = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&opt, sizeof(opt));
+    
+    /* Increase socket buffers for large transfers */
+    opt = 512 * 1024;  /* 512KB */
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char*)&opt, sizeof(opt));
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char*)&opt, sizeof(opt));
+    
+    /* Enable keep-alive */
+    opt = 1;
+    setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (const char*)&opt, sizeof(opt));
+}
+
+int Relay_ConnectToServer(const char *relayServerAddr, WORD relayPort,
+                         DWORD clientId, SOCKET *pRelaySocket)
+{
+    struct sockaddr_in addr;
+    struct hostent *pHost;
+    unsigned long ipAddr;
+    SOCKET sock;
+    
+    if (!relayServerAddr || !pRelaySocket) return RD2K_ERR_SOCKET;
+    
+    sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET) return RD2K_ERR_SOCKET;
+    
+    ZeroMemory(&addr, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(relayPort);
+    
+    /* Resolve hostname/IP */
+    ipAddr = inet_addr(relayServerAddr);
+    if (ipAddr != INADDR_NONE) {
+        addr.sin_addr.s_addr = ipAddr;
+    } else {
+        pHost = gethostbyname(relayServerAddr);
+        if (!pHost) {
+            closesocket(sock);
+            return RD2K_ERR_CONNECT;
+        }
+        CopyMemory(&addr.sin_addr, pHost->h_addr, pHost->h_length);
+    }
+    
+    /* Connect to relay server */
+    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        closesocket(sock);
+        return RD2K_ERR_CONNECT;
+    }
+    
+    /* Configure socket options for performance */
+    ConfigureRelaySocket(sock);
+    
+    *pRelaySocket = sock;
+    return RD2K_SUCCESS;
+}
+
+int Relay_Register(SOCKET relaySocket, DWORD clientId)
+{
+    RELAY_REGISTER_MSG msg;
+    
+    if (relaySocket == INVALID_SOCKET) return RD2K_ERR_SOCKET;
+    
+    msg.clientId = clientId;
+    msg.reserved = 0;
+    
+    return SendRelayPacket(relaySocket, RELAY_MSG_REGISTER, (const BYTE*)&msg, sizeof(msg));
+}
+
+int Relay_RequestPartner(SOCKET relaySocket, DWORD partnerId, DWORD password)
+{
+    RELAY_CONNECT_REQUEST msg;
+    
+    if (relaySocket == INVALID_SOCKET) return RD2K_ERR_SOCKET;
+    
+    msg.partnerId = partnerId;
+    msg.password = password;
+    
+    return SendRelayPacket(relaySocket, RELAY_MSG_CONNECT_REQUEST, (const BYTE*)&msg, sizeof(msg));
+}
+
+int Relay_WaitForConnection(SOCKET relaySocket, DWORD timeoutMs)
+{
+    BYTE buffer[512];
+    DWORD recvLen;
+    RELAY_HEADER header;
+    RELAY_CONNECT_RESPONSE response;
+    int result;
+    
+    if (relaySocket == INVALID_SOCKET) return RD2K_ERR_SOCKET;
+    
+    /* Wait for response */
+    result = WaitForSocketReady(relaySocket, FALSE, timeoutMs);
+    if (result <= 0) {
+        return RD2K_ERR_TIMEOUT;
+    }
+    
+    recvLen = recv(relaySocket, (char*)buffer, sizeof(buffer), 0);
+    if (recvLen == 0 || recvLen == SOCKET_ERROR) {
+        return RD2K_ERR_RECV;
+    }
+    
+    if (recvLen < sizeof(RELAY_HEADER)) {
+        return RD2K_ERR_PROTOCOL;
+    }
+    
+    CopyMemory(&header, buffer, sizeof(RELAY_HEADER));
+    
+    /* Decrypt if encrypted */
+    if ((header.flags & 0x01) && header.dataLength > 0) {
+        Crypto_Decrypt(buffer + sizeof(RELAY_HEADER), header.dataLength);
+    }
+    
+    if (header.msgType != RELAY_MSG_CONNECT_RESPONSE) {
+        return RD2K_ERR_PROTOCOL;
+    }
+    
+    if (recvLen < sizeof(RELAY_HEADER) + sizeof(RELAY_CONNECT_RESPONSE)) {
+        return RD2K_ERR_PROTOCOL;
+    }
+    
+    CopyMemory(&response, buffer + sizeof(RELAY_HEADER), sizeof(RELAY_CONNECT_RESPONSE));
+    
+    return response.status;
+}
+
+/* Check if relay connection is still alive by trying to peek at socket */
+int Relay_CheckConnection(SOCKET relaySocket)
+{
+    fd_set readSet, errorSet;
+    struct timeval timeout;
+    int result;
+    char buf;
+    int err;
+    
+    if (relaySocket == INVALID_SOCKET) return RD2K_ERR_SOCKET;
+    
+    /* Check socket for errors */
+    FD_ZERO(&readSet);
+    FD_ZERO(&errorSet);
+    FD_SET(relaySocket, &readSet);
+    FD_SET(relaySocket, &errorSet);
+    
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 0;
+    
+    result = select(0, &readSet, NULL, &errorSet, &timeout);
+    
+    if (result == SOCKET_ERROR) {
+        return RD2K_ERR_SERVER_LOST;
+    }
+    
+    /* Check if there's an error condition */
+    if (FD_ISSET(relaySocket, &errorSet)) {
+        return RD2K_ERR_SERVER_LOST;
+    }
+    
+    /* If readable, check if it's because connection closed (recv returns 0) */
+    if (FD_ISSET(relaySocket, &readSet)) {
+        result = recv(relaySocket, &buf, 1, MSG_PEEK);
+        if (result == 0) {
+            return RD2K_ERR_SERVER_LOST;  /* Connection closed */
+        }
+        if (result == SOCKET_ERROR) {
+            err = WSAGetLastError();
+            if (err != WSAEWOULDBLOCK) {
+                return RD2K_ERR_SERVER_LOST;
+            }
+        }
+    }
+    
+    return RD2K_SUCCESS;
+}
+
+int Relay_SendData(SOCKET relaySocket, const BYTE *data, DWORD length)
+{
+    if (relaySocket == INVALID_SOCKET) return RD2K_ERR_SOCKET;
+    if (!data) return RD2K_ERR_SOCKET;
+    
+    return SendRelayPacket(relaySocket, RELAY_MSG_DATA, data, length);
+}
+
+/* 
+ * Helper to receive exact number of bytes, handling TCP fragmentation.
+ * Returns: bytes received, 0 on connection closed, -1 on socket error, -2 on timeout
+ */
+static int RecvExactClient(SOCKET sock, BYTE *buffer, int length, int timeoutMs)
+{
+    int totalRecv = 0;
+    int recvLen;
+    int waitResult;
+    int retries = 0;
+    int maxRetries = (timeoutMs / 50) + 5;  /* 50ms polling intervals */
+    
+    while (totalRecv < length) {
+        waitResult = WaitForSocketReady(sock, FALSE, 50);
+        
+        if (waitResult < 0) {
+            return -1;  /* Socket error */
+        }
+        
+        if (waitResult == 0) {
+            retries++;
+            if (retries > maxRetries) {
+                return -2;  /* Timeout */
+            }
+            continue;
+        }
+        
+        recvLen = recv(sock, (char*)(buffer + totalRecv), length - totalRecv, 0);
+        
+        if (recvLen == 0) {
+            return 0;  /* Connection closed - relay server stopped */
+        }
+        
+        if (recvLen == SOCKET_ERROR) {
+            int err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK) {
+                continue;
+            }
+            return -1;  /* Real error */
+        }
+        
+        totalRecv += recvLen;
+        retries = 0;
+    }
+    
+    return totalRecv;
+}
+
+int Relay_RecvData(SOCKET relaySocket, BYTE *buffer, DWORD bufferSize, DWORD timeoutMs)
+{
+    RELAY_HEADER header;
+    BYTE headerBuf[sizeof(RELAY_HEADER)];
+    int recvLen;
+    int result;
+    
+    if (relaySocket == INVALID_SOCKET) return RD2K_ERR_SOCKET;
+    if (!buffer) return RD2K_ERR_SOCKET;
+    
+    /* Wait for data to be available */
+    result = WaitForSocketReady(relaySocket, FALSE, timeoutMs);
+    if (result < 0) {
+        return RD2K_ERR_RECV;
+    }
+    if (result == 0) {
+        return 0;  /* Timeout */
+    }
+    
+    /* Step 1: Receive the relay header (8 bytes) completely */
+    recvLen = RecvExactClient(relaySocket, headerBuf, sizeof(RELAY_HEADER), timeoutMs);
+    
+    if (recvLen == 0) {
+        return RD2K_ERR_SERVER_LOST;  /* Connection to relay server closed */
+    }
+    if (recvLen < 0) {
+        return RD2K_ERR_RECV;
+    }
+    if (recvLen < (int)sizeof(RELAY_HEADER)) {
+        return RD2K_ERR_SERVER_LOST;  /* Partial header indicates server disconnect */
+    }
+    
+    CopyMemory(&header, headerBuf, sizeof(RELAY_HEADER));
+    
+    /* Check if it's a DATA message */
+    if (header.msgType != RELAY_MSG_DATA) {
+        /* Not a data message - could be ping/disconnect/partner left */
+        if (header.msgType == RELAY_MSG_DISCONNECT) {
+            return RD2K_ERR_DISCONNECTED;
+        }
+        if (header.msgType == RELAY_MSG_PARTNER_DISCONNECTED) {
+            /* Partner has disconnected from relay - consume payload if any */
+            if (header.dataLength > 0 && header.dataLength <= sizeof(RELAY_PARTNER_DISCONNECTED)) {
+                RecvExactClient(relaySocket, buffer, header.dataLength, 1000);
+            }
+            return RD2K_ERR_PARTNER_LEFT;
+        }
+        /* Skip non-data message payload if any */
+        if (header.dataLength > 0 && header.dataLength < bufferSize) {
+            RecvExactClient(relaySocket, buffer, header.dataLength, 1000);
+        }
+        return 0;  /* Ignore, caller should retry */
+    }
+    
+    /* Validate data length */
+    if (header.dataLength == 0) {
+        return 0;  /* Empty data packet */
+    }
+    if (header.dataLength > bufferSize) {
+        /* Data too large for buffer - this is a problem */
+        /* Try to drain the socket to stay in sync */
+        DWORD remaining = header.dataLength;
+        while (remaining > 0) {
+            DWORD chunk = (remaining > bufferSize) ? bufferSize : remaining;
+            recvLen = RecvExactClient(relaySocket, buffer, chunk, 5000);
+            if (recvLen <= 0) break;
+            remaining -= recvLen;
+        }
+        return 0;  /* Data was too large, discarded */
+    }
+    
+    /* Step 2: Receive the complete data payload */
+    recvLen = RecvExactClient(relaySocket, buffer, header.dataLength, 30000);
+    
+    if (recvLen == 0) {
+        return RD2K_ERR_SERVER_LOST;  /* Connection to relay server lost */
+    }
+    if (recvLen < 0) {
+        return RD2K_ERR_RECV;
+    }
+    
+    if ((DWORD)recvLen < header.dataLength) {
+        /* Incomplete data - corrupted stream */
+        return RD2K_ERR_RECV;
+    }
+    
+    /* Decrypt if encrypted */
+    if (header.flags & 0x01) {
+        Crypto_Decrypt(buffer, recvLen);
+    }
+    
+    return recvLen;
+}

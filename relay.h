@@ -4,9 +4,11 @@
  * Allows two clients behind NAT to connect through a central relay server
  */
 
+
 #ifndef _REMOTEDESK2K_RELAY_H_
 #define _REMOTEDESK2K_RELAY_H_
 
+// Always include the central project header first
 #include "common.h"
 
 /* Relay server configuration */
@@ -24,6 +26,7 @@
 #define RELAY_MSG_DISCONNECT        0x54    /* Graceful disconnect */
 #define RELAY_MSG_PING              0x55    /* Keep-alive ping */
 #define RELAY_MSG_PONG              0x56    /* Keep-alive response */
+#define RELAY_MSG_PARTNER_DISCONNECTED 0x57 /* Partner has disconnected */
 
 /* Relay protocol header for relay-specific messages */
 #pragma pack(push, 1)
@@ -53,6 +56,19 @@ typedef struct _RELAY_CONNECT_RESPONSE {
     DWORD   reserved;
 } RELAY_CONNECT_RESPONSE, *PRELAY_CONNECT_RESPONSE;
 
+/* Disconnect reason codes */
+#define RELAY_DISCONNECT_NORMAL         0   /* Normal graceful disconnect */
+#define RELAY_DISCONNECT_ERROR          1   /* Connection error */
+#define RELAY_DISCONNECT_TIMEOUT        2   /* Connection timeout */
+#define RELAY_DISCONNECT_PARTNER_LEFT   3   /* Partner disconnected */
+#define RELAY_DISCONNECT_SERVER_STOP    4   /* Relay server stopping */
+
+/* Partner disconnected notification */
+typedef struct _RELAY_PARTNER_DISCONNECTED {
+    DWORD   reason;         /* RELAY_DISCONNECT_* */
+    DWORD   partnerId;      /* ID of partner that disconnected */
+} RELAY_PARTNER_DISCONNECTED, *PRELAY_PARTNER_DISCONNECTED;
+
 #pragma pack(pop)
 
 /* Relay connection state machine */
@@ -73,6 +89,7 @@ typedef struct _RELAY_CONNECTION {
     HANDLE              hThread;            /* Worker thread handle */
     HANDLE              hDisconnectEvent;   /* Signal to stop worker thread */
     struct _RELAY_CONNECTION* pPartner;     /* Paired connection (if any) */
+    struct _RELAY_SERVER* pServer;          /* Parent server reference */
     BYTE*               recvBuffer;         /* Receive buffer */
     DWORD               recvBufferSize;
     DWORD               recvPos;            /* Current position in buffer */
@@ -89,8 +106,8 @@ typedef struct _RELAY_STATS {
 
 /* ===== Relay Server API ===== */
 
-/* Initialize relay server on specified port */
-PRELAY_SERVER Relay_Create(WORD port);
+/* Initialize relay server on specified port and IP */
+PRELAY_SERVER Relay_Create(WORD port, const char* ipAddr);
 
 /* Start relay server (blocking or threaded) */
 int Relay_Start(PRELAY_SERVER pRelay);
@@ -103,6 +120,16 @@ void Relay_Destroy(PRELAY_SERVER pRelay);
 
 /* Get relay server statistics */
 void Relay_GetStats(PRELAY_SERVER pRelay, PRELAY_STATS pStats);
+
+/* ===== Logging Callback ===== */
+
+/* Logging callback function type */
+typedef void (*RELAY_LOG_CALLBACK)(const char* message);
+
+/* Set logging callback for console output
+   - pfnCallback: Function to call with log messages
+   Pass NULL to disable logging */
+void Relay_SetLogCallback(RELAY_LOG_CALLBACK pfnCallback);
 
 /* ===== Client-side Relay Connection ===== */
 
@@ -139,6 +166,11 @@ int Relay_WaitForConnection(SOCKET relaySocket, DWORD timeoutMs);
    - length: Length of data
    Returns: bytes sent or negative error code */
 int Relay_SendData(SOCKET relaySocket, const BYTE *data, DWORD length);
+
+/* Check if relay connection is still alive
+   - relaySocket: Socket to relay server
+   Returns: RD2K_SUCCESS = connected, RD2K_ERR_SERVER_LOST = disconnected */
+int Relay_CheckConnection(SOCKET relaySocket);
 
 /* Receive data through relay tunnel (non-blocking or timeout)
    - relaySocket: Socket to relay server

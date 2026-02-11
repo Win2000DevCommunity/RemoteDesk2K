@@ -37,47 +37,22 @@ echo.
 
 REM Compile all source files
 REM DDK compiler doesn't have /GS flag (older compiler)
+REM NOTE: relay_client.c is for CLIENT connecting TO relay server
+REM       relay.c is for RELAY SERVER only (built by build_relay.bat)
 echo Compiling source files...
 "%CL_PATH%" /nologo /O2 /W3 /D_WIN32_WINNT=0x0500 /DWINVER=0x0500 /D_WIN32_IE=0x0500 ^
    /I"%DDK_PATH%\inc\crt" /I"%SDK_PATH%\Include" /I"%DDK_PATH%\inc\w2k" ^
-   /c screen.c network.c input.c clipboard.c filetransfer.c progress.c remotedesk2k.c nogs.c crypto.c
+   /c screen.c network.c input.c remotedesk2k.c nogs.c server_config_tab.c clipboard.c filetransfer.c progress.c crypto.c relay_client.c
 if errorlevel 1 goto :error
 
 REM Link all objects
 echo Linking RemoteDesk2K.exe...
 "%LINK_PATH%" /nologo /subsystem:windows ^
      /LIBPATH:"%SDK_PATH%\Lib" /LIBPATH:"%DDK_PATH%\lib\crt\i386" /LIBPATH:"%DDK_PATH%\lib\w2k\i386" ^
-     screen.obj network.obj input.obj clipboard.obj filetransfer.obj progress.obj remotedesk2k.obj nogs.obj crypto.obj ^
+     screen.obj network.obj input.obj remotedesk2k.obj nogs.obj server_config_tab.obj clipboard.obj filetransfer.obj progress.obj crypto.obj relay_client.obj ^
      kernel32.lib user32.lib gdi32.lib ws2_32.lib comctl32.lib ^
      comdlg32.lib shell32.lib advapi32.lib ole32.lib oleaut32.lib ^
      /out:RemoteDesk2K.exe
 if errorlevel 1 goto :error
 
-echo.
-echo ============================================================
-echo BUILD SUCCESSFUL!
-echo Output: RemoteDesk2K.exe
-echo ============================================================
-echo.
-echo Features:
-echo   - UltraViewer-like interface
-echo   - ID and Password authentication  
-echo   - Encrypted ID (hides real IP address)
-echo   - File transfer support
-echo   - Clipboard sharing
-echo   - Full screen mode (F11)
-echo   - Stretch to fit display
-echo.
-goto :end
-
-:error
-echo.
-echo ============================================================
-echo BUILD FAILED!
-echo ============================================================
-pause
-exit /b 1
-
-:end
-endlocal
-pause
+echo Linking relay.exe (GUI relay server)...
