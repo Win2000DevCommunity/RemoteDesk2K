@@ -1491,6 +1491,35 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
             return 0;
         
+        case WM_NCLBUTTONDOWN:
+        {
+            /*
+             * Intercept title bar button clicks to prevent the modal tracking loop
+             * from blocking our timer-based network/screen processing.
+             * Instead of letting DefWindowProc handle these synchronously,
+             * we post the corresponding WM_SYSCOMMAND to handle them asynchronously.
+             */
+            switch (wParam) {
+                case HTMINBUTTON:
+                    /* Post minimize command - don't let DefWindowProc do modal tracking */
+                    PostMessageA(hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+                    return 0;
+                case HTMAXBUTTON:
+                    /* Check if maximized to decide restore or maximize */
+                    if (IsZoomed(hwnd)) {
+                        PostMessageA(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
+                    } else {
+                        PostMessageA(hwnd, WM_SYSCOMMAND, SC_MAXIMIZE, 0);
+                    }
+                    return 0;
+                case HTCLOSE:
+                    PostMessageA(hwnd, WM_SYSCOMMAND, SC_CLOSE, 0);
+                    return 0;
+            }
+            /* For other non-client areas (title bar drag, etc.), let DefWindowProc handle */
+            break;
+        }
+        
         case WM_CLOSE:
             StopServer();
             DisconnectFromPartner();
