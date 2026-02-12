@@ -41,7 +41,7 @@ REM NOTE: relay_client.c is for CLIENT connecting TO relay server
 REM       relay.c is for RELAY SERVER only (built by build_relay.bat)
 echo Compiling source files...
 "%CL_PATH%" /nologo /O2 /W3 /D_WIN32_WINNT=0x0500 /DWINVER=0x0500 /D_WIN32_IE=0x0500 ^
-   /I"%DDK_PATH%\inc\crt" /I"%SDK_PATH%\Include" /I"%DDK_PATH%\inc\w2k" /I"..\common" ^
+   /I"..\common" /I"%DDK_PATH%\inc\crt" /I"%DDK_PATH%\inc\w2k" /I"%SDK_PATH%\Include" ^
    /c ..\common\screen.c ..\common\network.c input.c remotedesk2k.c nogs.c server_config_tab.c clipboard.c filetransfer.c progress.c ..\common\crypto.c relay_client.c
 if errorlevel 1 goto :error
 

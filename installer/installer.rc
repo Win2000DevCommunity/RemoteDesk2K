@@ -4,4 +4,4 @@
 #define IDR_REMOTEDESK2K_EXE  1000
 
 /* The exe will be embedded as RCDATA resource */
-IDR_REMOTEDESK2K_EXE RCDATA "..\\RemoteDesk2K.exe"
+IDR_REMOTEDESK2K_EXE RCDATA "..\\client\\RemoteDesk2K.exe"

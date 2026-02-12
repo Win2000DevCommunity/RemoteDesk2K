@@ -27,9 +27,9 @@ if not exist "%CL_EXE%" (
 )
 
 REM Check if RemoteDesk2K.exe exists
-if not exist "..\RemoteDesk2K.exe" (
+if not exist "..\client\RemoteDesk2K.exe" (
     echo ERROR: RemoteDesk2K.exe not found!
-    echo Please run build.bat first to create RemoteDesk2K.exe
+    echo Please run client\build.bat first to create RemoteDesk2K.exe
     exit /b 1
 )
 
@@ -48,7 +48,7 @@ REM Step 2: Compile C source with DDK compiler (static CRT for Win2K compatibili
 echo Compiling source...
 "%CL_EXE%" /nologo /W3 /O2 /D_WIN32_WINNT=0x0500 /DWINVER=0x0500 ^
     /I"%CRT_INC%" /I"%SDK_INC%" /I"%W2K_INC%" ^
-    /c installer.c ..\nogs.c
+    /c installer.c ..\client\nogs.c
 if errorlevel 1 goto error
 
 REM Step 3: Link with DDK linker (static linking, Windows 2000 compatible)

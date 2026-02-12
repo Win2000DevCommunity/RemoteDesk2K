@@ -13,7 +13,7 @@ set SDK_LIB=%DDK_ROOT%\2000 sdk\Lib
 
 REM Compile all sources with dynamic CRT (/MD) and strict w2k headers
 cl.exe /nologo /W3 /Zi /MD /DWIN32 /D_WINDOWS /D_UNICODE /DUNICODE ^
-  /I"%W2K_INC%" /I"%CRT_INC%" /I"%SDK_INC%" /I"%COMMON%" ^
+  /I"%COMMON%" /I"%W2K_INC%" /I"%CRT_INC%" /I"%SDK_INC%" ^
   /c relay.c relay_gui.c relay_gui_main.c "%COMMON%\network.c" "%COMMON%\screen.c" security_cookie_stub.c "%COMMON%\crypto.c" || goto :error
 
 REM Link with MSVCRT and BufferOverflowU for security cookie stub
