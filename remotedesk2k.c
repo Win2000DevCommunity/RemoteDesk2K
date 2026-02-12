@@ -109,6 +109,10 @@
 #define TIMER_CLIPBOARD_REQUEST 6
 #define TIMER_RELAY_CHECK       7
 
+/* Custom Window Messages for async operations */
+#define WM_APP_CONNECT_RESULT   (WM_APP + 1)  /* wParam: result code, lParam: mode (0=direct, 1=relay) */
+#define WM_APP_CONNECT_STATUS   (WM_APP + 2)  /* wParam: 0, lParam: pointer to status string */
+
 /* Intervals */
 #define NETWORK_INTERVAL        10
 #define SCREEN_INTERVAL         100
@@ -209,6 +213,24 @@ static HWND             g_hToolbarWnd = NULL;
 static BOOL             g_bToolbarVisible = FALSE;
 static int              g_toolbarHeight = 32;
 
+/* Async connect thread data */
+typedef struct _CONNECT_THREAD_DATA {
+    BOOL    bRelayMode;      /* TRUE = relay, FALSE = direct */
+    DWORD   partnerId;
+    DWORD   partnerPwd;
+    char    host[64];        /* For direct connect */
+    int     result;          /* RD2K_SUCCESS or error code */
+    char    errorMsg[256];
+    /* Filled in on success for creating viewer */
+    WORD    remoteWidth;
+    WORD    remoteHeight;
+    BYTE    remoteBpp;
+    BYTE    remoteCompression;
+} CONNECT_THREAD_DATA, *PCONNECT_THREAD_DATA;
+
+static HANDLE           g_hConnectThread = NULL;
+static BOOL             g_bConnecting = FALSE;  /* TRUE while connection in progress */
+
 /* File transfer state - now handled by filetransfer module */
 
 /* Function prototypes */
@@ -236,6 +258,8 @@ void SendClipboardData(PRD2K_NETWORK pNet);
 void ReceiveClipboardText(const BYTE *data, DWORD length);
 void SendFileToRemote(const char *filePath);
 void SendClipboardFiles(PRD2K_NETWORK pNet);
+static DWORD WINAPI ConnectThreadProc(LPVOID lpParam);
+void HandleConnectResult(int result, BOOL bRelayMode, PCONNECT_THREAD_DATA pData);
 void ReceiveFileStart(const BYTE *data, DWORD length);
 void ReceiveFileData(const BYTE *data, DWORD length);
 void ReceiveFileEnd(void);
@@ -763,18 +787,212 @@ void ConnectToRelayServer(void)
     UpdateStatusBar("Connected to relay - enter partner ID", TRUE);
 }
 
+/* Background thread for connection - keeps UI responsive */
+static DWORD WINAPI ConnectThreadProc(LPVOID lpParam)
+{
+    PCONNECT_THREAD_DATA pData = (PCONNECT_THREAD_DATA)lpParam;
+    int result;
+    RD2K_HANDSHAKE handshake;
+    RD2K_HEADER header;
+    int screenW, screenH;
+    
+    if (!pData) return 1;
+    
+    ScreenCapture_GetDimensions(&screenW, &screenH);
+    
+    if (pData->bRelayMode) {
+        /* ========== RELAY MODE CONNECTION ========== */
+        EnterCriticalSection(&g_csRelay);
+        
+        /* Request connection to partner */
+        result = Relay_RequestPartner(g_relaySocket, pData->partnerId, pData->partnerPwd);
+        if (result != RD2K_SUCCESS) {
+            LeaveCriticalSection(&g_csRelay);
+            pData->result = RD2K_ERR_CONNECT;
+            lstrcpyA(pData->errorMsg, "Partner not found on relay server!");
+            PostMessage(g_hMainWnd, WM_APP_CONNECT_RESULT, (WPARAM)pData->result, (LPARAM)pData);
+            return 0;
+        }
+        
+        /* Wait for relay to pair us - this can take up to 30 seconds */
+        result = Relay_WaitForConnection(g_relaySocket, 30000);
+        if (result != RD2K_SUCCESS) {
+            LeaveCriticalSection(&g_csRelay);
+            pData->result = RD2K_ERR_TIMEOUT;
+            lstrcpyA(pData->errorMsg, "Relay connection timed out!");
+            PostMessage(g_hMainWnd, WM_APP_CONNECT_RESULT, (WPARAM)pData->result, (LPARAM)pData);
+            return 0;
+        }
+        
+        LeaveCriticalSection(&g_csRelay);
+        
+        /* Create client network structure for relay mode */
+        g_pClientNet = Network_Create(RD2K_LISTEN_PORT);
+        if (!g_pClientNet) {
+            pData->result = RD2K_ERR_MEMORY;
+            lstrcpyA(pData->errorMsg, "Failed to create connection!");
+            PostMessage(g_hMainWnd, WM_APP_CONNECT_RESULT, (WPARAM)pData->result, (LPARAM)pData);
+            return 0;
+        }
+        
+        /* Set relay mode */
+        g_pClientNet->bRelayMode = TRUE;
+        g_pClientNet->relaySocket = g_relaySocket;
+    }
+    else {
+        /* ========== DIRECT MODE CONNECTION ========== */
+        g_pClientNet = Network_Create(RD2K_LISTEN_PORT);
+        if (!g_pClientNet) {
+            pData->result = RD2K_ERR_MEMORY;
+            lstrcpyA(pData->errorMsg, "Failed to create connection!");
+            PostMessage(g_hMainWnd, WM_APP_CONNECT_RESULT, (WPARAM)pData->result, (LPARAM)pData);
+            return 0;
+        }
+        
+        /* Direct P2P connection */
+        result = Network_Connect(g_pClientNet, pData->host, RD2K_LISTEN_PORT);
+        if (result != RD2K_SUCCESS) {
+            Network_Destroy(g_pClientNet);
+            g_pClientNet = NULL;
+            pData->result = RD2K_ERR_CONNECT;
+            lstrcpyA(pData->errorMsg, "Failed to connect to partner!");
+            PostMessage(g_hMainWnd, WM_APP_CONNECT_RESULT, (WPARAM)pData->result, (LPARAM)pData);
+            return 0;
+        }
+    }
+    
+    /* Send handshake */
+    handshake.magic = RD2K_MAGIC;
+    handshake.yourId = g_myId;
+    handshake.password = pData->partnerPwd;
+    handshake.screenWidth = (WORD)screenW;
+    handshake.screenHeight = (WORD)screenH;
+    handshake.colorDepth = 24;
+    handshake.compression = COMPRESS_RLE;
+    handshake.versionMajor = RD2K_VERSION_MAJOR;
+    handshake.versionMinor = RD2K_VERSION_MINOR;
+    
+    Network_SendPacket(g_pClientNet, MSG_HANDSHAKE,
+                      (const BYTE*)&handshake, sizeof(handshake));
+    
+    /* Receive response - blocking */
+    result = Network_RecvPacket(g_pClientNet, &header,
+                               g_pClientNet->recvBuffer,
+                               g_pClientNet->recvBufferSize);
+    
+    if (result != RD2K_SUCCESS || header.msgType != MSG_HANDSHAKE_ACK) {
+        Network_Destroy(g_pClientNet);
+        g_pClientNet = NULL;
+        pData->result = RD2K_ERR_AUTH;
+        lstrcpyA(pData->errorMsg, "Authentication failed!\nWrong password or partner refused.");
+        PostMessage(g_hMainWnd, WM_APP_CONNECT_RESULT, (WPARAM)pData->result, (LPARAM)pData);
+        return 0;
+    }
+    
+    /* Parse response and store screen info */
+    {
+        RD2K_HANDSHAKE *pResponse = (RD2K_HANDSHAKE*)g_pClientNet->recvBuffer;
+        pData->remoteWidth = pResponse->screenWidth;
+        pData->remoteHeight = pResponse->screenHeight;
+        pData->remoteBpp = pResponse->colorDepth;
+        pData->remoteCompression = pResponse->compression;
+    }
+    
+    /* SUCCESS! */
+    pData->result = RD2K_SUCCESS;
+    pData->errorMsg[0] = '\0';
+    PostMessage(g_hMainWnd, WM_APP_CONNECT_RESULT, (WPARAM)RD2K_SUCCESS, (LPARAM)pData);
+    return 0;
+}
+
+/* Handle connection result from background thread */
+void HandleConnectResult(int result, BOOL bRelayMode, PCONNECT_THREAD_DATA pData)
+{
+    g_bConnecting = FALSE;
+    
+    if (g_hConnectThread) {
+        CloseHandle(g_hConnectThread);
+        g_hConnectThread = NULL;
+    }
+    
+    if (result != RD2K_SUCCESS) {
+        /* Connection failed - show error and reset UI */
+        if (bRelayMode) {
+            SetWindowTextA(g_hRelayConnectPartnerBtn, "Connect to Partner");
+            EnableWindow(g_hRelayConnectPartnerBtn, TRUE);
+            EnableWindow(g_hRelayConnectSvrBtn, TRUE);
+        } else {
+            SetWindowTextA(g_hConnectBtn, "Connect to partner");
+            EnableWindow(g_hConnectBtn, TRUE);
+        }
+        UpdateStatusBar("Connection failed", FALSE);
+        MessageBoxA(g_hMainWnd, pData->errorMsg, APP_TITLE, MB_ICONERROR);
+        free(pData);
+        return;
+    }
+    
+    /* Connection succeeded - set up viewer */
+    g_remoteScreen.width = pData->remoteWidth;
+    g_remoteScreen.height = pData->remoteHeight;
+    g_remoteScreen.bitsPerPixel = pData->remoteBpp;
+    g_remoteScreen.compression = pData->remoteCompression;
+    
+    /* Create viewer window */
+    if (!CreateViewerWindow()) {
+        Network_Destroy(g_pClientNet);
+        g_pClientNet = NULL;
+        
+        if (bRelayMode) {
+            SetWindowTextA(g_hRelayConnectPartnerBtn, "Connect to Partner");
+            EnableWindow(g_hRelayConnectPartnerBtn, TRUE);
+            EnableWindow(g_hRelayConnectSvrBtn, TRUE);
+        } else {
+            SetWindowTextA(g_hConnectBtn, "Connect to partner");
+            EnableWindow(g_hConnectBtn, TRUE);
+        }
+        UpdateStatusBar("Failed to create viewer", FALSE);
+        free(pData);
+        return;
+    }
+    
+    g_bClientConnected2 = TRUE;
+    g_pClientNet->state = STATE_CONNECTED;
+    
+    /* Start timers for network processing */
+    SetTimer(g_hMainWnd, TIMER_NETWORK, NETWORK_INTERVAL, NULL);
+    SetTimer(g_hMainWnd, TIMER_PING, PING_INTERVAL, NULL);
+    
+    /* Request full screen */
+    Network_SendPacket(g_pClientNet, MSG_FULL_SCREEN_REQ, NULL, 0);
+    
+    if (bRelayMode) {
+        SetWindowTextA(g_hRelayConnectPartnerBtn, "Disconnect");
+        EnableWindow(g_hRelayConnectPartnerBtn, TRUE);
+        EnableWindow(g_hRelayConnectSvrBtn, FALSE);
+        UpdateStatusBar("Connected via relay", TRUE);
+    } else {
+        SetWindowTextA(g_hConnectBtn, "Disconnect");
+        EnableWindow(g_hConnectBtn, TRUE);
+        UpdateStatusBar("Connected to partner", TRUE);
+    }
+    
+    free(pData);
+}
+
 /* Step 2: Connect to partner through relay */
 void ConnectToPartnerViaRelay(void)
 {
     char idStr[64], pwdStr[32];
     DWORD partnerId, partnerPwd;
-    int result;
-    int screenW, screenH;
-    RD2K_HANDSHAKE handshake;
-    RD2K_HEADER header;
+    PCONNECT_THREAD_DATA pData;
     
     if (!g_bConnectedToRelay || g_relaySocket == INVALID_SOCKET) {
         MessageBoxA(g_hMainWnd, "Please connect to relay server first!", APP_TITLE, MB_ICONWARNING);
+        return;
+    }
+    
+    if (g_bConnecting) {
+        MessageBoxA(g_hMainWnd, "Connection already in progress!", APP_TITLE, MB_ICONWARNING);
         return;
     }
     
@@ -805,125 +1023,35 @@ void ConnectToPartnerViaRelay(void)
         return;
     }
     
-    UpdateStatusBar("Requesting partner...", FALSE);
+    /* Create thread data */
+    pData = (PCONNECT_THREAD_DATA)calloc(1, sizeof(CONNECT_THREAD_DATA));
+    if (!pData) {
+        MessageBoxA(g_hMainWnd, "Out of memory!", APP_TITLE, MB_ICONERROR);
+        return;
+    }
+    
+    pData->bRelayMode = TRUE;
+    pData->partnerId = partnerId;
+    pData->partnerPwd = partnerPwd;
+    
+    /* Update UI to show connecting */
+    UpdateStatusBar("Connecting...", FALSE);
     SetWindowTextA(g_hRelayConnectPartnerBtn, "Connecting...");
     EnableWindow(g_hRelayConnectPartnerBtn, FALSE);
     EnableWindow(g_hRelayConnectSvrBtn, FALSE);
     
-    EnterCriticalSection(&g_csRelay);
+    g_bConnecting = TRUE;
     
-    /* Request connection to partner */
-    result = Relay_RequestPartner(g_relaySocket, partnerId, partnerPwd);
-    if (result != RD2K_SUCCESS) {
-        LeaveCriticalSection(&g_csRelay);
-        UpdateStatusBar("Partner not found", FALSE);
+    /* Start background thread - UI stays responsive */
+    g_hConnectThread = CreateThread(NULL, 0, ConnectThreadProc, pData, 0, NULL);
+    if (!g_hConnectThread) {
+        g_bConnecting = FALSE;
+        free(pData);
         SetWindowTextA(g_hRelayConnectPartnerBtn, "Connect to Partner");
         EnableWindow(g_hRelayConnectPartnerBtn, TRUE);
         EnableWindow(g_hRelayConnectSvrBtn, TRUE);
-        MessageBoxA(g_hMainWnd, 
-                   "Partner not found on relay server!\n\n"
-                   "Make sure partner is connected to the same relay\n"
-                   "and has registered with their ID.",
-                   APP_TITLE, MB_ICONERROR);
-        return;
+        MessageBoxA(g_hMainWnd, "Failed to start connection thread!", APP_TITLE, MB_ICONERROR);
     }
-    
-    /* Wait for relay to pair us */
-    UpdateStatusBar("Waiting for partner...", FALSE);
-    result = Relay_WaitForConnection(g_relaySocket, 30000);
-    if (result != RD2K_SUCCESS) {
-        LeaveCriticalSection(&g_csRelay);
-        UpdateStatusBar("Connection timeout", FALSE);
-        SetWindowTextA(g_hRelayConnectPartnerBtn, "Connect to Partner");
-        EnableWindow(g_hRelayConnectPartnerBtn, TRUE);
-        EnableWindow(g_hRelayConnectSvrBtn, TRUE);
-        MessageBoxA(g_hMainWnd, "Relay connection timed out!", APP_TITLE, MB_ICONERROR);
-        return;
-    }
-    
-    LeaveCriticalSection(&g_csRelay);
-    
-    /* Create client network structure for relay mode */
-    g_pClientNet = Network_Create(RD2K_LISTEN_PORT);
-    if (!g_pClientNet) {
-        UpdateStatusBar("Failed to create connection", FALSE);
-        SetWindowTextA(g_hRelayConnectPartnerBtn, "Connect to Partner");
-        EnableWindow(g_hRelayConnectPartnerBtn, TRUE);
-        EnableWindow(g_hRelayConnectSvrBtn, TRUE);
-        return;
-    }
-    
-    /* Set relay mode on network structure */
-    g_pClientNet->bRelayMode = TRUE;
-    g_pClientNet->relaySocket = g_relaySocket;
-    
-    /* Send handshake through relay */
-    ScreenCapture_GetDimensions(&screenW, &screenH);
-    
-    handshake.magic = RD2K_MAGIC;
-    handshake.yourId = g_myId;
-    handshake.password = partnerPwd;
-    handshake.screenWidth = (WORD)screenW;
-    handshake.screenHeight = (WORD)screenH;
-    handshake.colorDepth = 24;
-    handshake.compression = COMPRESS_RLE;
-    handshake.versionMajor = RD2K_VERSION_MAJOR;
-    handshake.versionMinor = RD2K_VERSION_MINOR;
-    
-    Network_SendPacket(g_pClientNet, MSG_HANDSHAKE,
-                      (const BYTE*)&handshake, sizeof(handshake));
-    
-    /* Receive response */
-    result = Network_RecvPacket(g_pClientNet, &header,
-                               g_pClientNet->recvBuffer,
-                               g_pClientNet->recvBufferSize);
-    
-    if (result != RD2K_SUCCESS || header.msgType != MSG_HANDSHAKE_ACK) {
-        Network_Destroy(g_pClientNet);
-        g_pClientNet = NULL;
-        UpdateStatusBar("Authentication failed", FALSE);
-        SetWindowTextA(g_hRelayConnectPartnerBtn, "Connect to Partner");
-        EnableWindow(g_hRelayConnectPartnerBtn, TRUE);
-        EnableWindow(g_hRelayConnectSvrBtn, TRUE);
-        MessageBoxA(g_hMainWnd, "Authentication failed!\n\nWrong password or partner refused.",
-                   APP_TITLE, MB_ICONERROR);
-        return;
-    }
-    
-    /* Parse response */
-    {
-        RD2K_HANDSHAKE *pResponse = (RD2K_HANDSHAKE*)g_pClientNet->recvBuffer;
-        g_remoteScreen.width = pResponse->screenWidth;
-        g_remoteScreen.height = pResponse->screenHeight;
-        g_remoteScreen.bitsPerPixel = pResponse->colorDepth;
-        g_remoteScreen.compression = pResponse->compression;
-    }
-    
-    /* Create viewer window */
-    if (!CreateViewerWindow()) {
-        Network_Destroy(g_pClientNet);
-        g_pClientNet = NULL;
-        UpdateStatusBar("Failed to create viewer", FALSE);
-        SetWindowTextA(g_hRelayConnectPartnerBtn, "Connect to Partner");
-        EnableWindow(g_hRelayConnectPartnerBtn, TRUE);
-        EnableWindow(g_hRelayConnectSvrBtn, TRUE);
-        return;
-    }
-    
-    g_bClientConnected2 = TRUE;
-    g_pClientNet->state = STATE_CONNECTED;
-    
-    /* Start timers for network processing */
-    SetTimer(g_hMainWnd, TIMER_NETWORK, NETWORK_INTERVAL, NULL);
-    SetTimer(g_hMainWnd, TIMER_PING, PING_INTERVAL, NULL);
-    
-    /* Request full screen */
-    Network_SendPacket(g_pClientNet, MSG_FULL_SCREEN_REQ, NULL, 0);
-    
-    SetWindowTextA(g_hRelayConnectPartnerBtn, "Disconnect");
-    EnableWindow(g_hRelayConnectPartnerBtn, TRUE);
-    EnableWindow(g_hRelayConnectSvrBtn, FALSE);  /* Can't disconnect server while in session */
-    UpdateStatusBar("Connected via relay", TRUE);
 }
 
 /* Disconnect from relay server cleanly */
@@ -1206,6 +1334,16 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             FileTransfer_Cancel();
             if ((int)wParam != FT_ERR_CANCELLED) {
                 MessageBoxA(hwnd, FileTransfer_GetLastError(), APP_TITLE, MB_ICONERROR);
+            }
+            return 0;
+        }
+        
+        case WM_APP_CONNECT_RESULT:
+        {
+            /* Connection completed (success or failure) from background thread */
+            PCONNECT_THREAD_DATA pData = (PCONNECT_THREAD_DATA)lParam;
+            if (pData) {
+                HandleConnectResult((int)wParam, pData->bRelayMode, pData);
             }
             return 0;
         }
@@ -1813,10 +1951,12 @@ void ConnectToPartner(void)
 {
     char idStr[64], pwdStr[32], host[64];
     DWORD partnerId, partnerPwd;
-    int screenW, screenH;
-    RD2K_HANDSHAKE handshake;
-    RD2K_HEADER header;
-    int result;
+    PCONNECT_THREAD_DATA pData;
+    
+    if (g_bConnecting) {
+        MessageBoxA(g_hMainWnd, "Connection already in progress!", APP_TITLE, MB_ICONWARNING);
+        return;
+    }
     
     GetWindowTextA(g_hPartnerId, idStr, sizeof(idStr));
     GetWindowTextA(g_hPartnerPwd, pwdStr, sizeof(pwdStr));
@@ -1859,104 +1999,34 @@ void ConnectToPartner(void)
         }
     }
     
+    /* Create thread data */
+    pData = (PCONNECT_THREAD_DATA)calloc(1, sizeof(CONNECT_THREAD_DATA));
+    if (!pData) {
+        MessageBoxA(g_hMainWnd, "Out of memory!", APP_TITLE, MB_ICONERROR);
+        return;
+    }
+    
+    pData->bRelayMode = FALSE;
+    pData->partnerId = partnerId;
+    pData->partnerPwd = partnerPwd;
+    lstrcpyA(pData->host, host);
+    
+    /* Update UI to show connecting */
     UpdateStatusBar("Connecting...", FALSE);
     SetWindowTextA(g_hConnectBtn, "Connecting...");
     EnableWindow(g_hConnectBtn, FALSE);
     
-    /* Create client network */
-    g_pClientNet = Network_Create(RD2K_LISTEN_PORT);
-    if (!g_pClientNet) {
-        UpdateStatusBar("Failed to create connection", FALSE);
+    g_bConnecting = TRUE;
+    
+    /* Start background thread - UI stays responsive */
+    g_hConnectThread = CreateThread(NULL, 0, ConnectThreadProc, pData, 0, NULL);
+    if (!g_hConnectThread) {
+        g_bConnecting = FALSE;
+        free(pData);
         SetWindowTextA(g_hConnectBtn, "Connect to partner");
         EnableWindow(g_hConnectBtn, TRUE);
-        return;
+        MessageBoxA(g_hMainWnd, "Failed to start connection thread!", APP_TITLE, MB_ICONERROR);
     }
-    
-    /* Direct P2P connection (Tab 1 mode) */
-    result = Network_Connect(g_pClientNet, host, RD2K_LISTEN_PORT);
-    if (result != RD2K_SUCCESS) {
-        Network_Destroy(g_pClientNet);
-        g_pClientNet = NULL;
-        UpdateStatusBar("Connection failed", FALSE);
-        SetWindowTextA(g_hConnectBtn, "Connect to partner");
-        EnableWindow(g_hConnectBtn, TRUE);
-        MessageBoxA(g_hMainWnd, 
-                   "Failed to connect to partner!\n\n"
-                   "Please check:\n"
-                   "- Partner ID/IP is correct\n"
-                   "- Partner is running RemoteDesk2K\n"
-                   "- Both computers are on the same network\n"
-                   "- No firewall blocking the connection\n\n"
-                   "For connections across the internet,\n"
-                   "use the 'Relay Server' tab instead.",
-                   APP_TITLE, MB_ICONERROR);
-        return;
-    }
-    
-    /* Send handshake */
-    ScreenCapture_GetDimensions(&screenW, &screenH);
-    
-    handshake.magic = RD2K_MAGIC;
-    handshake.yourId = g_myId;
-    handshake.password = partnerPwd;
-    handshake.screenWidth = (WORD)screenW;
-    handshake.screenHeight = (WORD)screenH;
-    handshake.colorDepth = 24;
-    handshake.compression = COMPRESS_RLE;
-    handshake.versionMajor = RD2K_VERSION_MAJOR;
-    handshake.versionMinor = RD2K_VERSION_MINOR;
-    
-    Network_SendPacket(g_pClientNet, MSG_HANDSHAKE,
-                      (const BYTE*)&handshake, sizeof(handshake));
-    
-    /* Receive response */
-    result = Network_RecvPacket(g_pClientNet, &header,
-                               g_pClientNet->recvBuffer,
-                               g_pClientNet->recvBufferSize);
-    
-    if (result != RD2K_SUCCESS || header.msgType != MSG_HANDSHAKE_ACK) {
-        Network_Destroy(g_pClientNet);
-        g_pClientNet = NULL;
-        UpdateStatusBar("Authentication failed", FALSE);
-        SetWindowTextA(g_hConnectBtn, "Connect to partner");
-        EnableWindow(g_hConnectBtn, TRUE);
-        MessageBoxA(g_hMainWnd, "Authentication failed!\n\nWrong password or partner refused connection.",
-                   APP_TITLE, MB_ICONERROR);
-        return;
-    }
-    
-    /* Parse response */
-    {
-        RD2K_HANDSHAKE *pResponse = (RD2K_HANDSHAKE*)g_pClientNet->recvBuffer;
-        g_remoteScreen.width = pResponse->screenWidth;
-        g_remoteScreen.height = pResponse->screenHeight;
-        g_remoteScreen.bitsPerPixel = pResponse->colorDepth;
-        g_remoteScreen.compression = pResponse->compression;
-    }
-    
-    /* Create viewer window */
-    if (!CreateViewerWindow()) {
-        Network_Destroy(g_pClientNet);
-        g_pClientNet = NULL;
-        UpdateStatusBar("Failed to create viewer", FALSE);
-        SetWindowTextA(g_hConnectBtn, "Connect to partner");
-        EnableWindow(g_hConnectBtn, TRUE);
-        return;
-    }
-    
-    g_bClientConnected2 = TRUE;
-    g_pClientNet->state = STATE_CONNECTED;
-    
-    /* Start timers for network processing */
-    SetTimer(g_hMainWnd, TIMER_NETWORK, NETWORK_INTERVAL, NULL);
-    SetTimer(g_hMainWnd, TIMER_PING, PING_INTERVAL, NULL);
-    
-    /* Request full screen */
-    Network_SendPacket(g_pClientNet, MSG_FULL_SCREEN_REQ, NULL, 0);
-    
-    SetWindowTextA(g_hConnectBtn, "Disconnect");
-    EnableWindow(g_hConnectBtn, TRUE);
-    UpdateStatusBar("Connected to partner", TRUE);
 }
 
 /* Disconnect from partner */
