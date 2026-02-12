@@ -161,9 +161,16 @@ RemoteDesk2K/
 
 ## Network Requirements
 
-- Both computers must be on same network (or port forwarded)
+### Direct Connection (Same Network)
+- Both computers on same LAN, or port forwarding configured
 - Default port: **5901**
 - Firewall must allow incoming TCP on port 5901
+
+### Relay Connection (Through Internet)
+- No port forwarding needed on client side
+- Relay server must have public IP or port forwarding
+- Default relay port: **5000**
+- Clients connect to relay using **Server ID** (no IP needed)
 
 ## Protocol Overview
 
