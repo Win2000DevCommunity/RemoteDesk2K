@@ -1,0 +1,7 @@
+/* installer.rc - Resource file for RemoteDesk2K Installer */
+
+/* Embed RemoteDesk2K.exe as binary resource */
+#define IDR_REMOTEDESK2K_EXE  1000
+
+/* The exe will be embedded as RCDATA resource */
+IDR_REMOTEDESK2K_EXE RCDATA "..\\RemoteDesk2K.exe"

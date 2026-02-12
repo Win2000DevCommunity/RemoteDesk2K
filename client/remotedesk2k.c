@@ -28,6 +28,11 @@
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "shell32.lib")
 
+/* Client config file */
+#define CLIENT_CONFIG_FILE      "client_config.ini"
+#define CLIENT_CONFIG_SECTION   "Client"
+static char             g_szClientConfigPath[MAX_PATH] = {0};
+
 /* Application */
 #define APP_TITLE           "RemoteDesk2K"
 #define MAIN_WND_CLASS      "RD2KMainWndClass"
@@ -240,6 +245,7 @@ void SwitchTab(int tabIndex);
 void ConnectToRelayServer(void);
 void ConnectToPartnerViaRelay(void);
 void UpdateStatusBar(const char *text, BOOL connected);
+void RefreshMainWindow(void);
 void StartServer(void);
 void StopServer(void);
 void ConnectToPartner(void);
@@ -288,6 +294,68 @@ void HandlePartnerDisconnect(BOOL isServerSide);
 BOOL AttemptRelayReconnection(void);
 INT_PTR CALLBACK ReconnectDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 void DisconnectFromRelayServer(BOOL silent);
+
+/* ========================================================================== 
+ * CLIENT CONFIG FILE FUNCTIONS - Save/Load client settings
+ * ========================================================================== */
+
+/* Get config file path (same directory as exe) */
+static void GetClientConfigPath(void) {
+    char *lastSlash;
+    GetModuleFileNameA(NULL, g_szClientConfigPath, sizeof(g_szClientConfigPath));
+    lastSlash = strrchr(g_szClientConfigPath, '\\');
+    if (lastSlash) {
+        lastSlash[1] = '\0';
+    }
+    strcat(g_szClientConfigPath, CLIENT_CONFIG_FILE);
+}
+
+/* Save client config to INI file */
+static void SaveClientConfig(void) {
+    char serverIdStr[64], partnerIdStr[32];
+    
+    if (g_szClientConfigPath[0] == '\0') GetClientConfigPath();
+    
+    /* Get Server ID */
+    if (g_hServerId) {
+        GetWindowTextA(g_hServerId, serverIdStr, sizeof(serverIdStr));
+        WritePrivateProfileStringA(CLIENT_CONFIG_SECTION, "ServerID", serverIdStr, g_szClientConfigPath);
+    }
+    
+    /* Get Partner ID (relay tab) */
+    if (g_hRelayPartnerId) {
+        GetWindowTextA(g_hRelayPartnerId, partnerIdStr, sizeof(partnerIdStr));
+        WritePrivateProfileStringA(CLIENT_CONFIG_SECTION, "LastPartnerID", partnerIdStr, g_szClientConfigPath);
+    }
+    
+    /* Get Partner ID (direct tab) */
+    if (g_hPartnerId) {
+        GetWindowTextA(g_hPartnerId, partnerIdStr, sizeof(partnerIdStr));
+        WritePrivateProfileStringA(CLIENT_CONFIG_SECTION, "LastDirectPartnerID", partnerIdStr, g_szClientConfigPath);
+    }
+}
+
+/* Load client config from INI file */
+static void LoadClientConfig(void) {
+    char serverIdStr[64], partnerIdStr[32], directPartnerIdStr[32];
+    
+    if (g_szClientConfigPath[0] == '\0') GetClientConfigPath();
+    
+    GetPrivateProfileStringA(CLIENT_CONFIG_SECTION, "ServerID", "", serverIdStr, sizeof(serverIdStr), g_szClientConfigPath);
+    GetPrivateProfileStringA(CLIENT_CONFIG_SECTION, "LastPartnerID", "", partnerIdStr, sizeof(partnerIdStr), g_szClientConfigPath);
+    GetPrivateProfileStringA(CLIENT_CONFIG_SECTION, "LastDirectPartnerID", "", directPartnerIdStr, sizeof(directPartnerIdStr), g_szClientConfigPath);
+    
+    /* Apply loaded values to controls */
+    if (g_hServerId && serverIdStr[0] != '\0') {
+        SetWindowTextA(g_hServerId, serverIdStr);
+    }
+    if (g_hRelayPartnerId && partnerIdStr[0] != '\0') {
+        SetWindowTextA(g_hRelayPartnerId, partnerIdStr);
+    }
+    if (g_hPartnerId && directPartnerIdStr[0] != '\0') {
+        SetWindowTextA(g_hPartnerId, directPartnerIdStr);
+    }
+}
 
 /* Entry Point */
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
@@ -385,6 +453,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     
     ShowWindow(g_hMainWnd, nCmdShow);
     UpdateWindow(g_hMainWnd);
+    
+    /* Force initial refresh to fix display artifacts on startup */
+    RefreshMainWindow();
     
     /* Start server automatically */
     StartServer();
@@ -680,6 +751,9 @@ void SwitchTab(int tabIndex)
     ShowWindow(GetDlgItem(g_hMainWnd, IDC_RELAY_PARTNER_PWD_LABEL), showTab2);
     ShowWindow(g_hRelayPartnerPwd, showTab2);
     ShowWindow(g_hRelayConnectPartnerBtn, showTab2);
+    
+    /* Force refresh after tab switch to fix display artifacts */
+    RefreshMainWindow();
 }
 
 /* Step 1: Connect to relay server and register */
@@ -1288,6 +1362,23 @@ void UpdateStatusBar(const char *text, BOOL connected)
     char statusText[256];
     sprintf(statusText, "%s %s", connected ? "\x95" : "\x95", text);  /* Bullet point */
     SendMessageA(g_hStatusBar, SB_SETTEXTA, 0, (LPARAM)statusText);
+    
+    /* Force refresh to fix display artifacts on Windows 2000 and 10/11 */
+    RefreshMainWindow();
+}
+
+/*
+ * Refresh main window and all children
+ * Fixes display artifacts (blue background covering status bar, etc.)
+ * on Windows 2000 and modern Windows versions
+ */
+void RefreshMainWindow(void)
+{
+    if (!g_hMainWnd) return;
+    
+    /* Invalidate entire main window and all children */
+    RedrawWindow(g_hMainWnd, NULL, NULL, 
+                 RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN | RDW_ERASE);
 }
 
 /* Main window procedure */
@@ -1296,6 +1387,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     switch (msg) {
         case WM_CREATE:
             CreateMainControls(hwnd);
+            LoadClientConfig();  /* Load saved Server ID and Partner ID */
             UpdateStatusBar("Ready to connect", TRUE);
             return 0;
         
@@ -1522,6 +1614,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         
         case WM_CLOSE:
+            SaveClientConfig();  /* Save Server ID and Partner ID for next session */
             StopServer();
             DisconnectFromPartner();
             DestroyWindow(hwnd);

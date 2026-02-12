@@ -3,12 +3,22 @@
 *.exe
 *.pdb
 *.ilk
+*.res
+*.exp
+*.lib
+*.iso
+*.log
+*.inf
+
+# Runtime config files (generated at runtime)
+*.ini
 
 # Windows shortcuts
 *.lnk
 
 # VS Code
 .vscode/
+.vs/
 
 # Backup files
 *.bak

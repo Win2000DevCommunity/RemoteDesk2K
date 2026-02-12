@@ -7,6 +7,10 @@
 /* Custom message for thread-safe console logging */
 #define WM_RELAY_LOG (WM_USER + 100)
 
+/* Config file name */
+#define RELAY_CONFIG_FILE "relay_config.ini"
+#define RELAY_CONFIG_SECTION "RelayServer"
+
 // Global variables
 static HWND g_hMainWnd = NULL;  /* Main window handle for logging */
 static HWND hTab;
@@ -17,6 +21,50 @@ static PRELAY_SERVER g_pRelayServer = NULL;
 static BOOL relayRunning = FALSE;
 static CRITICAL_SECTION g_csLogQueue;
 static BOOL g_bLogCsInitialized = FALSE;
+static char g_szConfigPath[MAX_PATH] = {0};  /* Full path to config file */
+
+/* ========================================================================== 
+ * CONFIG FILE FUNCTIONS - Save/Load relay settings
+ * ========================================================================== */
+
+/* Get config file path (same directory as exe) */
+static void GetConfigFilePath(void) {
+    char *lastSlash;
+    GetModuleFileNameA(NULL, g_szConfigPath, sizeof(g_szConfigPath));
+    lastSlash = strrchr(g_szConfigPath, '\\');
+    if (lastSlash) {
+        lastSlash[1] = '\0';
+    }
+    strcat(g_szConfigPath, RELAY_CONFIG_FILE);
+}
+
+/* Save relay server config to INI file */
+static void SaveRelayConfig(const char* ip, const char* port, const char* serverId) {
+    if (g_szConfigPath[0] == '\0') GetConfigFilePath();
+    
+    WritePrivateProfileStringA(RELAY_CONFIG_SECTION, "IP", ip, g_szConfigPath);
+    WritePrivateProfileStringA(RELAY_CONFIG_SECTION, "Port", port, g_szConfigPath);
+    WritePrivateProfileStringA(RELAY_CONFIG_SECTION, "ServerID", serverId, g_szConfigPath);
+}
+
+/* Load relay server config from INI file */
+static void LoadRelayConfig(void) {
+    char ip[64], port[16], serverId[32];
+    
+    if (g_szConfigPath[0] == '\0') GetConfigFilePath();
+    
+    GetPrivateProfileStringA(RELAY_CONFIG_SECTION, "IP", "0.0.0.0", ip, sizeof(ip), g_szConfigPath);
+    GetPrivateProfileStringA(RELAY_CONFIG_SECTION, "Port", "5000", port, sizeof(port), g_szConfigPath);
+    GetPrivateProfileStringA(RELAY_CONFIG_SECTION, "ServerID", "", serverId, sizeof(serverId), g_szConfigPath);
+    
+    /* Apply loaded values to controls */
+    if (hEditIP) SetWindowTextA(hEditIP, ip);
+    if (hEditPort) SetWindowTextA(hEditPort, port);
+    if (hEditServerId && serverId[0] != '\0') {
+        SetWindowTextA(hEditServerId, serverId);
+        EnableWindow(hBtnCopyId, TRUE);
+    }
+}
 
 // Forward declarations (only those not in headers)
 static DWORD WINAPI RelayThreadProc(LPVOID lpParam);
@@ -157,6 +205,8 @@ static void StartRelayServer(HWND hwnd) {
         AppendConsoleA("[INFO] Server ID generated: ");
         AppendConsoleA(serverId);
         AppendConsoleA("\r\n[INFO] Distribute this ID to your client users.\r\n");
+        /* Save config for next startup */
+        SaveRelayConfig(ip, portStr, serverId);
     } else {
         SetWindowTextA(hEditServerId, "(Failed to generate)");
         EnableWindow(hBtnCopyId, FALSE);
@@ -238,6 +288,8 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         SendMessageW(hTab, TCM_INSERTITEMW, 1, (LPARAM)&tie);
         CreateAllControls(hwnd, rc);
         OnTabChange(hwnd);
+        /* Load saved config */
+        LoadRelayConfig();
         break; }
     case WM_NOTIFY:
         if (((LPNMHDR)lParam)->idFrom == IDC_TAB && ((LPNMHDR)lParam)->code == TCN_SELCHANGE) {
