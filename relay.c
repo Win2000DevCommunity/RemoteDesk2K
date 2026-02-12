@@ -140,7 +140,9 @@ static PRELAY_CONNECTION FindConnectionById(PRELAY_SERVER pServer, DWORD clientI
     
     EnterCriticalSection(&pServer->csConnections);
     
-    for (i = 0; i < pServer->activeConnections; i++) {
+    /* IMPORTANT: Iterate ALL slots, not just activeConnections count
+     * because the array can be sparse after disconnections */
+    for (i = 0; i < pServer->maxConnections; i++) {
         if (pServer->connections[i] && 
             pServer->connections[i]->clientId == clientId &&
             pServer->connections[i]->state != RELAY_STATE_DISCONNECTED) {
@@ -152,6 +154,48 @@ static PRELAY_CONNECTION FindConnectionById(PRELAY_SERVER pServer, DWORD clientI
     
     LeaveCriticalSection(&pServer->csConnections);
     return NULL;
+}
+
+/* Remove stale connections with same clientId (for reconnection handling) */
+static void RemoveStaleConnections(PRELAY_SERVER pServer, DWORD clientId, PRELAY_CONNECTION pExclude)
+{
+    DWORD i;
+    
+    if (!pServer) return;
+    
+    EnterCriticalSection(&pServer->csConnections);
+    
+    for (i = 0; i < pServer->maxConnections; i++) {
+        PRELAY_CONNECTION pConn = pServer->connections[i];
+        if (pConn && pConn != pExclude && pConn->clientId == clientId) {
+            /* Found stale connection with same ID - mark for cleanup */
+            char idStr[20];
+            FormatClientId(clientId, idStr);
+            RelayLog("[CLEANUP] Removing stale connection for ID %s (state=%d)\r\n", 
+                    idStr, pConn->state);
+            
+            /* Signal disconnect and close socket */
+            if (pConn->hDisconnectEvent) {
+                SetEvent(pConn->hDisconnectEvent);
+            }
+            if (pConn->socket != INVALID_SOCKET) {
+                closesocket(pConn->socket);
+                pConn->socket = INVALID_SOCKET;
+            }
+            pConn->state = RELAY_STATE_DISCONNECTED;
+            
+            /* Clear slot and update count */
+            pServer->connections[i] = NULL;
+            if (pServer->activeConnections > 0) {
+                pServer->activeConnections--;
+            }
+            
+            /* Note: Connection struct will be freed by its worker thread or leaked
+             * if thread already exited. For a proper fix, we'd need reference counting. */
+        }
+    }
+    
+    LeaveCriticalSection(&pServer->csConnections);
 }
 
 /* Configure client socket for optimal relay performance */
@@ -292,6 +336,12 @@ static int ProcessRelayMessage(PRELAY_SERVER pServer, PRELAY_CONNECTION pConn,
                 return -1;
             }
             CopyMemory(&reg, buffer + sizeof(RELAY_HEADER), sizeof(RELAY_REGISTER_MSG));
+            
+            /* IMPORTANT: Remove any stale connections with this clientId first.
+             * This handles the case where a client disconnected and reconnected,
+             * leaving old connection entries in the array. */
+            RemoveStaleConnections(pServer, reg.clientId, pConn);
+            
             pConn->clientId = reg.clientId;
             pConn->state = RELAY_STATE_REGISTERED;
             pConn->lastActivity = GetTickCount();
@@ -562,6 +612,40 @@ static DWORD WINAPI ClientWorkerThread(LPVOID lpParam)
     pConn->pPartner = NULL;
     
     free(buffer);  /* Free heap buffer */
+    
+    /* IMPORTANT: Remove connection from server's array to allow slot reuse.
+     * This prevents stale entries from piling up and causing lookup issues. */
+    {
+        DWORD i;
+        EnterCriticalSection(&pServer->csConnections);
+        for (i = 0; i < pServer->maxConnections; i++) {
+            if (pServer->connections[i] == pConn) {
+                pServer->connections[i] = NULL;
+                if (pServer->activeConnections > 0) {
+                    pServer->activeConnections--;
+                }
+                break;
+            }
+        }
+        LeaveCriticalSection(&pServer->csConnections);
+        
+        /* Close socket and free resources */
+        if (pConn->socket != INVALID_SOCKET) {
+            closesocket(pConn->socket);
+            pConn->socket = INVALID_SOCKET;
+        }
+        if (pConn->recvBuffer) {
+            free(pConn->recvBuffer);
+            pConn->recvBuffer = NULL;
+        }
+        if (pConn->hDisconnectEvent) {
+            CloseHandle(pConn->hDisconnectEvent);
+            pConn->hDisconnectEvent = NULL;
+        }
+        /* Note: Don't free pConn here - the thread handle is still in use.
+         * The connection struct will be cleaned up when server stops. */
+    }
+    
     return 0;
 }
 

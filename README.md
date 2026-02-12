@@ -123,7 +123,9 @@ RemoteDesk2K/
 | Full Screen | ✓ | ✓ | ✓ |
 | Encryption | ✓ | ✓ | ✓ |
 | Relay Server | ✓ | ✓ | ✓ |
-| Win2000 Support | ✓ | ✗ | ✗ |
+| Win2000 Support | ✓ | ~* | ✗ |
+
+*AnyDesk has unofficial Win2000 support (older versions)
 
 ## Limitations
 
