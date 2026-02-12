@@ -1,33 +1,86 @@
+/*
+ * relay_gui.c - Beautiful Windows 2000 Classic Style GUI for Relay Server
+ * RemoteDesk2K Project (C) 2026
+ * 
+ * Features:
+ * - Classic Windows 2000 look with Info background colors
+ * - Professional layout with grouped sections
+ * - Status bar showing connection count
+ * - Console log with timestamped entries
+ */
 
-// relay_gui.c - Windows 2000 compatible GUI for relay server
-#include "relay_gui.h" // central header for GUI, includes common.h
-#include "relay.h"     // relay server types and functions
-#include "crypto.h"    // XOR encryption for relay messages
+#include "relay_gui.h"
+#include "relay.h"
+#include "crypto.h"
 
-/* Custom message for thread-safe console logging */
-#define WM_RELAY_LOG (WM_USER + 100)
+/* Custom messages */
+#define WM_RELAY_LOG        (WM_USER + 100)
+#define WM_UPDATE_STATUS    (WM_USER + 101)
 
-/* Config file name */
-#define RELAY_CONFIG_FILE "relay_config.ini"
-#define RELAY_CONFIG_SECTION "RelayServer"
+/* Config file */
+#define RELAY_CONFIG_FILE       "relay_config.ini"
+#define RELAY_CONFIG_SECTION    "RelayServer"
 
-// Global variables
-static HWND g_hMainWnd = NULL;  /* Main window handle for logging */
-static HWND hTab;
-static HWND hEditIP, hEditPort, hBtnStart;
-static HWND hEditServerId, hBtnCopyId;  /* Server ID display and copy */
-static HWND hEditConsole;
+/* Window dimensions */
+#define MAIN_WIDTH      520
+#define MAIN_HEIGHT     400
+
+/* Colors - Classic Windows 2000 style */
+#define COLOR_PANEL_BG      GetSysColor(COLOR_INFOBK)
+#define COLOR_HEADER_BG     RGB(100, 149, 237)  /* CornflowerBlue */
+#define COLOR_HEADER_TEXT   RGB(255, 255, 255)
+#define COLOR_STATUS_OK     RGB(0, 128, 0)
+#define COLOR_STATUS_WARN   RGB(200, 100, 0)
+
+/* Control IDs */
+#define IDC_HEADER          2000
+#define IDC_GROUP_SERVER    2001
+#define IDC_GROUP_SERVERID  2002
+#define IDC_GROUP_CONSOLE   2003
+#define IDC_STATUSBAR       2004
+#define IDC_LBL_IP          2005
+#define IDC_LBL_PORT        2006
+#define IDC_LBL_SERVERID    2007
+#define IDC_LBL_STATUS      2008
+#define IDC_CONNECTED_COUNT 2009
+
+/* Global variables */
+static HINSTANCE g_hInstance = NULL;
+static HWND g_hMainWnd = NULL;
+static HWND g_hStatusBar = NULL;
+static HFONT g_hFontNormal = NULL;
+static HFONT g_hFontBold = NULL;
+static HFONT g_hFontLarge = NULL;
+static HFONT g_hFontMono = NULL;
+static HBRUSH g_hBrushPanel = NULL;
+static HBRUSH g_hBrushHeader = NULL;
+
+/* Controls */
+static HWND hEditIP = NULL;
+static HWND hEditPort = NULL;
+static HWND hBtnStart = NULL;
+static HWND hEditServerId = NULL;
+static HWND hBtnCopyId = NULL;
+static HWND hEditConsole = NULL;
+static HWND hLblConnected = NULL;
+
+/* Relay server state */
 static PRELAY_SERVER g_pRelayServer = NULL;
-static BOOL relayRunning = FALSE;
-static CRITICAL_SECTION g_csLogQueue;
-static BOOL g_bLogCsInitialized = FALSE;
-static char g_szConfigPath[MAX_PATH] = {0};  /* Full path to config file */
+static BOOL g_bRelayRunning = FALSE;
+static char g_szConfigPath[MAX_PATH] = {0};
+
+/* Forward declarations */
+static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+static void CreateMainControls(HWND hwnd);
+static void StartRelayServer(HWND hwnd);
+static void StopRelayServer(HWND hwnd);
+static void UpdateStatusBar(const char *text, BOOL running);
+static void AppendConsoleLog(const char *text);
 
 /* ========================================================================== 
- * CONFIG FILE FUNCTIONS - Save/Load relay settings
+ * CONFIG FILE FUNCTIONS
  * ========================================================================== */
 
-/* Get config file path (same directory as exe) */
 static void GetConfigFilePath(void) {
     char *lastSlash;
     GetModuleFileNameA(NULL, g_szConfigPath, sizeof(g_szConfigPath));
@@ -38,16 +91,13 @@ static void GetConfigFilePath(void) {
     strcat(g_szConfigPath, RELAY_CONFIG_FILE);
 }
 
-/* Save relay server config to INI file */
 static void SaveRelayConfig(const char* ip, const char* port, const char* serverId) {
     if (g_szConfigPath[0] == '\0') GetConfigFilePath();
-    
     WritePrivateProfileStringA(RELAY_CONFIG_SECTION, "IP", ip, g_szConfigPath);
     WritePrivateProfileStringA(RELAY_CONFIG_SECTION, "Port", port, g_szConfigPath);
     WritePrivateProfileStringA(RELAY_CONFIG_SECTION, "ServerID", serverId, g_szConfigPath);
 }
 
-/* Load relay server config from INI file */
 static void LoadRelayConfig(void) {
     char ip[64], port[16], serverId[32];
     
@@ -57,7 +107,6 @@ static void LoadRelayConfig(void) {
     GetPrivateProfileStringA(RELAY_CONFIG_SECTION, "Port", "5000", port, sizeof(port), g_szConfigPath);
     GetPrivateProfileStringA(RELAY_CONFIG_SECTION, "ServerID", "", serverId, sizeof(serverId), g_szConfigPath);
     
-    /* Apply loaded values to controls */
     if (hEditIP) SetWindowTextA(hEditIP, ip);
     if (hEditPort) SetWindowTextA(hEditPort, port);
     if (hEditServerId && serverId[0] != '\0') {
@@ -66,58 +115,31 @@ static void LoadRelayConfig(void) {
     }
 }
 
-// Forward declarations (only those not in headers)
-static DWORD WINAPI RelayThreadProc(LPVOID lpParam);
-static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
-static void OnTabChange(HWND hwnd);
-static void StartRelayServer(HWND hwnd);
-static void StopRelayServer(HWND hwnd);
+/* ========================================================================== 
+ * CONSOLE LOGGING
+ * ========================================================================== */
 
-
-// Modular tab creation
-static void CreateAllControls(HWND parent, RECT rc) {
-    // Parameter tab controls
-    CreateWindowExW(0, L"STATIC", L"Relay IP:", WS_CHILD|WS_VISIBLE, 16,40,60,20, parent, NULL, NULL, NULL);
-    hEditIP = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"0.0.0.0", WS_CHILD|WS_VISIBLE, 80,40,100,20, parent, (HMENU)IDC_PARAM_IP, NULL, NULL);
-    if (!hEditIP) MessageBoxW(NULL, L"Failed to create hEditIP", L"Debug", MB_OK|MB_ICONERROR);
-    CreateWindowExW(0, L"STATIC", L"Port:", WS_CHILD|WS_VISIBLE, 190,40,40,20, parent, NULL, NULL, NULL);
-    hEditPort = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"5000", WS_CHILD|WS_VISIBLE, 230,40,60,20, parent, (HMENU)IDC_PARAM_PORT, NULL, NULL);
-    if (!hEditPort) MessageBoxW(NULL, L"Failed to create hEditPort", L"Debug", MB_OK|MB_ICONERROR);
-    hBtnStart = CreateWindowExW(0, L"BUTTON", L"Start", WS_CHILD|WS_VISIBLE, 300,40,60,20, parent, (HMENU)IDC_PARAM_START, NULL, NULL);
-    if (!hBtnStart) MessageBoxW(NULL, L"Failed to create hBtnStart", L"Debug", MB_OK|MB_ICONERROR);
+static void AppendConsoleLog(const char *text) {
+    SYSTEMTIME st;
+    char timeStamp[32];
+    char fullText[512];
+    int len;
     
-    // Server ID row (generated when server starts)
-    CreateWindowExW(0, L"STATIC", L"Server ID:", WS_CHILD|WS_VISIBLE, 16,70,60,20, parent, NULL, NULL, NULL);
-    hEditServerId = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"(Start server to generate)", 
-                                   WS_CHILD|WS_VISIBLE|ES_READONLY|ES_CENTER, 80,68,180,22, parent, (HMENU)IDC_SERVER_ID, NULL, NULL);
-    hBtnCopyId = CreateWindowExW(0, L"BUTTON", L"Copy", WS_CHILD|WS_VISIBLE|WS_DISABLED, 265,68,50,22, parent, (HMENU)IDC_COPY_ID, NULL, NULL);
+    if (!hEditConsole || !IsWindow(hEditConsole)) return;
     
-    // Console tab controls
-    hEditConsole = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD|WS_VISIBLE|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY|WS_VSCROLL, 16,100,400,140, parent, (HMENU)IDC_CONSOLE, NULL, NULL);
-    if (!hEditConsole) MessageBoxW(NULL, L"Failed to create hEditConsole", L"Debug", MB_OK|MB_ICONERROR);
-}
-
-// Tab switching logic
-static void OnTabChange(HWND hwnd) {
-    int sel = TabCtrl_GetCurSel(hTab);
-    // Parameters tab (always visible on tab 0)
-    ShowWindow(hEditIP, sel == 0 ? SW_SHOW : SW_HIDE);
-    ShowWindow(hEditPort, sel == 0 ? SW_SHOW : SW_HIDE);
-    ShowWindow(hBtnStart, sel == 0 ? SW_SHOW : SW_HIDE);
-    ShowWindow(hEditServerId, sel == 0 ? SW_SHOW : SW_HIDE);
-    ShowWindow(hBtnCopyId, sel == 0 ? SW_SHOW : SW_HIDE);
-    // Console tab
-    ShowWindow(hEditConsole, sel == 1 ? SW_SHOW : SW_HIDE);
-}
-
-
-// Minimal relay logic for Start/Stop button (expand as needed)
-static void AppendConsoleA(const char* text) {
-    if (hEditConsole && IsWindow(hEditConsole)) {
-        int len = GetWindowTextLengthA(hEditConsole);
-        SendMessageA(hEditConsole, EM_SETSEL, len, len);
-        SendMessageA(hEditConsole, EM_REPLACESEL, FALSE, (LPARAM)text);
-    }
+    /* Add timestamp */
+    GetLocalTime(&st);
+    _snprintf(timeStamp, sizeof(timeStamp), "[%02d:%02d:%02d] ", 
+              st.wHour, st.wMinute, st.wSecond);
+    _snprintf(fullText, sizeof(fullText), "%s%s", timeStamp, text);
+    
+    /* Append to console */
+    len = GetWindowTextLengthA(hEditConsole);
+    SendMessageA(hEditConsole, EM_SETSEL, len, len);
+    SendMessageA(hEditConsole, EM_REPLACESEL, FALSE, (LPARAM)fullText);
+    
+    /* Auto-scroll to bottom */
+    SendMessageA(hEditConsole, EM_SCROLLCARET, 0, 0);
 }
 
 /* Relay log callback - posts message to main thread for thread safety */
@@ -125,16 +147,28 @@ static void RelayLogCallback(const char* message) {
     char* msgCopy;
     if (!g_hMainWnd || !IsWindow(g_hMainWnd)) return;
     
-    /* Allocate copy of message - will be freed by main thread */
     msgCopy = (char*)malloc(strlen(message) + 1);
     if (msgCopy) {
         strcpy(msgCopy, message);
-        /* Post to main thread - if fails, free memory */
         if (!PostMessageA(g_hMainWnd, WM_RELAY_LOG, 0, (LPARAM)msgCopy)) {
             free(msgCopy);
         }
     }
 }
+
+/* ========================================================================== 
+ * STATUS BAR
+ * ========================================================================== */
+
+static void UpdateStatusBar(const char *text, BOOL running) {
+    char statusText[256];
+    sprintf(statusText, " %s  %s", running ? "\x95" : "\x95", text);
+    SendMessageA(g_hStatusBar, SB_SETTEXTA, 0, (LPARAM)statusText);
+}
+
+/* ========================================================================== 
+ * RELAY SERVER CONTROL
+ * ========================================================================== */
 
 static void StartRelayServer(HWND hwnd) {
     char ip[64] = {0};
@@ -146,41 +180,39 @@ static void StartRelayServer(HWND hwnd) {
     /* Initialize crypto for XOR encryption */
     Crypto_Init(NULL);
     
-    /* Set log callback to route messages to console */
+    /* Set log callback */
     Relay_SetLogCallback(RelayLogCallback);
     
-    // Get IP and port from edit controls
+    /* Get IP and port from edit controls */
     GetWindowTextA(hEditIP, ip, sizeof(ip)-1);
     GetWindowTextA(hEditPort, portStr, sizeof(portStr)-1);
     port = (WORD)atoi(portStr);
     if (port == 0) port = RELAY_DEFAULT_PORT;
     
-    // Create and start relay server
+    /* Create and start relay server */
     g_pRelayServer = Relay_Create(port, ip);
     if (!g_pRelayServer) {
-        int wsaerr = WSAGetLastError();
         char errbuf[128];
-        _snprintf(errbuf, sizeof(errbuf), "[ERROR] Failed to create relay server. WSAGetLastError=%d\r\n", wsaerr);
-        AppendConsoleA(errbuf);
-        SetWindowTextW(hBtnStart, L"Start");
-        relayRunning = FALSE;
-        return;
-    }
-    result = Relay_Start(g_pRelayServer);
-    if (result != 0) {
         int wsaerr = WSAGetLastError();
-        char errbuf[128];
-        _snprintf(errbuf, sizeof(errbuf), "[ERROR] Failed to start relay server. WSAGetLastError=%d\r\n", wsaerr);
-        AppendConsoleA(errbuf);
-        Relay_Destroy(g_pRelayServer);
-        g_pRelayServer = NULL;
-        SetWindowTextW(hBtnStart, L"Start");
-        relayRunning = FALSE;
+        _snprintf(errbuf, sizeof(errbuf), "Failed to create server (Error: %d)\r\n", wsaerr);
+        AppendConsoleLog(errbuf);
+        UpdateStatusBar("Failed to start server", FALSE);
         return;
     }
     
-    /* Generate Server ID from IP:Port for clients to use */
-    /* If IP is 0.0.0.0, try to get actual LAN IP */
+    result = Relay_Start(g_pRelayServer);
+    if (result != 0) {
+        char errbuf[128];
+        int wsaerr = WSAGetLastError();
+        _snprintf(errbuf, sizeof(errbuf), "Failed to start server (Error: %d)\r\n", wsaerr);
+        AppendConsoleLog(errbuf);
+        Relay_Destroy(g_pRelayServer);
+        g_pRelayServer = NULL;
+        UpdateStatusBar("Failed to start server", FALSE);
+        return;
+    }
+    
+    /* Generate Server ID from IP:Port */
     if (strcmp(ip, "0.0.0.0") == 0) {
         char hostname[256];
         struct hostent *he;
@@ -192,7 +224,6 @@ static void StartRelayServer(HWND hwnd) {
                 strncpy(ip, inet_ntoa(addr), sizeof(ip)-1);
             }
         }
-        /* If still 0.0.0.0, use localhost placeholder */
         if (strcmp(ip, "0.0.0.0") == 0) {
             strcpy(ip, "127.0.0.1");
         }
@@ -202,23 +233,24 @@ static void StartRelayServer(HWND hwnd) {
     if (result == CRYPTO_SUCCESS) {
         SetWindowTextA(hEditServerId, serverId);
         EnableWindow(hBtnCopyId, TRUE);
-        AppendConsoleA("[INFO] Server ID generated: ");
-        AppendConsoleA(serverId);
-        AppendConsoleA("\r\n[INFO] Distribute this ID to your client users.\r\n");
-        /* Save config for next startup */
+        AppendConsoleLog("Server ID generated successfully\r\n");
+        AppendConsoleLog("Distribute this ID to client users!\r\n");
         SaveRelayConfig(ip, portStr, serverId);
     } else {
-        SetWindowTextA(hEditServerId, "(Failed to generate)");
+        SetWindowTextA(hEditServerId, "(Generation failed)");
         EnableWindow(hBtnCopyId, FALSE);
     }
     
-    SetWindowTextW(hBtnStart, L"Stop");
-    AppendConsoleA("[INFO] Relay server started.\r\n");
-    relayRunning = TRUE;
+    SetWindowTextA(hBtnStart, "Stop Server");
+    EnableWindow(hEditIP, FALSE);
+    EnableWindow(hEditPort, FALSE);
+    
+    g_bRelayRunning = TRUE;
+    UpdateStatusBar("Server running - waiting for connections", TRUE);
+    AppendConsoleLog("Relay server started successfully\r\n");
 }
 
 static void StopRelayServer(HWND hwnd) {
-    /* Clear log callback */
     Relay_SetLogCallback(NULL);
     
     if (g_pRelayServer) {
@@ -227,150 +259,329 @@ static void StopRelayServer(HWND hwnd) {
         g_pRelayServer = NULL;
     }
     
-    /* Cleanup crypto */
     Crypto_Cleanup();
     
-    /* Clear Server ID display */
     SetWindowTextA(hEditServerId, "(Start server to generate)");
     EnableWindow(hBtnCopyId, FALSE);
     
-    SetWindowTextW(hBtnStart, L"Start");
-    AppendConsoleA("[INFO] Relay server stopped.\r\n");
-    relayRunning = FALSE;
+    SetWindowTextA(hBtnStart, "Start Server");
+    EnableWindow(hEditIP, TRUE);
+    EnableWindow(hEditPort, TRUE);
+    
+    g_bRelayRunning = FALSE;
+    UpdateStatusBar("Server stopped", FALSE);
+    AppendConsoleLog("Relay server stopped\r\n");
 }
 
-// Entry point for the relay GUI
-int RelayGui_Run(HINSTANCE hInstance, int nCmdShow) {
-    WNDCLASSW wc;
-    MSG msg;
-    HWND hwnd;
-    WSADATA wsaData;
-    int wsaInit = WSAStartup(MAKEWORD(2,2), &wsaData);
-    if (wsaInit != 0) {
-        MessageBoxA(NULL, "WSAStartup failed!", "Error", MB_OK|MB_ICONERROR);
-        return 1;
+/* ========================================================================== 
+ * CREATE CONTROLS
+ * ========================================================================== */
+
+static void CreateMainControls(HWND hwnd) {
+    int y;
+    int panelWidth = MAIN_WIDTH - 30;
+    int leftMargin = 15;
+    
+    /* Header - Blue banner */
+    CreateWindowExA(0, "STATIC", "  RemoteDesk2K Relay Server",
+                   WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
+                   0, 0, MAIN_WIDTH, 35, hwnd, (HMENU)IDC_HEADER, g_hInstance, NULL);
+    
+    y = 50;
+    
+    /* ---- Server Configuration Group ---- */
+    CreateWindowExA(0, "BUTTON", " Server Configuration ",
+                   WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+                   leftMargin, y, panelWidth, 75, hwnd, (HMENU)IDC_GROUP_SERVER, g_hInstance, NULL);
+    
+    y += 22;
+    
+    /* IP Address */
+    CreateWindowExA(0, "STATIC", "Listen IP:",
+                   WS_CHILD | WS_VISIBLE | SS_RIGHT,
+                   leftMargin + 10, y + 3, 70, 18, hwnd, (HMENU)IDC_LBL_IP, g_hInstance, NULL);
+    hEditIP = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "0.0.0.0",
+                             WS_CHILD | WS_VISIBLE | ES_CENTER,
+                             leftMargin + 85, y, 120, 22, hwnd, (HMENU)IDC_PARAM_IP, g_hInstance, NULL);
+    
+    /* Port */
+    CreateWindowExA(0, "STATIC", "Port:",
+                   WS_CHILD | WS_VISIBLE | SS_RIGHT,
+                   leftMargin + 215, y + 3, 40, 18, hwnd, (HMENU)IDC_LBL_PORT, g_hInstance, NULL);
+    hEditPort = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "5000",
+                               WS_CHILD | WS_VISIBLE | ES_CENTER | ES_NUMBER,
+                               leftMargin + 260, y, 60, 22, hwnd, (HMENU)IDC_PARAM_PORT, g_hInstance, NULL);
+    
+    /* Start/Stop Button */
+    hBtnStart = CreateWindowExA(0, "BUTTON", "Start Server",
+                               WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                               leftMargin + 340, y - 2, 120, 28, hwnd, (HMENU)IDC_PARAM_START, g_hInstance, NULL);
+    
+    y += 55;
+    
+    /* ---- Server ID Group ---- */
+    CreateWindowExA(0, "BUTTON", " Server ID (share with clients) ",
+                   WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+                   leftMargin, y, panelWidth, 55, hwnd, (HMENU)IDC_GROUP_SERVERID, g_hInstance, NULL);
+    
+    y += 22;
+    
+    /* Server ID display */
+    hEditServerId = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "(Start server to generate)",
+                                   WS_CHILD | WS_VISIBLE | ES_READONLY | ES_CENTER,
+                                   leftMargin + 15, y, 340, 24, hwnd, (HMENU)IDC_SERVER_ID, g_hInstance, NULL);
+    
+    /* Copy button */
+    hBtnCopyId = CreateWindowExA(0, "BUTTON", "Copy ID",
+                                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
+                                leftMargin + 365, y - 1, 90, 26, hwnd, (HMENU)IDC_COPY_ID, g_hInstance, NULL);
+    
+    y += 55;
+    
+    /* ---- Console Log Group ---- */
+    CreateWindowExA(0, "BUTTON", " Console Log ",
+                   WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+                   leftMargin, y, panelWidth, 140, hwnd, (HMENU)IDC_GROUP_CONSOLE, g_hInstance, NULL);
+    
+    y += 18;
+    
+    /* Console edit control */
+    hEditConsole = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
+                                  WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | 
+                                  ES_READONLY | WS_VSCROLL,
+                                  leftMargin + 10, y, panelWidth - 20, 110, 
+                                  hwnd, (HMENU)IDC_CONSOLE, g_hInstance, NULL);
+    
+    /* Status bar */
+    g_hStatusBar = CreateStatusWindowA(WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
+                                      " Ready", hwnd, IDC_STATUSBAR);
+    
+    /* Set fonts */
+    SendMessage(hEditIP, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+    SendMessage(hEditPort, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+    SendMessage(hBtnStart, WM_SETFONT, (WPARAM)g_hFontBold, TRUE);
+    SendMessage(hEditServerId, WM_SETFONT, (WPARAM)g_hFontLarge, TRUE);
+    SendMessage(hBtnCopyId, WM_SETFONT, (WPARAM)g_hFontBold, TRUE);
+    SendMessage(hEditConsole, WM_SETFONT, (WPARAM)g_hFontMono, TRUE);
+    
+    /* Set font for all static controls */
+    {
+        HWND hChild = GetWindow(hwnd, GW_CHILD);
+        while (hChild) {
+            char className[32];
+            GetClassNameA(hChild, className, sizeof(className));
+            if (_stricmp(className, "STATIC") == 0 || _stricmp(className, "BUTTON") == 0) {
+                SendMessage(hChild, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+            }
+            hChild = GetWindow(hChild, GW_HWNDNEXT);
+        }
     }
-    memset(&wc, 0, sizeof(wc));
-    wc.lpfnWndProc = MainWndProc;
-    wc.hInstance = hInstance;
-    wc.lpszClassName = L"RelayGuiWnd";
-    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
-    RegisterClassW(&wc);
-    hwnd = CreateWindowW(L"RelayGuiWnd", L"RemoteDesk2K Relay Server", WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT, 480, 320, NULL, NULL, hInstance, NULL);
-    g_hMainWnd = hwnd;  /* Store for thread-safe logging */
-    ShowWindow(hwnd, nCmdShow);
-    UpdateWindow(hwnd);
-    while (GetMessage(&msg, NULL, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
-    WSACleanup();
-    return 0;
 }
 
-// Main window procedure implementation
+/* ========================================================================== 
+ * WINDOW PROCEDURE
+ * ========================================================================== */
+
 static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
-    case WM_CREATE: {
-        INITCOMMONCONTROLSEX icc = { sizeof(INITCOMMONCONTROLSEX), ICC_TAB_CLASSES };
-        InitCommonControlsEx(&icc);
-        RECT rc;
-        GetClientRect(hwnd, &rc);
-        hTab = CreateWindowExW(0, WC_TABCONTROLW, L"", WS_CHILD|WS_VISIBLE|WS_CLIPSIBLINGS,
-            0,0,rc.right,rc.bottom, hwnd, (HMENU)IDC_TAB, NULL, NULL);
-        TCITEMW tie = { TCIF_TEXT };
-        static wchar_t paramText[] = L"Parameters";
-        static wchar_t consoleText[] = L"Console";
-        tie.pszText = paramText;
-        SendMessageW(hTab, TCM_INSERTITEMW, 0, (LPARAM)&tie);
-        tie.pszText = consoleText;
-        SendMessageW(hTab, TCM_INSERTITEMW, 1, (LPARAM)&tie);
-        CreateAllControls(hwnd, rc);
-        OnTabChange(hwnd);
-        /* Load saved config */
-        LoadRelayConfig();
-        break; }
-    case WM_NOTIFY:
-        if (((LPNMHDR)lParam)->idFrom == IDC_TAB && ((LPNMHDR)lParam)->code == TCN_SELCHANGE) {
-            OnTabChange(hwnd);
-        }
-        break;
-    case WM_COMMAND:
-        if ((HWND)lParam == hBtnStart) {
-            if (!relayRunning) {
-                StartRelayServer(hwnd);
-            } else {
-                StopRelayServer(hwnd);
+        case WM_CREATE:
+            CreateMainControls(hwnd);
+            LoadRelayConfig();
+            UpdateStatusBar("Ready - click Start Server to begin", FALSE);
+            AppendConsoleLog("RemoteDesk2K Relay Server initialized\r\n");
+            AppendConsoleLog("Configure IP/Port and click Start Server\r\n");
+            return 0;
+        
+        case WM_CTLCOLORSTATIC:
+        {
+            HDC hdcStatic = (HDC)wParam;
+            HWND hStatic = (HWND)lParam;
+            int ctrlId = GetDlgCtrlID(hStatic);
+            
+            /* Blue header background */
+            if (ctrlId == IDC_HEADER) {
+                SetTextColor(hdcStatic, COLOR_HEADER_TEXT);
+                SetBkColor(hdcStatic, COLOR_HEADER_BG);
+                return (LRESULT)g_hBrushHeader;
             }
+            
+            /* Panel background for other statics */
+            SetBkColor(hdcStatic, COLOR_PANEL_BG);
+            return (LRESULT)g_hBrushPanel;
         }
-        else if ((HWND)lParam == hBtnCopyId) {
-            /* Copy Server ID to clipboard */
-            char serverId[64];
-            GetWindowTextA(hEditServerId, serverId, sizeof(serverId));
-            if (serverId[0] != '\0' && serverId[0] != '(') {
-                if (OpenClipboard(hwnd)) {
-                    HGLOBAL hMem;
-                    char *pMem;
-                    int len = (int)strlen(serverId) + 1;
-                    EmptyClipboard();
-                    hMem = GlobalAlloc(GMEM_MOVEABLE, len);
-                    if (hMem) {
-                        pMem = (char*)GlobalLock(hMem);
-                        if (pMem) {
-                            memcpy(pMem, serverId, len);
-                            GlobalUnlock(hMem);
-                            SetClipboardData(CF_TEXT, hMem);
-                        }
-                    }
-                    CloseClipboard();
-                    AppendConsoleA("[INFO] Server ID copied to clipboard.\r\n");
+        
+        case WM_CTLCOLOREDIT:
+        {
+            HDC hdcEdit = (HDC)wParam;
+            HWND hEdit = (HWND)lParam;
+            
+            /* Server ID field - light blue when has ID */
+            if (hEdit == hEditServerId && g_bRelayRunning) {
+                SetBkColor(hdcEdit, RGB(230, 240, 255));
+                return (LRESULT)CreateSolidBrush(RGB(230, 240, 255));
+            }
+            return DefWindowProcA(hwnd, msg, wParam, lParam);
+        }
+        
+        case WM_COMMAND:
+        {
+            HWND hCtrl = (HWND)lParam;
+            
+            if (hCtrl == hBtnStart) {
+                if (!g_bRelayRunning) {
+                    StartRelayServer(hwnd);
+                } else {
+                    StopRelayServer(hwnd);
                 }
             }
-        }
-        break;
-    case WM_SIZE: {
-        RECT rc;
-        GetClientRect(hwnd, &rc);
-        MoveWindow(hTab, 0,0,rc.right,rc.bottom, TRUE);
-        // Move parameter controls
-        MoveWindow(hEditIP, 80,40,100,20, TRUE);
-        MoveWindow(hEditPort, 230,40,60,20, TRUE);
-        MoveWindow(hBtnStart, 300,40,60,20, TRUE);
-        // Move Server ID controls
-        MoveWindow(hEditServerId, 80,68,180,22, TRUE);
-        MoveWindow(hBtnCopyId, 265,68,50,22, TRUE);
-        // Move console control
-        MoveWindow(hEditConsole, 16,100,400,140, TRUE);
-        break; }
-    case WM_CLOSE:
-        g_hMainWnd = NULL;  /* Prevent more log messages */
-        StopRelayServer(hwnd);
-        DestroyWindow(hwnd);
-        break;
-    case WM_DESTROY:
-        g_hMainWnd = NULL;
-        PostQuitMessage(0);
-        break;
-    default:
-        /* Handle custom log message from worker threads */
-        if (msg == WM_RELAY_LOG) {
-            char* logText = (char*)lParam;
-            if (logText) {
-                AppendConsoleA(logText);
-                free(logText);  /* Free the allocated copy */
+            else if (hCtrl == hBtnCopyId) {
+                char serverId[64];
+                GetWindowTextA(hEditServerId, serverId, sizeof(serverId));
+                if (serverId[0] != '\0' && serverId[0] != '(') {
+                    if (OpenClipboard(hwnd)) {
+                        HGLOBAL hMem;
+                        char *pMem;
+                        int len = (int)strlen(serverId) + 1;
+                        EmptyClipboard();
+                        hMem = GlobalAlloc(GMEM_MOVEABLE, len);
+                        if (hMem) {
+                            pMem = (char*)GlobalLock(hMem);
+                            if (pMem) {
+                                memcpy(pMem, serverId, len);
+                                GlobalUnlock(hMem);
+                                SetClipboardData(CF_TEXT, hMem);
+                            }
+                        }
+                        CloseClipboard();
+                        AppendConsoleLog("Server ID copied to clipboard\r\n");
+                    }
+                }
             }
             return 0;
         }
-        return DefWindowProc(hwnd, msg, wParam, lParam);
+        
+        case WM_RELAY_LOG:
+        {
+            char* logText = (char*)lParam;
+            if (logText) {
+                AppendConsoleLog(logText);
+                free(logText);
+            }
+            return 0;
+        }
+        
+        case WM_SIZE:
+        {
+            /* Resize status bar */
+            SendMessage(g_hStatusBar, WM_SIZE, 0, 0);
+            return 0;
+        }
+        
+        case WM_CLOSE:
+            g_hMainWnd = NULL;
+            StopRelayServer(hwnd);
+            DestroyWindow(hwnd);
+            return 0;
+        
+        case WM_DESTROY:
+            g_hMainWnd = NULL;
+            PostQuitMessage(0);
+            return 0;
     }
-    return 0;
+    
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
 }
 
+/* ========================================================================== 
+ * ENTRY POINT
+ * ========================================================================== */
 
-
-// relay_gui.c - Windows 2000 compatible GUI for relay server
-#include "relay_gui.h"
-
-
-
+int RelayGui_Run(HINSTANCE hInstance, int nCmdShow) {
+    WNDCLASSEXA wc;
+    MSG msg;
+    WSADATA wsaData;
+    INITCOMMONCONTROLSEX icc;
+    
+    g_hInstance = hInstance;
+    
+    /* Initialize Winsock */
+    if (WSAStartup(MAKEWORD(2,2), &wsaData) != 0) {
+        MessageBoxA(NULL, "Failed to initialize network!", "Error", MB_ICONERROR);
+        return 1;
+    }
+    
+    /* Initialize common controls */
+    icc.dwSize = sizeof(icc);
+    icc.dwICC = ICC_WIN95_CLASSES | ICC_BAR_CLASSES;
+    InitCommonControlsEx(&icc);
+    
+    /* Create fonts */
+    g_hFontNormal = CreateFontA(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                               DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, "Tahoma");
+    g_hFontBold = CreateFontA(14, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, "Tahoma");
+    g_hFontLarge = CreateFontA(18, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                              DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, "Tahoma");
+    g_hFontMono = CreateFontA(13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
+    
+    /* Create brushes */
+    g_hBrushPanel = GetSysColorBrush(COLOR_INFOBK);
+    g_hBrushHeader = CreateSolidBrush(COLOR_HEADER_BG);
+    
+    /* Register window class */
+    ZeroMemory(&wc, sizeof(wc));
+    wc.cbSize = sizeof(WNDCLASSEXA);
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = MainWndProc;
+    wc.hInstance = hInstance;
+    wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = g_hBrushPanel;
+    wc.lpszClassName = "RD2KRelayServerClass";
+    wc.hIconSm = LoadIcon(NULL, IDI_APPLICATION);
+    
+    if (!RegisterClassExA(&wc)) {
+        WSACleanup();
+        return 1;
+    }
+    
+    /* Create main window */
+    g_hMainWnd = CreateWindowExA(
+        0, "RD2KRelayServerClass", "RemoteDesk2K Relay Server",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        CW_USEDEFAULT, CW_USEDEFAULT, MAIN_WIDTH, MAIN_HEIGHT,
+        NULL, NULL, hInstance, NULL);
+    
+    if (!g_hMainWnd) {
+        WSACleanup();
+        return 1;
+    }
+    
+    ShowWindow(g_hMainWnd, nCmdShow);
+    UpdateWindow(g_hMainWnd);
+    
+    /* Force initial refresh */
+    RedrawWindow(g_hMainWnd, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN | RDW_ERASE);
+    
+    /* Message loop */
+    while (GetMessage(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    
+    /* Cleanup */
+    DeleteObject(g_hFontNormal);
+    DeleteObject(g_hFontBold);
+    DeleteObject(g_hFontLarge);
+    DeleteObject(g_hFontMono);
+    DeleteObject(g_hBrushHeader);
+    
+    WSACleanup();
+    
+    return (int)msg.wParam;
+}
