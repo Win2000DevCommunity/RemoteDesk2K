@@ -2705,7 +2705,12 @@ LRESULT CALLBACK ViewerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                 GetClientRect(hwnd, &rcClient);
                 
                 if (g_displayMode == DISPLAY_STRETCH) {
-                    SetStretchBltMode(hdc, COLORONCOLOR);
+                    /* Use HALFTONE mode for high-quality smooth scaling
+                     * This does proper bilinear interpolation instead of
+                     * nearest-neighbor (COLORONCOLOR) which looks pixelated.
+                     * SetBrushOrgEx is required after SetStretchBltMode(HALFTONE). */
+                    SetStretchBltMode(hdc, HALFTONE);
+                    SetBrushOrgEx(hdc, 0, 0, NULL);
                     StretchBlt(hdc, 0, 0, rcClient.right, rcClient.bottom,
                               g_hdcViewer, 0, 0, g_remoteScreen.width, g_remoteScreen.height,
                               SRCCOPY);
