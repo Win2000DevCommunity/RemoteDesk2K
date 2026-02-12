@@ -1567,6 +1567,9 @@ void StartServer(void)
         return;
     }
     
+    /* Initialize async input processing */
+    Input_Initialize();
+    
     g_bServerRunning = TRUE;
     SetTimer(g_hMainWnd, TIMER_LISTEN_CHECK, LISTEN_CHECK_INTERVAL, NULL);
     UpdateStatusBar("Ready to connect", TRUE);
@@ -1576,6 +1579,9 @@ void StartServer(void)
 void StopServer(void)
 {
     if (!g_bServerRunning) return;
+    
+    /* Shutdown async input processing */
+    Input_Shutdown();
     
     KillTimer(g_hMainWnd, TIMER_LISTEN_CHECK);
     KillTimer(g_hMainWnd, TIMER_SCREEN);

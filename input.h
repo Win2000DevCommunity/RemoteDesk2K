@@ -84,4 +84,17 @@ BOOL Input_ProcessMouseEvent(WORD x, WORD y, BYTE buttons, BYTE flags, SHORT whe
  */
 BOOL Input_ProcessKeyEvent(WORD vk, WORD scan, BYTE flags);
 
+/*
+ * Initialize the async input system
+ * Creates a background thread for input processing
+ * This prevents UI freeze when clicking window title bars
+ */
+BOOL Input_Initialize(void);
+
+/*
+ * Shutdown the async input system
+ * Waits for pending events and stops the thread
+ */
+void Input_Shutdown(void);
+
 #endif /* _RD2K_INPUT_H_ */
