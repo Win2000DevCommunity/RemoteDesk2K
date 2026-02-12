@@ -17,6 +17,7 @@
 #include "filetransfer.h"
 #include "progress.h"
 #include "relay.h"
+#include "crypto.h"
 #include <commctrl.h>
 #include <commdlg.h>
 #include <windowsx.h>
@@ -58,10 +59,8 @@
 #define IDC_TAB_CTRL            206
 
 /* Control IDs - Server Config Tab (Relay Connect) */
-#define IDC_SERVER_IP_LABEL     210
-#define IDC_SERVER_IP           211
-#define IDC_SERVER_PORT_LABEL   212
-#define IDC_SERVER_PORT         213
+#define IDC_SERVER_ID_LABEL     210   /* "Server ID" label */
+#define IDC_SERVER_ID           211   /* Encrypted Server ID field (given by admin) */
 #define IDC_RELAY_PARTNER_ID_LABEL  216
 #define IDC_RELAY_PARTNER_ID    217
 #define IDC_RELAY_PARTNER_PWD_LABEL 218
@@ -164,15 +163,14 @@ static int              g_nCurrentTab = 0;
 /* Right Panel Controls - Tab 2: Relay Connect */
 static HWND             g_hRelayPartnerId = NULL;   /* Partner ID for relay connection */
 static HWND             g_hRelayPartnerPwd = NULL;  /* Password for relay connection */
-static HWND             g_hServerIp = NULL;          /* Relay server IP */
-static HWND             g_hServerPort = NULL;        /* Relay server port */
+static HWND             g_hServerId = NULL;          /* Encrypted Server ID (given by admin) */
 static HWND             g_hRelayConnectSvrBtn = NULL;  /* Step 1: Connect to server */
 static HWND             g_hRelayConnectPartnerBtn = NULL; /* Step 2: Connect to partner */
 static BOOL             g_bConnectedToRelay = FALSE;  /* TRUE when registered with relay */
 
-/* Relay connection settings (address of external relay server to connect TO) */
-static char             g_szRelayServerIp[64] = "";  /* IP of relay server to connect to */
-static WORD             g_wRelayServerPort = 5900;   /* Port of relay server */
+/* Relay connection settings (decoded from Server ID) */
+static char             g_szRelayServerIp[64] = "";  /* IP decoded from Server ID */
+static WORD             g_wRelayServerPort = 5900;   /* Port decoded from Server ID */
 static SOCKET           g_relaySocket = INVALID_SOCKET;
 static CRITICAL_SECTION g_csRelay;
 
@@ -585,21 +583,13 @@ void CreateMainControls(HWND hwnd)
         /* Step 2: Then connect to partner by ID */
         y = contentY + 45;
         
-        /* Server IP (the relay server to connect through) */
-        CreateWindowExA(0, "STATIC", "Server IP",
+        /* Server ID (encrypted IP:Port - provided by server admin) */
+        CreateWindowExA(0, "STATIC", "Server ID",
                        WS_CHILD | SS_LEFT,
-                       rightX + 10, y, 70, 20, hwnd, (HMENU)IDC_SERVER_IP_LABEL, g_hInstance, NULL);
-        g_hServerIp = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
-                                     WS_CHILD | ES_LEFT,
-                                     rightX + 80, y - 2, 120, 24, hwnd, (HMENU)IDC_SERVER_IP, g_hInstance, NULL);
-        
-        /* Relay Server Port */
-        CreateWindowExA(0, "STATIC", "Port",
-                       WS_CHILD | SS_LEFT,
-                       rightX + 205, y, 30, 20, hwnd, (HMENU)IDC_SERVER_PORT_LABEL, g_hInstance, NULL);
-        g_hServerPort = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "5900",
-                                       WS_CHILD | ES_NUMBER | ES_CENTER,
-                                       rightX + 235, y - 2, 45, 24, hwnd, (HMENU)IDC_SERVER_PORT, g_hInstance, NULL);
+                       rightX + 10, y, 70, 20, hwnd, (HMENU)IDC_SERVER_ID_LABEL, g_hInstance, NULL);
+        g_hServerId = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
+                                     WS_CHILD | ES_LEFT | ES_UPPERCASE,
+                                     rightX + 80, y - 2, 200, 24, hwnd, (HMENU)IDC_SERVER_ID, g_hInstance, NULL);
         
         y += 30;
         
@@ -636,8 +626,7 @@ void CreateMainControls(HWND hwnd)
                                                    rightX + 70, y, 160, 26, hwnd, (HMENU)IDC_RELAY_CONNECT_PARTNER_BTN, g_hInstance, NULL);
         
         /* Set fonts for relay connect controls */
-        SendMessage(g_hServerIp, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
-        SendMessage(g_hServerPort, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
+        SendMessage(g_hServerId, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
         SendMessage(g_hRelayConnectSvrBtn, WM_SETFONT, (WPARAM)g_hFontBold, TRUE);
         SendMessage(g_hRelayPartnerId, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
         SendMessage(g_hRelayPartnerPwd, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
@@ -681,12 +670,10 @@ void SwitchTab(int tabIndex)
     ShowWindow(g_hPartnerPwd, showTab1);
     ShowWindow(g_hConnectBtn, showTab1);
     
-    /* Tab 2: Server Connect controls */
+    /* Tab 2: Server Connect controls (using encrypted Server ID) */
     ShowWindow(GetDlgItem(g_hMainWnd, IDC_INSTR_TAB2), showTab2);
-    ShowWindow(GetDlgItem(g_hMainWnd, IDC_SERVER_IP_LABEL), showTab2);
-    ShowWindow(g_hServerIp, showTab2);
-    ShowWindow(GetDlgItem(g_hMainWnd, IDC_SERVER_PORT_LABEL), showTab2);
-    ShowWindow(g_hServerPort, showTab2);
+    ShowWindow(GetDlgItem(g_hMainWnd, IDC_SERVER_ID_LABEL), showTab2);
+    ShowWindow(g_hServerId, showTab2);
     ShowWindow(g_hRelayConnectSvrBtn, showTab2);
     ShowWindow(GetDlgItem(g_hMainWnd, IDC_RELAY_PARTNER_ID_LABEL), showTab2);
     ShowWindow(g_hRelayPartnerId, showTab2);
@@ -698,7 +685,7 @@ void SwitchTab(int tabIndex)
 /* Step 1: Connect to relay server and register */
 void ConnectToRelayServer(void)
 {
-    char portStr[16];
+    char serverIdStr[32];
     int result;
     SOCKET relaySocket = INVALID_SOCKET;
     
@@ -721,16 +708,30 @@ void ConnectToRelayServer(void)
         return;
     }
     
-    /* Get Relay Server IP and Port */
-    GetWindowTextA(g_hServerIp, g_szRelayServerIp, sizeof(g_szRelayServerIp));
-    GetWindowTextA(g_hServerPort, portStr, sizeof(portStr));
-    g_wRelayServerPort = (WORD)atoi(portStr);
-    if (g_wRelayServerPort == 0) {
-        g_wRelayServerPort = 5900;
+    /* Get Server ID and decode it to IP:Port */
+    GetWindowTextA(g_hServerId, serverIdStr, sizeof(serverIdStr));
+    
+    if (serverIdStr[0] == '\0') {
+        MessageBoxA(g_hMainWnd, "Please enter the Server ID!\n\n"
+                   "The Server ID is provided by your system administrator.",
+                   APP_TITLE, MB_ICONWARNING);
+        return;
     }
     
-    if (g_szRelayServerIp[0] == '\0') {
-        MessageBoxA(g_hMainWnd, "Please enter the Relay Server IP address!", APP_TITLE, MB_ICONWARNING);
+    /* Validate and decode Server ID */
+    if (!Crypto_ValidateServerIDFormat(serverIdStr)) {
+        MessageBoxA(g_hMainWnd, "Invalid Server ID format!\n\n"
+                   "Server ID should look like: ABCD-EFGH-1234",
+                   APP_TITLE, MB_ICONWARNING);
+        return;
+    }
+    
+    result = Crypto_DecodeServerID(serverIdStr, g_szRelayServerIp, &g_wRelayServerPort);
+    if (result != CRYPTO_SUCCESS) {
+        MessageBoxA(g_hMainWnd, "Invalid Server ID!\n\n"
+                   "The Server ID could not be decoded.\n"
+                   "Please check with your administrator.",
+                   APP_TITLE, MB_ICONERROR);
         return;
     }
     
@@ -755,7 +756,7 @@ void ConnectToRelayServer(void)
         EnableWindow(g_hRelayConnectSvrBtn, TRUE);
         MessageBoxA(g_hMainWnd, 
                    "Failed to connect to relay server!\n\n"
-                   "Check:\n- Relay server IP and port\n- Relay server is running",
+                   "Make sure the relay server is running.",
                    APP_TITLE, MB_ICONERROR);
         return;
     }

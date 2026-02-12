@@ -38,6 +38,13 @@ A remote desktop application with UltraViewer/AnyDesk-like interface, designed f
 - Partner disconnect detection with notification
 - Works alongside direct connections
 
+### 🔐 Server ID System (NEW)
+- **Encrypted Server IDs** - Relay IP:port encoded as `XXXX-XXXX-XXXX` format
+- **Privacy Protection** - Client users never see the real server IP address
+- **Admin-Only Generation** - Only relay server admin can generate Server IDs
+- **One-Click Copy** - Copy Server ID to clipboard for easy distribution
+- **Simple Client Experience** - Users just enter the Server ID to connect
+
 
 ## Build Environment
 
@@ -56,7 +63,8 @@ A remote desktop application with UltraViewer/AnyDesk-like interface, designed f
 ### Build Steps
 ```batch
 cd RemoteDesk2K
-build.bat
+build.bat          # Build client (RemoteDesk2K.exe)
+build_relay.bat    # Build relay server (relay.exe)
 ```
 
 ## Usage
@@ -69,10 +77,20 @@ build.bat
 
 ### As Viewer (Controlling)
 1. Run `RemoteDesk2K.exe`
-2. Enter partner's **IP address** in "Partner ID" field
+2. Enter the **Server ID** (e.g., `A7K2-M9PL-X3QR`) provided by admin
 3. Enter partner's **Password**
 4. Click "Connect to partner"
 5. Use the viewer window to control remote PC
+
+### Relay Server Admin
+1. Run `relay.exe`
+2. Configure relay IP and port
+3. Click **Start Server**
+4. **Server ID** is auto-generated and displayed
+5. Click **Copy** to copy Server ID
+6. Distribute Server ID to your client users
+
+> **Note:** Clients only see the Server ID, never the real IP:port. This protects your server infrastructure.
 
 ### Viewer Controls
 | Key/Action | Function |
@@ -134,6 +152,13 @@ RemoteDesk2K/
 - 24-bit color depth
 
 ## Version History
+
+- **1.2.0** - Server ID Privacy Update
+  - Encrypted Server ID system (`XXXX-XXXX-XXXX` format)
+  - Client users no longer see real server IP address
+  - Relay server auto-generates Server ID on start
+  - Copy button for easy Server ID distribution
+  - Enhanced privacy for server administrators
 
 - **1.1.0** - Security and Relay Update
   - Full encryption on all connections (direct and relay)

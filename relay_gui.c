@@ -11,6 +11,7 @@
 static HWND g_hMainWnd = NULL;  /* Main window handle for logging */
 static HWND hTab;
 static HWND hEditIP, hEditPort, hBtnStart;
+static HWND hEditServerId, hBtnCopyId;  /* Server ID display and copy */
 static HWND hEditConsole;
 static PRELAY_SERVER g_pRelayServer = NULL;
 static BOOL relayRunning = FALSE;
@@ -36,18 +37,27 @@ static void CreateAllControls(HWND parent, RECT rc) {
     if (!hEditPort) MessageBoxW(NULL, L"Failed to create hEditPort", L"Debug", MB_OK|MB_ICONERROR);
     hBtnStart = CreateWindowExW(0, L"BUTTON", L"Start", WS_CHILD|WS_VISIBLE, 300,40,60,20, parent, (HMENU)IDC_PARAM_START, NULL, NULL);
     if (!hBtnStart) MessageBoxW(NULL, L"Failed to create hBtnStart", L"Debug", MB_OK|MB_ICONERROR);
+    
+    // Server ID row (generated when server starts)
+    CreateWindowExW(0, L"STATIC", L"Server ID:", WS_CHILD|WS_VISIBLE, 16,70,60,20, parent, NULL, NULL, NULL);
+    hEditServerId = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"(Start server to generate)", 
+                                   WS_CHILD|WS_VISIBLE|ES_READONLY|ES_CENTER, 80,68,180,22, parent, (HMENU)IDC_SERVER_ID, NULL, NULL);
+    hBtnCopyId = CreateWindowExW(0, L"BUTTON", L"Copy", WS_CHILD|WS_VISIBLE|WS_DISABLED, 265,68,50,22, parent, (HMENU)IDC_COPY_ID, NULL, NULL);
+    
     // Console tab controls
-    hEditConsole = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD|WS_VISIBLE|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY|WS_VSCROLL, 16,80,400,160, parent, (HMENU)IDC_CONSOLE, NULL, NULL);
+    hEditConsole = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD|WS_VISIBLE|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY|WS_VSCROLL, 16,100,400,140, parent, (HMENU)IDC_CONSOLE, NULL, NULL);
     if (!hEditConsole) MessageBoxW(NULL, L"Failed to create hEditConsole", L"Debug", MB_OK|MB_ICONERROR);
 }
 
 // Tab switching logic
 static void OnTabChange(HWND hwnd) {
     int sel = TabCtrl_GetCurSel(hTab);
-    // Parameters tab
+    // Parameters tab (always visible on tab 0)
     ShowWindow(hEditIP, sel == 0 ? SW_SHOW : SW_HIDE);
     ShowWindow(hEditPort, sel == 0 ? SW_SHOW : SW_HIDE);
     ShowWindow(hBtnStart, sel == 0 ? SW_SHOW : SW_HIDE);
+    ShowWindow(hEditServerId, sel == 0 ? SW_SHOW : SW_HIDE);
+    ShowWindow(hBtnCopyId, sel == 0 ? SW_SHOW : SW_HIDE);
     // Console tab
     ShowWindow(hEditConsole, sel == 1 ? SW_SHOW : SW_HIDE);
 }
@@ -81,6 +91,7 @@ static void RelayLogCallback(const char* message) {
 static void StartRelayServer(HWND hwnd) {
     char ip[64] = {0};
     char portStr[16] = {0};
+    char serverId[SERVER_ID_MAX_LEN] = {0};
     WORD port = 0;
     int result = 0;
     
@@ -95,6 +106,7 @@ static void StartRelayServer(HWND hwnd) {
     GetWindowTextA(hEditPort, portStr, sizeof(portStr)-1);
     port = (WORD)atoi(portStr);
     if (port == 0) port = RELAY_DEFAULT_PORT;
+    
     // Create and start relay server
     g_pRelayServer = Relay_Create(port, ip);
     if (!g_pRelayServer) {
@@ -118,6 +130,38 @@ static void StartRelayServer(HWND hwnd) {
         relayRunning = FALSE;
         return;
     }
+    
+    /* Generate Server ID from IP:Port for clients to use */
+    /* If IP is 0.0.0.0, try to get actual LAN IP */
+    if (strcmp(ip, "0.0.0.0") == 0) {
+        char hostname[256];
+        struct hostent *he;
+        if (gethostname(hostname, sizeof(hostname)) == 0) {
+            he = gethostbyname(hostname);
+            if (he && he->h_addr_list[0]) {
+                struct in_addr addr;
+                memcpy(&addr, he->h_addr_list[0], sizeof(addr));
+                strncpy(ip, inet_ntoa(addr), sizeof(ip)-1);
+            }
+        }
+        /* If still 0.0.0.0, use localhost placeholder */
+        if (strcmp(ip, "0.0.0.0") == 0) {
+            strcpy(ip, "127.0.0.1");
+        }
+    }
+    
+    result = Crypto_EncodeServerID(ip, port, serverId);
+    if (result == CRYPTO_SUCCESS) {
+        SetWindowTextA(hEditServerId, serverId);
+        EnableWindow(hBtnCopyId, TRUE);
+        AppendConsoleA("[INFO] Server ID generated: ");
+        AppendConsoleA(serverId);
+        AppendConsoleA("\r\n[INFO] Distribute this ID to your client users.\r\n");
+    } else {
+        SetWindowTextA(hEditServerId, "(Failed to generate)");
+        EnableWindow(hBtnCopyId, FALSE);
+    }
+    
     SetWindowTextW(hBtnStart, L"Stop");
     AppendConsoleA("[INFO] Relay server started.\r\n");
     relayRunning = TRUE;
@@ -135,6 +179,10 @@ static void StopRelayServer(HWND hwnd) {
     
     /* Cleanup crypto */
     Crypto_Cleanup();
+    
+    /* Clear Server ID display */
+    SetWindowTextA(hEditServerId, "(Start server to generate)");
+    EnableWindow(hBtnCopyId, FALSE);
     
     SetWindowTextW(hBtnStart, L"Start");
     AppendConsoleA("[INFO] Relay server stopped.\r\n");
@@ -204,6 +252,30 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 StopRelayServer(hwnd);
             }
         }
+        else if ((HWND)lParam == hBtnCopyId) {
+            /* Copy Server ID to clipboard */
+            char serverId[64];
+            GetWindowTextA(hEditServerId, serverId, sizeof(serverId));
+            if (serverId[0] != '\0' && serverId[0] != '(') {
+                if (OpenClipboard(hwnd)) {
+                    HGLOBAL hMem;
+                    char *pMem;
+                    int len = (int)strlen(serverId) + 1;
+                    EmptyClipboard();
+                    hMem = GlobalAlloc(GMEM_MOVEABLE, len);
+                    if (hMem) {
+                        pMem = (char*)GlobalLock(hMem);
+                        if (pMem) {
+                            memcpy(pMem, serverId, len);
+                            GlobalUnlock(hMem);
+                            SetClipboardData(CF_TEXT, hMem);
+                        }
+                    }
+                    CloseClipboard();
+                    AppendConsoleA("[INFO] Server ID copied to clipboard.\r\n");
+                }
+            }
+        }
         break;
     case WM_SIZE: {
         RECT rc;
@@ -213,8 +285,11 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         MoveWindow(hEditIP, 80,40,100,20, TRUE);
         MoveWindow(hEditPort, 230,40,60,20, TRUE);
         MoveWindow(hBtnStart, 300,40,60,20, TRUE);
+        // Move Server ID controls
+        MoveWindow(hEditServerId, 80,68,180,22, TRUE);
+        MoveWindow(hBtnCopyId, 265,68,50,22, TRUE);
         // Move console control
-        MoveWindow(hEditConsole, 16,80,400,160, TRUE);
+        MoveWindow(hEditConsole, 16,100,400,140, TRUE);
         break; }
     case WM_CLOSE:
         g_hMainWnd = NULL;  /* Prevent more log messages */

@@ -121,4 +121,41 @@ void Crypto_GenerateSessionKey(BYTE *keyOut);
  */
 void Crypto_DeriveKeyFromPassword(const char *password, BYTE *keyOut);
 
+/*
+ * SERVER ID ENCODING/DECODING
+ * 
+ * Server ID is an obfuscated representation of IP:Port
+ * Format: "XXXX-XXXX-XXXX" (alphanumeric, easy to type/share)
+ * 
+ * This hides the actual server IP from end users for security.
+ * Server admin generates the ID, distributes to clients.
+ */
+
+/* Maximum Server ID string length (including null terminator) */
+#define SERVER_ID_MAX_LEN   20
+
+/*
+ * Encode IP address and port into a Server ID string
+ * ipAddress: IP address string (e.g., "192.168.1.100")
+ * port: port number (0-65535)
+ * serverIdOut: output buffer for Server ID (at least SERVER_ID_MAX_LEN bytes)
+ * Returns: CRYPTO_SUCCESS or error code
+ */
+int Crypto_EncodeServerID(const char *ipAddress, WORD port, char *serverIdOut);
+
+/*
+ * Decode Server ID string back to IP address and port
+ * serverId: Server ID string (e.g., "ABCD-EFGH-1234")
+ * ipAddressOut: output buffer for IP (at least 16 bytes)
+ * portOut: output pointer for port
+ * Returns: CRYPTO_SUCCESS or error code
+ */
+int Crypto_DecodeServerID(const char *serverId, char *ipAddressOut, WORD *portOut);
+
+/*
+ * Validate Server ID format (quick check without decoding)
+ * Returns: TRUE if format appears valid, FALSE otherwise
+ */
+BOOL Crypto_ValidateServerIDFormat(const char *serverId);
+
 #endif /* CRYPTO_H */

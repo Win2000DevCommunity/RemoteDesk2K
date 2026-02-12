@@ -19,6 +19,7 @@
 #include "crypto.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <time.h>
 
 /* S-Box for byte substitution (adds non-linearity) */
@@ -345,4 +346,291 @@ void Crypto_DeriveKeyFromPassword(const char *password, BYTE *keyOut)
         keyOut[i] ^= (BYTE)((hash >> (i % 4)) & 0xFF);
         hash = hash * 1103515245 + 12345;
     }
+}
+
+/* ============================================================
+ * SERVER ID ENCODING/DECODING FUNCTIONS
+ * 
+ * Server ID hides the actual IP:Port from end users.
+ * Format: "XXXX-XXXX-XXXX" using base32-like encoding
+ * ============================================================ */
+
+/* Base32-like alphabet (no confusing chars like 0/O, 1/I/L) */
+static const char g_ServerIdAlphabet[] = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+#define ALPHABET_SIZE 32
+
+/* Helper: Parse IP address string to 4 bytes */
+static BOOL ParseIPAddress(const char *ipStr, BYTE *ipBytes)
+{
+    int parts[4];
+    int i;
+    
+    if (!ipStr || !ipBytes) return FALSE;
+    
+    /* Parse dotted decimal format */
+    if (sscanf(ipStr, "%d.%d.%d.%d", &parts[0], &parts[1], &parts[2], &parts[3]) != 4) {
+        return FALSE;
+    }
+    
+    /* Validate each octet */
+    for (i = 0; i < 4; i++) {
+        if (parts[i] < 0 || parts[i] > 255) {
+            return FALSE;
+        }
+        ipBytes[i] = (BYTE)parts[i];
+    }
+    
+    return TRUE;
+}
+
+/* Helper: Format IP bytes to string */
+static void FormatIPAddress(const BYTE *ipBytes, char *ipStr)
+{
+    if (ipBytes && ipStr) {
+        sprintf(ipStr, "%d.%d.%d.%d", ipBytes[0], ipBytes[1], ipBytes[2], ipBytes[3]);
+    }
+}
+
+/* Helper: Encode 6 bytes to base32-like string (produces ~10 chars) */
+static void EncodeBase32(const BYTE *data, int dataLen, char *output)
+{
+    int bitBuffer = 0;
+    int bitCount = 0;
+    int outIdx = 0;
+    int i;
+    
+    for (i = 0; i < dataLen; i++) {
+        bitBuffer = (bitBuffer << 8) | data[i];
+        bitCount += 8;
+        
+        while (bitCount >= 5) {
+            bitCount -= 5;
+            output[outIdx++] = g_ServerIdAlphabet[(bitBuffer >> bitCount) & 0x1F];
+        }
+    }
+    
+    /* Handle remaining bits */
+    if (bitCount > 0) {
+        output[outIdx++] = g_ServerIdAlphabet[(bitBuffer << (5 - bitCount)) & 0x1F];
+    }
+    
+    output[outIdx] = '\0';
+}
+
+/* Helper: Decode base32-like string to bytes */
+static int DecodeBase32(const char *input, BYTE *output, int maxOutLen)
+{
+    int bitBuffer = 0;
+    int bitCount = 0;
+    int outIdx = 0;
+    int i;
+    char c;
+    int charVal;
+    const char *found;
+    
+    for (i = 0; input[i] != '\0' && outIdx < maxOutLen; i++) {
+        c = input[i];
+        
+        /* Skip dashes */
+        if (c == '-') continue;
+        
+        /* Convert to uppercase */
+        if (c >= 'a' && c <= 'z') {
+            c = (char)(c - 'a' + 'A');
+        }
+        
+        /* Find character in alphabet */
+        found = strchr(g_ServerIdAlphabet, c);
+        if (!found) {
+            return -1;  /* Invalid character */
+        }
+        charVal = (int)(found - g_ServerIdAlphabet);
+        
+        bitBuffer = (bitBuffer << 5) | charVal;
+        bitCount += 5;
+        
+        while (bitCount >= 8 && outIdx < maxOutLen) {
+            bitCount -= 8;
+            output[outIdx++] = (BYTE)((bitBuffer >> bitCount) & 0xFF);
+        }
+    }
+    
+    return outIdx;
+}
+
+/* Helper: Insert dashes into server ID for readability: XXXX-XXXX-XXXX */
+static void FormatServerID(const char *raw, char *formatted)
+{
+    int len;
+    int i, j;
+    
+    len = (int)strlen(raw);
+    j = 0;
+    
+    for (i = 0; i < len && j < SERVER_ID_MAX_LEN - 1; i++) {
+        if (i > 0 && (i % 4) == 0) {
+            formatted[j++] = '-';
+        }
+        formatted[j++] = raw[i];
+    }
+    formatted[j] = '\0';
+}
+
+/* Helper: Remove dashes from server ID */
+static void UnformatServerID(const char *formatted, char *raw)
+{
+    int i, j;
+    
+    j = 0;
+    for (i = 0; formatted[i] != '\0'; i++) {
+        if (formatted[i] != '-') {
+            raw[j++] = formatted[i];
+        }
+    }
+    raw[j] = '\0';
+}
+
+/*
+ * Encode IP address and port into obfuscated Server ID
+ * 
+ * Structure: [4 bytes IP] + [2 bytes Port] = 6 bytes
+ * These are encrypted, then base32-encoded
+ */
+int Crypto_EncodeServerID(const char *ipAddress, WORD port, char *serverIdOut)
+{
+    BYTE rawData[8];  /* Extra padding for encryption */
+    BYTE encryptedData[8];
+    char rawId[20];
+    
+    if (!ipAddress || !serverIdOut) {
+        return CRYPTO_ERR_INVALID;
+    }
+    
+    /* Zero out buffers */
+    ZeroMemory(rawData, sizeof(rawData));
+    
+    /* Parse IP address to bytes */
+    if (!ParseIPAddress(ipAddress, rawData)) {
+        return CRYPTO_ERR_INVALID;
+    }
+    
+    /* Add port (big-endian for consistent encoding) */
+    rawData[4] = (BYTE)((port >> 8) & 0xFF);
+    rawData[5] = (BYTE)(port & 0xFF);
+    
+    /* Add checksum byte for validation */
+    rawData[6] = (BYTE)(rawData[0] ^ rawData[1] ^ rawData[2] ^ rawData[3] ^ rawData[4] ^ rawData[5]);
+    rawData[7] = 0x2A;  /* Magic marker byte (RD2K) */
+    
+    /* Copy for encryption (encrypt in place would modify original) */
+    memcpy(encryptedData, rawData, 8);
+    
+    /* Encrypt the data */
+    if (!g_bInitialized) {
+        Crypto_Init(NULL);
+    }
+    Crypto_Encrypt(encryptedData, 8);
+    
+    /* Encode to base32-like string */
+    EncodeBase32(encryptedData, 8, rawId);
+    
+    /* Format with dashes for readability */
+    FormatServerID(rawId, serverIdOut);
+    
+    return CRYPTO_SUCCESS;
+}
+
+/*
+ * Decode Server ID back to IP address and port
+ */
+int Crypto_DecodeServerID(const char *serverId, char *ipAddressOut, WORD *portOut)
+{
+    char rawId[20];
+    BYTE encryptedData[8];
+    BYTE decryptedData[8];
+    int decodedLen;
+    BYTE checksum;
+    
+    if (!serverId || !ipAddressOut || !portOut) {
+        return CRYPTO_ERR_INVALID;
+    }
+    
+    /* Remove formatting dashes */
+    UnformatServerID(serverId, rawId);
+    
+    /* Decode from base32 */
+    ZeroMemory(encryptedData, sizeof(encryptedData));
+    decodedLen = DecodeBase32(rawId, encryptedData, 8);
+    
+    if (decodedLen < 6) {
+        return CRYPTO_ERR_INVALID;
+    }
+    
+    /* Copy for decryption */
+    memcpy(decryptedData, encryptedData, 8);
+    
+    /* Decrypt the data */
+    if (!g_bInitialized) {
+        Crypto_Init(NULL);
+    }
+    Crypto_Decrypt(decryptedData, 8);
+    
+    /* Verify checksum */
+    checksum = (BYTE)(decryptedData[0] ^ decryptedData[1] ^ decryptedData[2] ^ 
+                      decryptedData[3] ^ decryptedData[4] ^ decryptedData[5]);
+    if (checksum != decryptedData[6]) {
+        return CRYPTO_ERR_INVALID;  /* Checksum mismatch - invalid ID */
+    }
+    
+    /* Extract IP address */
+    FormatIPAddress(decryptedData, ipAddressOut);
+    
+    /* Extract port (big-endian) */
+    *portOut = (WORD)((decryptedData[4] << 8) | decryptedData[5]);
+    
+    return CRYPTO_SUCCESS;
+}
+
+/*
+ * Validate Server ID format (quick check without full decoding)
+ */
+BOOL Crypto_ValidateServerIDFormat(const char *serverId)
+{
+    int len;
+    int alphaCount = 0;
+    int dashCount = 0;
+    int i;
+    char c;
+    const char *found;
+    
+    if (!serverId) return FALSE;
+    
+    len = (int)strlen(serverId);
+    
+    /* Server ID should be around 15-17 chars with dashes */
+    if (len < 10 || len > 20) return FALSE;
+    
+    for (i = 0; i < len; i++) {
+        c = serverId[i];
+        
+        if (c == '-') {
+            dashCount++;
+            continue;
+        }
+        
+        /* Convert to uppercase for check */
+        if (c >= 'a' && c <= 'z') {
+            c = (char)(c - 'a' + 'A');
+        }
+        
+        /* Check if valid alphabet character */
+        found = strchr(g_ServerIdAlphabet, c);
+        if (!found) {
+            return FALSE;
+        }
+        alphaCount++;
+    }
+    
+    /* Expect ~13 alphabet chars and 2-3 dashes */
+    return (alphaCount >= 10 && alphaCount <= 16 && dashCount >= 1);
 }
