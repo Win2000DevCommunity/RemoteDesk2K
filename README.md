@@ -26,10 +26,17 @@ A remote desktop application with UltraViewer/AnyDesk-like interface, designed f
 - **Refresh Screen** (F5) - Force full screen refresh
 
 ### 🔒 Security
+- **Encrypted connections** - All traffic encrypted with multi-layer cipher
 - Password-protected connections
 - Auto-generated 5-digit password
 - Custom password option
 - Password refresh button
+
+### 🌐 Relay Server Support
+- Connect through NAT/firewalls via relay server
+- Auto-reconnection on connection loss (5 attempts)
+- Partner disconnect detection with notification
+- Works alongside direct connections
 
 
 ## Build Environment
@@ -114,19 +121,24 @@ RemoteDesk2K/
 | File Transfer | ✓ | ✓ | ✓ |
 | Clipboard | ✓ | ✓ | ✓ |
 | Full Screen | ✓ | ✓ | ✓ |
-| Encryption | ✗ | ✓ | ✓ |
-| Relay Server | ✗ | ✓ | ✓ |
+| Encryption | ✓ | ✓ | ✓ |
+| Relay Server | ✓ | ✓ | ✓ |
 | Win2000 Support | ✓ | ✗ | ✗ |
 
 ## Limitations
 
-- Direct connection only (no relay server)
 - Single connection at a time
-- No encryption (use VPN for security)
 - No audio streaming
 - 24-bit color depth
 
 ## Version History
+
+- **1.1.0** - Security and Relay Update
+  - Full encryption on all connections (direct and relay)
+  - Relay server support for NAT traversal
+  - Auto-reconnection on connection loss
+  - Partner disconnect notifications
+  - Connection health monitoring
 
 - **1.0.0** - Initial release
   - UltraViewer-like unified interface

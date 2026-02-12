@@ -1,10 +1,12 @@
 /*
  * RemoteDesk2K - Network Module Implementation
  * Windows 2000 compatible network I/O with proper socket options
+ * All data transfers are encrypted using multi-layer XOR + S-Box algorithm
  */
 
 #include "network.h"
 #include "relay.h"
+#include "crypto.h"
 
 /* Socket timeout values (milliseconds) */
 #define SOCKET_SEND_TIMEOUT     60000   /* 60 seconds for large files */
@@ -412,12 +414,13 @@ int Network_RecvExact(PRD2K_NETWORK pNet, BYTE *buffer, DWORD length)
 int Network_SendPacket(PRD2K_NETWORK pNet, BYTE msgType, const BYTE *data, DWORD dataLength)
 {
     RD2K_HEADER header;
+    BYTE *encryptedData = NULL;
     int result;
     
     if (!pNet) return RD2K_ERR_SEND;
     
     header.msgType = msgType;
-    header.flags = 0;
+    header.flags = 0x01;  /* Flag: encrypted */
     header.reserved = 0;
     header.dataLength = dataLength;
     header.checksum = data ? CalculateChecksum(data, dataLength) : 0;
@@ -426,7 +429,19 @@ int Network_SendPacket(PRD2K_NETWORK pNet, BYTE msgType, const BYTE *data, DWORD
     if (result != RD2K_SUCCESS) return result;
     
     if (data && dataLength > 0) {
-        result = Network_Send(pNet, data, dataLength);
+        /* Encrypt data before sending (for direct connections) */
+        if (!pNet->bRelayMode) {
+            encryptedData = (BYTE*)malloc(dataLength);
+            if (!encryptedData) return RD2K_ERR_MEMORY;
+            
+            CopyMemory(encryptedData, data, dataLength);
+            Crypto_Encrypt(encryptedData, dataLength);
+            result = Network_Send(pNet, encryptedData, dataLength);
+            free(encryptedData);
+        } else {
+            /* Relay mode - encryption handled by relay layer */
+            result = Network_Send(pNet, data, dataLength);
+        }
     }
     
     return result;
@@ -446,6 +461,11 @@ int Network_RecvPacket(PRD2K_NETWORK pNet, RD2K_HEADER *pHeader, BYTE *data, DWO
         
         result = Network_RecvExact(pNet, data, pHeader->dataLength);
         if (result != RD2K_SUCCESS) return result;
+        
+        /* Decrypt data after receiving (for direct connections) */
+        if (!pNet->bRelayMode && (pHeader->flags & 0x01)) {
+            Crypto_Decrypt(data, pHeader->dataLength);
+        }
         
         if (CalculateChecksum(data, pHeader->dataLength) != pHeader->checksum) {
             return RD2K_ERR_PROTOCOL;
