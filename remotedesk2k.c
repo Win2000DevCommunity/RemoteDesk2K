@@ -1149,10 +1149,18 @@ void HandleRelayServerLost(void)
     char msg[256];
     BOOL reconnected = FALSE;
     
+    /* IMPORTANT: Prevent re-entry while already reconnecting */
+    if (g_bReconnecting) {
+        return;
+    }
+    
+    /* Set flag FIRST to prevent re-entry */
+    g_bReconnecting = TRUE;
+    
     /* Cancel any pending file transfer */
     FileTransfer_Cancel();
     
-    /* Stop all timers */
+    /* Stop all timers IMMEDIATELY */
     KillTimer(g_hMainWnd, TIMER_NETWORK);
     KillTimer(g_hMainWnd, TIMER_PING);
     KillTimer(g_hMainWnd, TIMER_RELAY_CHECK);
@@ -1180,21 +1188,11 @@ void HandleRelayServerLost(void)
     LeaveCriticalSection(&g_csRelay);
     
     /* Start reconnection attempts */
-    g_bReconnecting = TRUE;
     UpdateStatusBar("Relay server lost - reconnecting...", FALSE);
     
-    for (attempt = 1; attempt <= RECONNECT_MAX_ATTEMPTS && g_bReconnecting; attempt++) {
-        sprintf(msg, "Relay server disconnected.\n\nReconnecting... Attempt %d of %d", 
-                attempt, RECONNECT_MAX_ATTEMPTS);
-        
-        /* Show/update message box for this attempt */
-        if (attempt == 1) {
-            /* For first attempt, update status and wait */
-            UpdateStatusBar(msg + 28, FALSE);  /* Skip the first line */
-        } else {
-            sprintf(msg, "Reconnecting... Attempt %d of %d", attempt, RECONNECT_MAX_ATTEMPTS);
-            UpdateStatusBar(msg, FALSE);
-        }
+    for (attempt = 1; attempt <= RECONNECT_MAX_ATTEMPTS; attempt++) {
+        sprintf(msg, "Reconnecting... Attempt %d of %d", attempt, RECONNECT_MAX_ATTEMPTS);
+        UpdateStatusBar(msg, FALSE);
         
         /* Try to reconnect */
         if (AttemptRelayReconnection()) {
@@ -1202,7 +1200,7 @@ void HandleRelayServerLost(void)
             break;
         }
         
-        /* Wait before next attempt */
+        /* Wait before next attempt - but check if app is closing */
         if (attempt < RECONNECT_MAX_ATTEMPTS) {
             Sleep(RECONNECT_DELAY_MS);
         }
@@ -1220,6 +1218,7 @@ void HandleRelayServerLost(void)
         /* Restart relay health check timer */
         SetTimer(g_hMainWnd, TIMER_RELAY_CHECK, RELAY_CHECK_INTERVAL, NULL);
         
+        /* Show ONE message - only if partner was connected */
         MessageBoxA(g_hMainWnd, 
                    "Reconnected to relay server.\n\n"
                    "Note: Your partner connection was lost.\n"
