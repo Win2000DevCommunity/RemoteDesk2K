@@ -2,6 +2,27 @@
 
 A remote desktop application with UltraViewer/AnyDesk-like interface, designed for Windows 2000.
 
+## Downloads
+
+| File | Description | Size |
+|------|-------------|------|
+| **RD2K_Setup.exe** | Client installer (includes RemoteDesk2K.exe) | ~130 KB |
+| **relay.exe** | Relay server (separate, for admins only) | ~33 KB |
+
+> ⚠️ **Important:** The relay server (`relay.exe`) is **NOT included** in the installer.  
+> It is distributed separately for server administrators only.
+
+### No Cloud Server Yet
+
+Currently, there is **no public cloud-hosted relay server**. To use relay mode:
+
+1. **You or someone in your network** must run `relay.exe` on a server/PC with a public IP or port forwarding
+2. Start the relay server and copy the generated **Server ID**
+3. Distribute the Server ID to client users
+4. Clients can then connect through the relay
+
+> 💡 **Direct Connection** still works without any relay server if both PCs are on the same network!
+
 ## Features
 
 ### 🖥️ UltraViewer-Style Interface
@@ -63,8 +84,45 @@ A remote desktop application with UltraViewer/AnyDesk-like interface, designed f
 ### Build Steps
 ```batch
 cd RemoteDesk2K
-build.bat          # Build client (RemoteDesk2K.exe)
-build_relay.bat    # Build relay server (relay.exe)
+
+# Build client application
+cd client
+build.bat              # Creates RemoteDesk2K.exe
+
+# Build relay server (admin only)
+cd ../relay
+build_relay.bat        # Creates relay.exe
+
+# Build installer (optional)
+cd ../installer
+build_installer.bat    # Creates RD2K_Setup.exe (embeds client)
+```
+
+## Project Structure
+
+```
+RemoteDesk2K/
+├── client/              # Client application
+│   ├── remotedesk2k.c   # Main client code
+│   ├── clipboard.c/h    # Clipboard sharing
+│   ├── filetransfer.c/h # File transfer
+│   ├── input.c/h        # Input handling
+│   ├── progress.c/h     # Progress dialogs
+│   └── build.bat        # Client build script
+├── relay/               # Relay server (separate)
+│   ├── relay.c          # Relay server logic
+│   ├── relay_gui.c      # Relay server GUI
+│   └── build_relay.bat  # Relay build script
+├── common/              # Shared code
+│   ├── common.h         # Protocol definitions
+│   ├── network.c/h      # Network communication
+│   ├── screen.c/h       # Screen capture
+│   ├── crypto.c/h       # Encryption
+│   └── relay.h          # Relay protocol
+├── installer/           # Installer builder
+│   ├── installer.c      # Installer code
+│   └── build_installer.bat
+└── README.md
 ```
 
 ## Usage
@@ -106,19 +164,6 @@ build_relay.bat    # Build relay server (relay.exe)
 - Both computers must be on same network (or port forwarded)
 - Default port: **5901**
 - Firewall must allow incoming TCP on port 5901
-
-## File Structure
-
-```
-RemoteDesk2K/
-├── common.h         - Protocol definitions
-├── screen.h/c       - Screen capture module
-├── network.h/c      - Network communication
-├── remotedesk2k.c   - Main application (unified UI)
-├── Makefile         - Build configuration
-├── build.bat        - Build script
-└── README.md        - This file
-```
 
 ## Protocol Overview
 
