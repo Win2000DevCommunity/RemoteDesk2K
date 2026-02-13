@@ -156,8 +156,47 @@ static PRELAY_CONNECTION FindConnectionById(PRELAY_SERVER pServer, DWORD clientI
     return NULL;
 }
 
+/* Check if a socket is still connected (not dead) */
+static BOOL IsSocketAlive(SOCKET sock)
+{
+    char buf;
+    int result;
+    fd_set readfds;
+    struct timeval tv;
+    
+    if (sock == INVALID_SOCKET) return FALSE;
+    
+    /* Use select with 0 timeout to check socket state without blocking */
+    FD_ZERO(&readfds);
+    FD_SET(sock, &readfds);
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    
+    result = select(0, &readfds, NULL, NULL, &tv);
+    
+    if (result == SOCKET_ERROR) {
+        return FALSE;  /* Socket error - dead */
+    }
+    
+    if (result > 0) {
+        /* Data available - try to peek without removing from buffer */
+        result = recv(sock, &buf, 1, MSG_PEEK);
+        if (result == 0) {
+            return FALSE;  /* Connection closed gracefully */
+        }
+        if (result == SOCKET_ERROR) {
+            int err = WSAGetLastError();
+            if (err != WSAEWOULDBLOCK) {
+                return FALSE;  /* Real error - dead */
+            }
+        }
+    }
+    
+    return TRUE;  /* Socket appears alive */
+}
+
 /* Remove stale connections with same clientId (for reconnection handling) 
- * IMPORTANT: Never remove PAIRED connections - they are active sessions!
+ * IMPORTANT: Only protect PAIRED connections if socket is still alive!
  * Returns TRUE if ID is available for registration, FALSE if already paired */
 static BOOL RemoveStaleConnections(PRELAY_SERVER pServer, DWORD clientId, PRELAY_CONNECTION pExclude)
 {
@@ -172,13 +211,42 @@ static BOOL RemoveStaleConnections(PRELAY_SERVER pServer, DWORD clientId, PRELAY
         PRELAY_CONNECTION pConn = pServer->connections[i];
         if (pConn && pConn != pExclude && pConn->clientId == clientId) {
             
-            /* CRITICAL: Never touch PAIRED connections - they are active sessions! */
+            /* For PAIRED connections, check if socket is actually still alive */
             if (pConn->state == RELAY_STATE_PAIRED) {
                 char idStr[20];
                 FormatClientId(clientId, idStr);
+                
+                /* Check if socket is dead - if so, clean it up! */
+                if (!IsSocketAlive(pConn->socket)) {
+                    RelayLog("[CLEANUP] PAIRED connection for ID %s has dead socket - allowing reconnect\r\n", idStr);
+                    
+                    /* Notify partner that their partner disconnected */
+                    if (pConn->pPartner && pConn->pPartner->socket != INVALID_SOCKET) {
+                        RELAY_PARTNER_DISCONNECTED notification;
+                        notification.reason = RELAY_DISCONNECT_PARTNER_LEFT;
+                        notification.partnerId = pConn->clientId;
+                        SendRelayPacket(pConn->pPartner->socket, RELAY_MSG_PARTNER_DISCONNECTED,
+                                       (const BYTE*)&notification, sizeof(notification));
+                        pConn->pPartner->pPartner = NULL;
+                        pConn->pPartner->state = RELAY_STATE_REGISTERED;
+                    }
+                    
+                    /* Clean up the dead connection */
+                    if (pConn->hDisconnectEvent) SetEvent(pConn->hDisconnectEvent);
+                    if (pConn->socket != INVALID_SOCKET) {
+                        closesocket(pConn->socket);
+                        pConn->socket = INVALID_SOCKET;
+                    }
+                    pConn->state = RELAY_STATE_DISCONNECTED;
+                    pServer->connections[i] = NULL;
+                    if (pServer->activeConnections > 0) pServer->activeConnections--;
+                    continue;  /* Allow new registration */
+                }
+                
+                /* Socket is alive - protect this active session */
                 RelayLog("[PROTECT] ID %s is already in active session (PAIRED) - blocking duplicate\r\n", idStr);
-                bIdAvailable = FALSE;  /* ID is in use, reject new registration */
-                continue;  /* Don't remove this connection */
+                bIdAvailable = FALSE;
+                continue;
             }
             
             /* Only remove truly stale connections:
