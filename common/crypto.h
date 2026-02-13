@@ -145,7 +145,7 @@ int Crypto_EncodeServerID(const char *ipAddress, WORD port, char *serverIdOut);
 
 /*
  * Decode Server ID string back to IP address and port
- * serverId: Server ID string (e.g., "ABCD-EFGH-1234")
+ * serverId: Server ID string (e.g., "XXXX-XXXX-XXXX-X")
  * ipAddressOut: output buffer for IP (at least 16 bytes)
  * portOut: output pointer for port
  * Returns: CRYPTO_SUCCESS or error code

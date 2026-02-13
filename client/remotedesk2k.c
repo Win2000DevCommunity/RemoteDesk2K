@@ -795,7 +795,7 @@ void ConnectToRelayServer(void)
     /* Validate and decode Server ID */
     if (!Crypto_ValidateServerIDFormat(serverIdStr)) {
         MessageBoxA(g_hMainWnd, "Invalid Server ID format!\n\n"
-                   "Server ID should look like: ABCD-EFGH-1234",
+                   "Server ID should look like: XXXX-XXXX-XXXX-X",
                    APP_TITLE, MB_ICONWARNING);
         return;
     }
@@ -851,6 +851,9 @@ void ConnectToRelayServer(void)
     g_relaySocket = relaySocket;
     g_bConnectedToRelay = TRUE;
     LeaveCriticalSection(&g_csRelay);
+    
+    /* Save Server ID immediately so it's remembered next time */
+    SaveClientConfig();
     
     /* Start timer to check relay connection health */
     SetTimer(g_hMainWnd, TIMER_RELAY_CHECK, RELAY_CHECK_INTERVAL, NULL);
@@ -1114,6 +1117,9 @@ void ConnectToPartnerViaRelay(void)
     SetWindowTextA(g_hRelayConnectPartnerBtn, "Connecting...");
     EnableWindow(g_hRelayConnectPartnerBtn, FALSE);
     EnableWindow(g_hRelayConnectSvrBtn, FALSE);
+    
+    /* Save Partner ID immediately so it's remembered */
+    SaveClientConfig();
     
     g_bConnecting = TRUE;
     
@@ -2143,6 +2149,9 @@ void ConnectToPartner(void)
     UpdateStatusBar("Connecting...", FALSE);
     SetWindowTextA(g_hConnectBtn, "Connecting...");
     EnableWindow(g_hConnectBtn, FALSE);
+    
+    /* Save Partner ID immediately so it's remembered */
+    SaveClientConfig();
     
     g_bConnecting = TRUE;
     

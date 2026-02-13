@@ -355,8 +355,8 @@ void Crypto_DeriveKeyFromPassword(const char *password, BYTE *keyOut)
  * Format: "XXXX-XXXX-XXXX" using base32-like encoding
  * ============================================================ */
 
-/* Base32-like alphabet (no confusing chars like 0/O, 1/I/L) */
-static const char g_ServerIdAlphabet[] = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+/* Base32-like alphabet - MUST have exactly 32 characters! (no confusing chars like 0/O, 1/I) */
+static const char g_ServerIdAlphabet[] = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 #define ALPHABET_SIZE 32
 
 /* Helper: Parse IP address string to 4 bytes */
@@ -391,27 +391,45 @@ static void FormatIPAddress(const BYTE *ipBytes, char *ipStr)
     }
 }
 
-/* Helper: Encode 6 bytes to base32-like string (produces ~10 chars) */
+/* Helper: Get bit at position from byte array (0 = MSB of first byte) */
+static int GetBit(const BYTE *data, int bitPos)
+{
+    int byteIdx = bitPos / 8;
+    int bitIdx = 7 - (bitPos % 8);  /* MSB first */
+    return (data[byteIdx] >> bitIdx) & 1;
+}
+
+/* Helper: Encode bytes to base32-like string (8 bytes produces 13 chars) 
+ * Uses bit-by-bit extraction to avoid any integer overflow issues */
 static void EncodeBase32(const BYTE *data, int dataLen, char *output)
 {
-    int bitBuffer = 0;
-    int bitCount = 0;
+    int totalBits = dataLen * 8;
+    int bitPos = 0;
     int outIdx = 0;
-    int i;
+    int charVal;
+    int b;
     
-    for (i = 0; i < dataLen; i++) {
-        bitBuffer = (bitBuffer << 8) | data[i];
-        bitCount += 8;
-        
-        while (bitCount >= 5) {
-            bitCount -= 5;
-            output[outIdx++] = g_ServerIdAlphabet[(bitBuffer >> bitCount) & 0x1F];
+    while (bitPos + 5 <= totalBits) {
+        /* Extract 5 bits */
+        charVal = 0;
+        for (b = 0; b < 5; b++) {
+            charVal = (charVal << 1) | GetBit(data, bitPos + b);
         }
+        output[outIdx++] = g_ServerIdAlphabet[charVal];
+        bitPos += 5;
     }
     
-    /* Handle remaining bits */
-    if (bitCount > 0) {
-        output[outIdx++] = g_ServerIdAlphabet[(bitBuffer << (5 - bitCount)) & 0x1F];
+    /* Handle remaining bits (if any) - pad with zeros on the right */
+    if (bitPos < totalBits) {
+        charVal = 0;
+        for (b = 0; b < 5; b++) {
+            if (bitPos + b < totalBits) {
+                charVal = (charVal << 1) | GetBit(data, bitPos + b);
+            } else {
+                charVal = charVal << 1;  /* Pad with 0 */
+            }
+        }
+        output[outIdx++] = g_ServerIdAlphabet[charVal];
     }
     
     output[outIdx] = '\0';
@@ -420,7 +438,7 @@ static void EncodeBase32(const BYTE *data, int dataLen, char *output)
 /* Helper: Decode base32-like string to bytes */
 static int DecodeBase32(const char *input, BYTE *output, int maxOutLen)
 {
-    int bitBuffer = 0;
+    unsigned int bitBuffer = 0;  /* MUST be unsigned to avoid overflow issues */
     int bitCount = 0;
     int outIdx = 0;
     int i;
@@ -500,7 +518,7 @@ int Crypto_EncodeServerID(const char *ipAddress, WORD port, char *serverIdOut)
 {
     BYTE rawData[8];  /* Extra padding for encryption */
     BYTE encryptedData[8];
-    char rawId[20];
+    char rawId[32];  /* Increased buffer size for safety */
     
     if (!ipAddress || !serverIdOut) {
         return CRYPTO_ERR_INVALID;
@@ -508,6 +526,7 @@ int Crypto_EncodeServerID(const char *ipAddress, WORD port, char *serverIdOut)
     
     /* Zero out buffers */
     ZeroMemory(rawData, sizeof(rawData));
+    ZeroMemory(rawId, sizeof(rawId));
     
     /* Parse IP address to bytes */
     if (!ParseIPAddress(ipAddress, rawData)) {
@@ -531,7 +550,7 @@ int Crypto_EncodeServerID(const char *ipAddress, WORD port, char *serverIdOut)
     }
     Crypto_Encrypt(encryptedData, 8);
     
-    /* Encode to base32-like string */
+    /* Encode to base32-like string - MUST produce 13 chars for 8 bytes */
     EncodeBase32(encryptedData, 8, rawId);
     
     /* Format with dashes for readability */
