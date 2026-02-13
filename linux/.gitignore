@@ -1,0 +1,14 @@
+# Build artifacts
+*.o
+*.obj
+*.exe
+relay_server
+relay_server_debug
+
+# Logs
+*.log
+
+# Editor/IDE
+.vscode/
+*.swp
+*~
