@@ -393,12 +393,23 @@ static int ProcessRelayMessage(PRELAY_SERVER pServer, PRELAY_CONNECTION pConn,
             
             /* Look for partner */
             pPartner = FindConnectionById(pServer, req.partnerId);
-            if (!pPartner || pPartner->state != RELAY_STATE_REGISTERED) {
-                response.status = RD2K_ERR_CONNECT;  /* Partner not found */
-                RelayLog("[CONNECT] Client %s -> Partner %s: NOT FOUND\r\n", 
+            if (!pPartner) {
+                /* Partner not connected to relay server */
+                response.status = RD2K_ERR_CONNECT;
+                RelayLog("[CONNECT] Client %s -> Partner %s: NOT ONLINE\r\n", 
                         clientIdStr, partnerIdStr);
+            } else if (pPartner->state == RELAY_STATE_PAIRED) {
+                /* Partner is already in a session with someone else */
+                response.status = RD2K_ERR_CONNECT;
+                RelayLog("[CONNECT] Client %s -> Partner %s: BUSY (in another session)\r\n", 
+                        clientIdStr, partnerIdStr);
+            } else if (pPartner->state != RELAY_STATE_REGISTERED) {
+                /* Partner in unexpected state */
+                response.status = RD2K_ERR_CONNECT;
+                RelayLog("[CONNECT] Client %s -> Partner %s: NOT READY (state=%d)\r\n", 
+                        clientIdStr, partnerIdStr, pPartner->state);
             } else {
-                /* Pair the connections */
+                /* Partner available - Pair the connections */
                 pConn->pPartner = pPartner;
                 pPartner->pPartner = pConn;
                 pConn->state = RELAY_STATE_PAIRED;
@@ -413,7 +424,9 @@ static int ProcessRelayMessage(PRELAY_SERVER pServer, PRELAY_CONNECTION pConn,
                            (const BYTE*)&response, sizeof(response));
             
             pConn->lastActivity = GetTickCount();
-            return response.status;
+            
+            /* Don't disconnect client on failed connect - let them try again */
+            return 0;
         }
         
         case RELAY_MSG_DATA: {
@@ -597,8 +610,9 @@ static DWORD WINAPI ClientWorkerThread(LPVOID lpParam)
         /* Step 5: Process the complete message */
         result = ProcessRelayMessage(pServer, pConn, buffer, totalPacketSize);
         if (result != 0 && result != RD2K_SUCCESS) {
-            RelayLog("[INFO] ProcessRelayMessage returned %d\r\n", result);
-            break;  /* Disconnect or error */
+            /* result = 1 means graceful disconnect (RELAY_MSG_DISCONNECT)
+             * result = -1 means protocol error */
+            break;
         }
     }
     
@@ -606,7 +620,13 @@ static DWORD WINAPI ClientWorkerThread(LPVOID lpParam)
     {
         char idStr[20];
         FormatClientId(pConn->clientId, idStr);
-        RelayLog("[INFO] Client %s worker thread ending\r\n", idStr);
+        
+        /* Log proper disconnect message */
+        if (pConn->clientId != 0) {
+            RelayLog("[DISCONNECT] Client %s connection closed\r\n", idStr);
+        } else {
+            RelayLog("[DISCONNECT] Unregistered client connection closed\r\n");
+        }
         
         /* If we have a partner, notify them that we disconnected */
         if (pConn->pPartner && pConn->pPartner->socket != INVALID_SOCKET) {
