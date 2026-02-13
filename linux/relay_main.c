@@ -52,40 +52,28 @@ static void LogCallback(const char *message)
 {
     char timestamp[32];
     const char *color = COLOR_RESET;
-    const char *prefix = "";
     
     GetTimestamp(timestamp, sizeof(timestamp));
     
     /* Determine color based on message type */
     if (strstr(message, "[ERROR]")) {
         color = COLOR_RED;
-        prefix = "ERROR";
     } else if (strstr(message, "[WARN]")) {
         color = COLOR_YELLOW;
-        prefix = "WARN ";
     } else if (strstr(message, "[INFO]")) {
         color = COLOR_GREEN;
-        prefix = "INFO ";
     } else if (strstr(message, "[REGISTER]")) {
         color = COLOR_CYAN;
-        prefix = "REGIS";
     } else if (strstr(message, "[CONNECT]")) {
         color = COLOR_MAGENTA;
-        prefix = "CONN ";
     } else if (strstr(message, "[DISCONNECT]")) {
         color = COLOR_BLUE;
-        prefix = "DISC ";
     } else if (strstr(message, "[CLEANUP]")) {
         color = COLOR_DIM;
-        prefix = "CLEAN";
     } else if (strstr(message, "[PROTECT]")) {
         color = COLOR_YELLOW;
-        prefix = "PROT ";
     } else if (strstr(message, "[REJECT]")) {
         color = COLOR_RED;
-        prefix = "REJCT";
-    } else {
-        prefix = "     ";
     }
     
     pthread_mutex_lock(&g_printMutex);
@@ -273,7 +261,6 @@ static int Daemonize(void)
 static void PrintStatus(WORD port, const char *bindIp)
 {
     char serverId[SERVER_ID_MAX_LEN];
-    char publicIp[64] = "0.0.0.0";
     
     pthread_mutex_lock(&g_printMutex);
     
