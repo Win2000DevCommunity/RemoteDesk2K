@@ -157,6 +157,178 @@ static void RelayLogCallback(const char* message) {
 }
 
 /* ========================================================================== 
+ * PUBLIC IP DETECTION via OpenDNS (for VPS/Cloud servers)
+ * Uses DNS query to myip.opendns.com via resolver1.opendns.com (208.67.222.222)
+ * This returns the PUBLIC IP even when server is behind NAT or on VPS
+ * ========================================================================== */
+
+/* DNS header structure */
+#pragma pack(push, 1)
+typedef struct _DNS_HEADER {
+    USHORT id;
+    USHORT flags;
+    USHORT qdcount;  /* Question count */
+    USHORT ancount;  /* Answer count */
+    USHORT nscount;  /* Authority count */
+    USHORT arcount;  /* Additional count */
+} DNS_HEADER;
+#pragma pack(pop)
+
+/* Get public IP address using OpenDNS lookup
+ * Returns TRUE on success, FALSE on failure
+ * publicIP buffer should be at least 16 bytes */
+static BOOL GetPublicIPviaOpenDNS(char *publicIP, int bufLen) {
+    SOCKET sock = INVALID_SOCKET;
+    struct sockaddr_in dnsServer;
+    BYTE queryBuf[512];
+    BYTE responseBuf[512];
+    int queryLen = 0;
+    int recvLen = 0;
+    DNS_HEADER *dnsHeader;
+    BYTE *ptr;
+    fd_set readfds;
+    struct timeval tv;
+    
+    /* DNS server: resolver1.opendns.com = 208.67.222.222 */
+    const char *DNS_SERVER_IP = "208.67.222.222";
+    const WORD DNS_PORT = 53;
+    
+    /* Query for: myip.opendns.com (returns your public IP) */
+    /* DNS question: 4myip7opendns3com0 (length-prefixed labels) */
+    static const BYTE dnsQuestion[] = {
+        4, 'm', 'y', 'i', 'p',           /* "myip" */
+        7, 'o', 'p', 'e', 'n', 'd', 'n', 's',  /* "opendns" */
+        3, 'c', 'o', 'm',                 /* "com" */
+        0,                                /* End of name */
+        0, 1,                             /* Type: A (IPv4) */
+        0, 1                              /* Class: IN (Internet) */
+    };
+    
+    if (!publicIP || bufLen < 16) return FALSE;
+    publicIP[0] = '\0';
+    
+    /* Create UDP socket */
+    sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == INVALID_SOCKET) {
+        return FALSE;
+    }
+    
+    /* Set timeout */
+    tv.tv_sec = 3;  /* 3 second timeout */
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+    
+    /* Setup DNS server address */
+    memset(&dnsServer, 0, sizeof(dnsServer));
+    dnsServer.sin_family = AF_INET;
+    dnsServer.sin_port = htons(DNS_PORT);
+    dnsServer.sin_addr.s_addr = inet_addr(DNS_SERVER_IP);
+    
+    /* Build DNS query packet */
+    memset(queryBuf, 0, sizeof(queryBuf));
+    dnsHeader = (DNS_HEADER*)queryBuf;
+    dnsHeader->id = htons(0x1234);      /* Transaction ID */
+    dnsHeader->flags = htons(0x0100);   /* Standard query, recursion desired */
+    dnsHeader->qdcount = htons(1);      /* 1 question */
+    dnsHeader->ancount = 0;
+    dnsHeader->nscount = 0;
+    dnsHeader->arcount = 0;
+    
+    /* Copy question after header */
+    queryLen = sizeof(DNS_HEADER);
+    memcpy(queryBuf + queryLen, dnsQuestion, sizeof(dnsQuestion));
+    queryLen += sizeof(dnsQuestion);
+    
+    /* Send DNS query */
+    if (sendto(sock, (const char*)queryBuf, queryLen, 0,
+               (struct sockaddr*)&dnsServer, sizeof(dnsServer)) == SOCKET_ERROR) {
+        closesocket(sock);
+        return FALSE;
+    }
+    
+    /* Wait for response with select */
+    FD_ZERO(&readfds);
+    FD_SET(sock, &readfds);
+    tv.tv_sec = 5;
+    tv.tv_usec = 0;
+    
+    if (select(0, &readfds, NULL, NULL, &tv) <= 0) {
+        closesocket(sock);
+        return FALSE;
+    }
+    
+    /* Receive response */
+    recvLen = recv(sock, (char*)responseBuf, sizeof(responseBuf), 0);
+    closesocket(sock);
+    
+    if (recvLen <= (int)(sizeof(DNS_HEADER) + sizeof(dnsQuestion))) {
+        return FALSE;
+    }
+    
+    /* Parse response */
+    dnsHeader = (DNS_HEADER*)responseBuf;
+    
+    /* Check for successful response */
+    if ((ntohs(dnsHeader->flags) & 0x8000) == 0) {
+        return FALSE;  /* Not a response */
+    }
+    if ((ntohs(dnsHeader->flags) & 0x000F) != 0) {
+        return FALSE;  /* Error in response */
+    }
+    if (ntohs(dnsHeader->ancount) == 0) {
+        return FALSE;  /* No answers */
+    }
+    
+    /* Skip header and question section to find answer */
+    ptr = responseBuf + sizeof(DNS_HEADER);
+    
+    /* Skip question (same as query) */
+    while (*ptr != 0 && ptr < responseBuf + recvLen) {
+        ptr += (*ptr) + 1;  /* Skip label */
+    }
+    ptr += 1 + 4;  /* Skip null terminator, type and class */
+    
+    /* Now at answer section */
+    /* Answer format: name(2 bytes compressed), type(2), class(2), ttl(4), rdlength(2), rdata(4 for A record) */
+    
+    /* Skip name (could be compressed pointer 0xC0XX or labels) */
+    if ((*ptr & 0xC0) == 0xC0) {
+        ptr += 2;  /* Compressed pointer */
+    } else {
+        while (*ptr != 0 && ptr < responseBuf + recvLen) {
+            ptr += (*ptr) + 1;
+        }
+        ptr++;
+    }
+    
+    /* Check we have enough data for answer record */
+    if (ptr + 10 > responseBuf + recvLen) {
+        return FALSE;
+    }
+    
+    /* Check type is A (0x0001) */
+    if (ptr[0] != 0 || ptr[1] != 1) {
+        return FALSE;  /* Not type A */
+    }
+    ptr += 2;  /* Skip type */
+    ptr += 2;  /* Skip class */
+    ptr += 4;  /* Skip TTL */
+    
+    /* Get rdlength */
+    USHORT rdlength = (ptr[0] << 8) | ptr[1];
+    ptr += 2;
+    
+    if (rdlength != 4 || ptr + 4 > responseBuf + recvLen) {
+        return FALSE;  /* Invalid A record */
+    }
+    
+    /* Extract IP address */
+    _snprintf(publicIP, bufLen, "%d.%d.%d.%d", ptr[0], ptr[1], ptr[2], ptr[3]);
+    
+    return TRUE;
+}
+
+/* ========================================================================== 
  * STATUS BAR
  * ========================================================================== */
 
@@ -213,19 +385,36 @@ static void StartRelayServer(HWND hwnd) {
     }
     
     /* Generate Server ID from IP:Port */
+    /* IMPORTANT: For VPS/Cloud servers, we need the PUBLIC IP, not the private IP!
+     * Use OpenDNS lookup to get the real public IP address */
     if (strcmp(ip, "0.0.0.0") == 0) {
-        char hostname[256];
-        struct hostent *he;
-        if (gethostname(hostname, sizeof(hostname)) == 0) {
-            he = gethostbyname(hostname);
-            if (he && he->h_addr_list[0]) {
-                struct in_addr addr;
-                memcpy(&addr, he->h_addr_list[0], sizeof(addr));
-                strncpy(ip, inet_ntoa(addr), sizeof(ip)-1);
+        char publicIP[64] = {0};
+        
+        AppendConsoleLog("Detecting public IP via OpenDNS...\r\n");
+        
+        /* Try to get public IP using OpenDNS DNS lookup */
+        if (GetPublicIPviaOpenDNS(publicIP, sizeof(publicIP)) && publicIP[0] != '\0') {
+            char logbuf[128];
+            strncpy(ip, publicIP, sizeof(ip)-1);
+            _snprintf(logbuf, sizeof(logbuf), "Public IP detected: %s\r\n", ip);
+            AppendConsoleLog(logbuf);
+        } else {
+            /* Fallback to local hostname resolution (may give private IP on VPS) */
+            char hostname[256];
+            struct hostent *he;
+            AppendConsoleLog("OpenDNS lookup failed, using local IP...\r\n");
+            if (gethostname(hostname, sizeof(hostname)) == 0) {
+                he = gethostbyname(hostname);
+                if (he && he->h_addr_list[0]) {
+                    struct in_addr addr;
+                    memcpy(&addr, he->h_addr_list[0], sizeof(addr));
+                    strncpy(ip, inet_ntoa(addr), sizeof(ip)-1);
+                    AppendConsoleLog("WARNING: Using local IP - may not work on VPS!\r\n");
+                }
             }
-        }
-        if (strcmp(ip, "0.0.0.0") == 0) {
-            strcpy(ip, "127.0.0.1");
+            if (strcmp(ip, "0.0.0.0") == 0) {
+                strcpy(ip, "127.0.0.1");
+            }
         }
     }
     

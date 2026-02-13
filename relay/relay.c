@@ -726,8 +726,8 @@ static DWORD WINAPI AcceptThread(LPVOID lpParam)
             continue;
         }
         
-        RelayLog("[INFO] New connection from %s:%d\r\n", 
-                inet_ntoa(clientAddr.sin_addr), ntohs(clientAddr.sin_port));
+        /* Privacy: Don't log client IP addresses */
+        RelayLog("[INFO] New client connection accepted\r\n");
         
         /* Create connection context */
         pConn = AddConnection(pServer, clientSocket);
