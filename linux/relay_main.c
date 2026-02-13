@@ -1,0 +1,441 @@
+/*
+ * relay_main.c - RemoteDesk2K Linux Relay Server CLI
+ * 
+ * Professional terminal interface with:
+ * - Signal handling (SIGINT, SIGTERM)
+ * - Runtime statistics display
+ * - Color-coded log output
+ * - Daemon mode support
+ */
+
+#include "common.h"
+#include "crypto.h"
+#include "relay.h"
+
+/* ============================================================
+ * GLOBAL STATE
+ * ============================================================ */
+
+static RELAY_SERVER *g_pServer = NULL;
+static volatile int g_bRunning = 1;
+static int g_bDaemon = 0;
+static int g_bColor = 1;
+static FILE *g_logFile = NULL;
+static pthread_mutex_t g_printMutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* ANSI color codes */
+#define COLOR_RESET     "\033[0m"
+#define COLOR_RED       "\033[31m"
+#define COLOR_GREEN     "\033[32m"
+#define COLOR_YELLOW    "\033[33m"
+#define COLOR_BLUE      "\033[34m"
+#define COLOR_MAGENTA   "\033[35m"
+#define COLOR_CYAN      "\033[36m"
+#define COLOR_BOLD      "\033[1m"
+#define COLOR_DIM       "\033[2m"
+
+/* ============================================================
+ * LOGGING
+ * ============================================================ */
+
+static void GetTimestamp(char *buffer, size_t len)
+{
+    time_t now;
+    struct tm *tm_info;
+    
+    time(&now);
+    tm_info = localtime(&now);
+    strftime(buffer, len, "%Y-%m-%d %H:%M:%S", tm_info);
+}
+
+static void LogCallback(const char *message)
+{
+    char timestamp[32];
+    const char *color = COLOR_RESET;
+    const char *prefix = "";
+    
+    GetTimestamp(timestamp, sizeof(timestamp));
+    
+    /* Determine color based on message type */
+    if (strstr(message, "[ERROR]")) {
+        color = COLOR_RED;
+        prefix = "ERROR";
+    } else if (strstr(message, "[WARN]")) {
+        color = COLOR_YELLOW;
+        prefix = "WARN ";
+    } else if (strstr(message, "[INFO]")) {
+        color = COLOR_GREEN;
+        prefix = "INFO ";
+    } else if (strstr(message, "[REGISTER]")) {
+        color = COLOR_CYAN;
+        prefix = "REGIS";
+    } else if (strstr(message, "[CONNECT]")) {
+        color = COLOR_MAGENTA;
+        prefix = "CONN ";
+    } else if (strstr(message, "[DISCONNECT]")) {
+        color = COLOR_BLUE;
+        prefix = "DISC ";
+    } else if (strstr(message, "[CLEANUP]")) {
+        color = COLOR_DIM;
+        prefix = "CLEAN";
+    } else if (strstr(message, "[PROTECT]")) {
+        color = COLOR_YELLOW;
+        prefix = "PROT ";
+    } else if (strstr(message, "[REJECT]")) {
+        color = COLOR_RED;
+        prefix = "REJCT";
+    } else {
+        prefix = "     ";
+    }
+    
+    pthread_mutex_lock(&g_printMutex);
+    
+    if (g_logFile) {
+        /* Plain text for log file */
+        fprintf(g_logFile, "[%s] %s\n", timestamp, message);
+        fflush(g_logFile);
+    }
+    
+    if (!g_bDaemon) {
+        if (g_bColor) {
+            fprintf(stdout, "%s[%s]%s %s%s%s", 
+                    COLOR_DIM, timestamp, COLOR_RESET,
+                    color, message, COLOR_RESET);
+        } else {
+            fprintf(stdout, "[%s] %s", timestamp, message);
+        }
+        
+        /* Add newline if message doesn't have one */
+        if (message[strlen(message)-1] != '\n')
+            fprintf(stdout, "\n");
+        
+        fflush(stdout);
+    }
+    
+    pthread_mutex_unlock(&g_printMutex);
+}
+
+/* ============================================================
+ * SIGNAL HANDLING
+ * ============================================================ */
+
+static void SignalHandler(int sig)
+{
+    pthread_mutex_lock(&g_printMutex);
+    
+    if (g_bColor && !g_bDaemon) {
+        fprintf(stdout, "\n%s%s>>> Received signal %d (%s), shutting down...%s\n",
+                COLOR_BOLD, COLOR_YELLOW, sig,
+                sig == SIGINT ? "SIGINT" : sig == SIGTERM ? "SIGTERM" : "UNKNOWN",
+                COLOR_RESET);
+    } else if (!g_bDaemon) {
+        fprintf(stdout, "\n>>> Received signal %d, shutting down...\n", sig);
+    }
+    
+    pthread_mutex_unlock(&g_printMutex);
+    
+    g_bRunning = 0;
+}
+
+static void SetupSignalHandlers(void)
+{
+    struct sigaction sa;
+    
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SignalHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    
+    /* Ignore SIGPIPE (broken pipe) - handle in send() instead */
+    signal(SIGPIPE, SIG_IGN);
+}
+
+/* ============================================================
+ * BANNER & HELP
+ * ============================================================ */
+
+static void PrintBanner(void)
+{
+    if (g_bDaemon) return;
+    
+    pthread_mutex_lock(&g_printMutex);
+    
+    if (g_bColor) {
+        fprintf(stdout, "\n");
+        fprintf(stdout, "%s%s╔══════════════════════════════════════════════════════════╗%s\n", COLOR_BOLD, COLOR_CYAN, COLOR_RESET);
+        fprintf(stdout, "%s%s║%s%s        RemoteDesk2K - Linux Relay Server v1.0.0         %s%s║%s\n", COLOR_BOLD, COLOR_CYAN, COLOR_RESET, COLOR_BOLD, COLOR_BOLD, COLOR_CYAN, COLOR_RESET);
+        fprintf(stdout, "%s%s║%s     Compatible with Windows 2000 RemoteDesk2K Clients    %s║%s\n", COLOR_BOLD, COLOR_CYAN, COLOR_RESET, COLOR_CYAN, COLOR_RESET);
+        fprintf(stdout, "%s%s╚══════════════════════════════════════════════════════════╝%s\n", COLOR_BOLD, COLOR_CYAN, COLOR_RESET);
+        fprintf(stdout, "\n");
+    } else {
+        fprintf(stdout, "\n");
+        fprintf(stdout, "============================================================\n");
+        fprintf(stdout, "        RemoteDesk2K - Linux Relay Server v1.0.0\n");
+        fprintf(stdout, "     Compatible with Windows 2000 RemoteDesk2K Clients\n");
+        fprintf(stdout, "============================================================\n");
+        fprintf(stdout, "\n");
+    }
+    
+    pthread_mutex_unlock(&g_printMutex);
+}
+
+static void PrintHelp(const char *progname)
+{
+    fprintf(stdout, "Usage: %s [OPTIONS]\n\n", progname);
+    fprintf(stdout, "Options:\n");
+    fprintf(stdout, "  -p, --port PORT      Listen port (default: 5000)\n");
+    fprintf(stdout, "  -b, --bind IP        Bind to specific IP (default: 0.0.0.0)\n");
+    fprintf(stdout, "  -d, --daemon         Run as daemon (background)\n");
+    fprintf(stdout, "  -l, --log FILE       Log output to file\n");
+    fprintf(stdout, "  -n, --no-color       Disable colored output\n");
+    fprintf(stdout, "  -h, --help           Show this help message\n");
+    fprintf(stdout, "  -v, --version        Show version information\n");
+    fprintf(stdout, "\n");
+    fprintf(stdout, "Examples:\n");
+    fprintf(stdout, "  %s                   # Listen on 0.0.0.0:5000\n", progname);
+    fprintf(stdout, "  %s -p 5900           # Listen on port 5900\n", progname);
+    fprintf(stdout, "  %s -d -l relay.log   # Run as daemon with logging\n", progname);
+    fprintf(stdout, "\n");
+    fprintf(stdout, "Signals:\n");
+    fprintf(stdout, "  SIGINT (Ctrl+C)      Graceful shutdown\n");
+    fprintf(stdout, "  SIGTERM              Graceful shutdown\n");
+    fprintf(stdout, "\n");
+}
+
+static void PrintVersion(void)
+{
+    fprintf(stdout, "RemoteDesk2K Linux Relay Server v1.0.0\n");
+    fprintf(stdout, "Compatible with Windows RemoteDesk2K clients\n");
+    fprintf(stdout, "Built: %s %s\n", __DATE__, __TIME__);
+}
+
+/* ============================================================
+ * DAEMON MODE
+ * ============================================================ */
+
+static int Daemonize(void)
+{
+    pid_t pid;
+    
+    /* Fork off parent */
+    pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return -1;
+    }
+    if (pid > 0) {
+        /* Parent exits */
+        printf("Daemon started with PID %d\n", pid);
+        exit(0);
+    }
+    
+    /* Child becomes session leader */
+    if (setsid() < 0) {
+        perror("setsid");
+        return -1;
+    }
+    
+    /* Fork again to prevent acquiring terminal */
+    pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return -1;
+    }
+    if (pid > 0) {
+        exit(0);
+    }
+    
+    /* Change working directory */
+    if (chdir("/") < 0) {
+        perror("chdir");
+    }
+    
+    /* Close standard file descriptors */
+    close(STDIN_FILENO);
+    close(STDOUT_FILENO);
+    close(STDERR_FILENO);
+    
+    /* Redirect to /dev/null */
+    open("/dev/null", O_RDONLY);  /* stdin */
+    open("/dev/null", O_WRONLY); /* stdout */
+    open("/dev/null", O_WRONLY); /* stderr */
+    
+    return 0;
+}
+
+/* ============================================================
+ * STATUS DISPLAY
+ * ============================================================ */
+
+static void PrintStatus(WORD port, const char *bindIp)
+{
+    char serverId[SERVER_ID_MAX_LEN];
+    char publicIp[64] = "0.0.0.0";
+    
+    pthread_mutex_lock(&g_printMutex);
+    
+    if (g_bColor) {
+        fprintf(stdout, "%s┌─────────────────────────────────────────────────┐%s\n", COLOR_CYAN, COLOR_RESET);
+        fprintf(stdout, "%s│%s  Server Status                                  %s│%s\n", COLOR_CYAN, COLOR_BOLD, COLOR_CYAN, COLOR_RESET);
+        fprintf(stdout, "%s├─────────────────────────────────────────────────┤%s\n", COLOR_CYAN, COLOR_RESET);
+        fprintf(stdout, "%s│%s  Listen IP:   %s%-33s%s│%s\n", COLOR_CYAN, COLOR_RESET, COLOR_GREEN, bindIp, COLOR_CYAN, COLOR_RESET);
+        fprintf(stdout, "%s│%s  Port:        %s%-33d%s│%s\n", COLOR_CYAN, COLOR_RESET, COLOR_GREEN, port, COLOR_CYAN, COLOR_RESET);
+        fprintf(stdout, "%s│%s  Status:      %s%-33s%s│%s\n", COLOR_CYAN, COLOR_RESET, COLOR_GREEN, "RUNNING", COLOR_CYAN, COLOR_RESET);
+        fprintf(stdout, "%s└─────────────────────────────────────────────────┘%s\n", COLOR_CYAN, COLOR_RESET);
+    } else {
+        fprintf(stdout, "Server Status:\n");
+        fprintf(stdout, "  Listen IP: %s\n", bindIp);
+        fprintf(stdout, "  Port:      %d\n", port);
+        fprintf(stdout, "  Status:    RUNNING\n");
+    }
+    
+    /* Generate Server ID for reference */
+    if (strcmp(bindIp, "0.0.0.0") != 0) {
+        if (Crypto_EncodeServerID(bindIp, port, serverId) == CRYPTO_SUCCESS) {
+            if (g_bColor) {
+                fprintf(stdout, "\n%s  Server ID: %s%s%s\n", COLOR_DIM, COLOR_BOLD, serverId, COLOR_RESET);
+            } else {
+                fprintf(stdout, "\n  Server ID: %s\n", serverId);
+            }
+        }
+    } else {
+        if (g_bColor) {
+            fprintf(stdout, "\n%s  Note: Bind to specific IP or use public IP for Server ID%s\n", COLOR_DIM, COLOR_RESET);
+        } else {
+            fprintf(stdout, "\n  Note: Bind to specific IP or use public IP for Server ID\n");
+        }
+    }
+    
+    fprintf(stdout, "\n");
+    
+    if (g_bColor) {
+        fprintf(stdout, "%sPress Ctrl+C to stop the server%s\n\n", COLOR_DIM, COLOR_RESET);
+    } else {
+        fprintf(stdout, "Press Ctrl+C to stop the server\n\n");
+    }
+    
+    pthread_mutex_unlock(&g_printMutex);
+}
+
+/* ============================================================
+ * MAIN
+ * ============================================================ */
+
+int main(int argc, char *argv[])
+{
+    WORD port = RELAY_DEFAULT_PORT;
+    char bindIp[64] = "0.0.0.0";
+    const char *logFile = NULL;
+    int i;
+    
+    /* Parse command line arguments */
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--port") == 0) {
+            if (i + 1 < argc) {
+                port = (WORD)atoi(argv[++i]);
+                if (port == 0) port = RELAY_DEFAULT_PORT;
+            }
+        } else if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--bind") == 0) {
+            if (i + 1 < argc) {
+                strncpy(bindIp, argv[++i], sizeof(bindIp) - 1);
+            }
+        } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--daemon") == 0) {
+            g_bDaemon = 1;
+        } else if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--log") == 0) {
+            if (i + 1 < argc) {
+                logFile = argv[++i];
+            }
+        } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-color") == 0) {
+            g_bColor = 0;
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            PrintHelp(argv[0]);
+            return 0;
+        } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
+            PrintVersion();
+            return 0;
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            PrintHelp(argv[0]);
+            return 1;
+        }
+    }
+    
+    /* Open log file if specified */
+    if (logFile) {
+        g_logFile = fopen(logFile, "a");
+        if (!g_logFile) {
+            perror("Failed to open log file");
+            return 1;
+        }
+    }
+    
+    /* Daemonize if requested */
+    if (g_bDaemon) {
+        if (Daemonize() < 0) {
+            fprintf(stderr, "Failed to daemonize\n");
+            return 1;
+        }
+    }
+    
+    /* Setup signal handlers */
+    SetupSignalHandlers();
+    
+    /* Print banner */
+    PrintBanner();
+    
+    /* Initialize crypto */
+    Crypto_Init(NULL);
+    
+    /* Set log callback */
+    Relay_SetLogCallback(LogCallback);
+    
+    /* Create relay server */
+    g_pServer = Relay_Create(port, bindIp);
+    if (!g_pServer) {
+        LogCallback("[ERROR] Failed to create relay server - check port/IP\n");
+        if (g_logFile) fclose(g_logFile);
+        return 1;
+    }
+    
+    /* Start server */
+    if (Relay_Start(g_pServer) != RD2K_SUCCESS) {
+        LogCallback("[ERROR] Failed to start relay server\n");
+        Relay_Destroy(g_pServer);
+        if (g_logFile) fclose(g_logFile);
+        return 1;
+    }
+    
+    /* Print status */
+    PrintStatus(port, bindIp);
+    
+    LogCallback("[INFO] Relay server started successfully\n");
+    
+    /* Main loop - wait for shutdown signal */
+    while (g_bRunning) {
+        usleep(100000);  /* 100ms */
+    }
+    
+    /* Shutdown */
+    LogCallback("[INFO] Shutting down relay server...\n");
+    
+    Relay_Destroy(g_pServer);
+    g_pServer = NULL;
+    
+    Crypto_Cleanup();
+    
+    LogCallback("[INFO] Relay server stopped\n");
+    
+    if (g_logFile) {
+        fclose(g_logFile);
+        g_logFile = NULL;
+    }
+    
+    if (!g_bDaemon && g_bColor) {
+        fprintf(stdout, "%s%sGoodbye!%s\n", COLOR_BOLD, COLOR_GREEN, COLOR_RESET);
+    }
+    
+    return 0;
+}
