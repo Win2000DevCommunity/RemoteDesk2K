@@ -156,18 +156,36 @@ static PRELAY_CONNECTION FindConnectionById(PRELAY_SERVER pServer, DWORD clientI
     return NULL;
 }
 
-/* Remove stale connections with same clientId (for reconnection handling) */
-static void RemoveStaleConnections(PRELAY_SERVER pServer, DWORD clientId, PRELAY_CONNECTION pExclude)
+/* Remove stale connections with same clientId (for reconnection handling) 
+ * IMPORTANT: Never remove PAIRED connections - they are active sessions!
+ * Returns TRUE if ID is available for registration, FALSE if already paired */
+static BOOL RemoveStaleConnections(PRELAY_SERVER pServer, DWORD clientId, PRELAY_CONNECTION pExclude)
 {
     DWORD i;
+    BOOL bIdAvailable = TRUE;
     
-    if (!pServer) return;
+    if (!pServer) return FALSE;
     
     EnterCriticalSection(&pServer->csConnections);
     
     for (i = 0; i < pServer->maxConnections; i++) {
         PRELAY_CONNECTION pConn = pServer->connections[i];
         if (pConn && pConn != pExclude && pConn->clientId == clientId) {
+            
+            /* CRITICAL: Never touch PAIRED connections - they are active sessions! */
+            if (pConn->state == RELAY_STATE_PAIRED) {
+                char idStr[20];
+                FormatClientId(clientId, idStr);
+                RelayLog("[PROTECT] ID %s is already in active session (PAIRED) - blocking duplicate\r\n", idStr);
+                bIdAvailable = FALSE;  /* ID is in use, reject new registration */
+                continue;  /* Don't remove this connection */
+            }
+            
+            /* Only remove truly stale connections:
+             * - DISCONNECTED (state=4): already dead
+             * - CONNECTED (state=0): never completed registration, zombie
+             * - REGISTERED (state=1): waiting but not paired, can be replaced */
+            
             /* Found stale connection with same ID - mark for cleanup */
             char idStr[20];
             FormatClientId(clientId, idStr);
@@ -196,6 +214,7 @@ static void RemoveStaleConnections(PRELAY_SERVER pServer, DWORD clientId, PRELAY
     }
     
     LeaveCriticalSection(&pServer->csConnections);
+    return bIdAvailable;
 }
 
 /* Configure client socket for optimal relay performance */
@@ -332,22 +351,30 @@ static int ProcessRelayMessage(PRELAY_SERVER pServer, PRELAY_CONNECTION pConn,
         case RELAY_MSG_REGISTER: {
             RELAY_REGISTER_MSG reg;
             char idStr[20];
+            BOOL bIdAvailable;
+            
             if (length < sizeof(RELAY_HEADER) + sizeof(RELAY_REGISTER_MSG)) {
                 return -1;
             }
             CopyMemory(&reg, buffer + sizeof(RELAY_HEADER), sizeof(RELAY_REGISTER_MSG));
             
-            /* IMPORTANT: Remove any stale connections with this clientId first.
-             * This handles the case where a client disconnected and reconnected,
-             * leaving old connection entries in the array. */
-            RemoveStaleConnections(pServer, reg.clientId, pConn);
+            /* Check for stale connections and verify ID is available.
+             * If ID is already in an active PAIRED session, reject this registration. */
+            bIdAvailable = RemoveStaleConnections(pServer, reg.clientId, pConn);
+            
+            FormatClientId(reg.clientId, idStr);
+            
+            if (!bIdAvailable) {
+                /* ID is already in use by an active paired session - disconnect this client */
+                RelayLog("[REJECT] Registration rejected for ID %s - already in active session\r\n", idStr);
+                return -1;  /* Signal error to disconnect this duplicate client */
+            }
             
             pConn->clientId = reg.clientId;
             pConn->state = RELAY_STATE_REGISTERED;
             pConn->lastActivity = GetTickCount();
             
             /* Log client registration with friendly ID */
-            FormatClientId(reg.clientId, idStr);
             RelayLog("[REGISTER] Client ID: %s registered\r\n", idStr);
             return 0;
         }
