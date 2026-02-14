@@ -42,6 +42,38 @@ sudo make install
 sudo make uninstall
 ```
 
+## Quick Start (WSL/Windows)
+
+### 1. Build the relay server
+
+```bash
+cd /mnt/c/Users/win2000/Downloads/WinDDK-1ed3987db6e72d1fb9c6298fddf0c080b8f591e1/RemoteDesk2K/linux
+make clean && make
+```
+
+### 2. Set up Windows port forwarding (run in PowerShell as Administrator)
+
+```powershell
+$wslIP = (wsl hostname -I).Trim().Split()[0]
+netsh interface portproxy add v4tov4 listenport=8080 listenaddress=0.0.0.0 connectport=8080 connectaddress=$wslIP
+```
+
+### 3. Run the relay server in WSL
+
+```bash
+wsl bash -c "sudo killall -9 relay_server 2>/dev/null; cd /mnt/c/Users/win2000/Downloads/WinDDK-1ed3987db6e72d1fb9c6298fddf0c080b8f591e1/RemoteDesk2K/linux && sudo ./relay_server -p 8080"
+```
+
+- The relay will print a SERVER ID (e.g. `JMZF-DANL-FKN3-U`).
+- Give this Server ID to your customers/clients.
+- Make sure your router/firewall allows incoming connections to port 8080.
+
+### 4. For local-only testing (optional)
+
+```bash
+sudo ./relay_server -p 8080 -i 127.0.0.1
+```
+
 ## Usage
 
 ```
