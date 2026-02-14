@@ -22,6 +22,7 @@ static int g_bDaemon = 0;
 static int g_bColor = 1;
 static FILE *g_logFile = NULL;
 static pthread_mutex_t g_printMutex = PTHREAD_MUTEX_INITIALIZER;
+static char g_customIp[64] = "";  /* Custom IP for Server ID (for local testing) */
 
 /* ANSI color codes */
 #define COLOR_RESET     "\033[0m"
@@ -176,6 +177,7 @@ static void PrintHelp(const char *progname)
     fprintf(stdout, "Options:\n");
     fprintf(stdout, "  -p, --port PORT      Listen port (default: 5000)\n");
     fprintf(stdout, "  -b, --bind IP        Bind to specific IP (default: 0.0.0.0)\n");
+    fprintf(stdout, "  -i, --server-ip IP   Override IP in Server ID (for local testing)\n");
     fprintf(stdout, "  -d, --daemon         Run as daemon (background)\n");
     fprintf(stdout, "  -l, --log FILE       Log output to file\n");
     fprintf(stdout, "  -n, --no-color       Disable colored output\n");
@@ -185,6 +187,7 @@ static void PrintHelp(const char *progname)
     fprintf(stdout, "Examples:\n");
     fprintf(stdout, "  %s                   # Listen on 0.0.0.0:5000\n", progname);
     fprintf(stdout, "  %s -p 5900           # Listen on port 5900\n", progname);
+    fprintf(stdout, "  %s -p 80 -i 127.0.0.1  # Local testing (Server ID uses 127.0.0.1)\n", progname);
     fprintf(stdout, "  %s -d -l relay.log   # Run as daemon with logging\n", progname);
     fprintf(stdout, "\n");
     fprintf(stdout, "Signals:\n");
@@ -436,8 +439,17 @@ static void PrintStatus(WORD port, const char *bindIp)
         fprintf(stdout, "  Status:    RUNNING\n");
     }
     
-    /* Detect public IP via OpenDNS if bound to 0.0.0.0 */
-    if (strcmp(bindIp, "0.0.0.0") == 0) {
+    /* Check for custom IP override first (for local testing) */
+    if (g_customIp[0] != '\0') {
+        snprintf(displayIp, sizeof(displayIp), "%s", g_customIp);
+        if (g_bColor) {
+            fprintf(stdout, "\n%sUsing custom IP for Server ID: %s%s%s\n", COLOR_DIM, COLOR_YELLOW, g_customIp, COLOR_RESET);
+        } else {
+            fprintf(stdout, "\nUsing custom IP for Server ID: %s\n", g_customIp);
+        }
+    }
+    /* Detect public IP via OpenDNS if bound to 0.0.0.0 and no custom IP */
+    else if (strcmp(bindIp, "0.0.0.0") == 0) {
         if (g_bColor) {
             fprintf(stdout, "\n%sDetecting public IP via OpenDNS...%s\n", COLOR_DIM, COLOR_RESET);
         } else {
@@ -519,6 +531,10 @@ int main(int argc, char *argv[])
             }
         } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-color") == 0) {
             g_bColor = 0;
+        } else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--server-ip") == 0) {
+            if (i + 1 < argc) {
+                strncpy(g_customIp, argv[++i], sizeof(g_customIp) - 1);
+            }
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             PrintHelp(argv[0]);
             return 0;
