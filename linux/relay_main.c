@@ -255,12 +255,169 @@ static int Daemonize(void)
 }
 
 /* ============================================================
+ * PUBLIC IP DETECTION VIA OPENDNS
+ * ============================================================ */
+
+/* DNS header structure */
+#pragma pack(push, 1)
+typedef struct {
+    uint16_t id;
+    uint16_t flags;
+    uint16_t qdcount;
+    uint16_t ancount;
+    uint16_t nscount;
+    uint16_t arcount;
+} DNS_HEADER_T;
+#pragma pack(pop)
+
+/* Get public IP address using OpenDNS lookup (myip.opendns.com)
+ * Same method as Windows relay server
+ * Returns 1 on success, 0 on failure */
+static int GetPublicIPviaOpenDNS(char *publicIP, int bufLen)
+{
+    int sock = -1;
+    struct sockaddr_in dnsServer;
+    uint8_t queryBuf[512];
+    uint8_t responseBuf[512];
+    int queryLen = 0;
+    ssize_t recvLen = 0;
+    DNS_HEADER_T *dnsHeader;
+    uint8_t *ptr;
+    fd_set readfds;
+    struct timeval tv;
+    
+    /* DNS server: resolver1.opendns.com = 208.67.222.222 */
+    const char *DNS_SERVER_IP = "208.67.222.222";
+    const uint16_t DNS_PORT = 53;
+    
+    /* Query for: myip.opendns.com (returns your public IP) */
+    static const uint8_t dnsQuestion[] = {
+        4, 'm', 'y', 'i', 'p',                /* "myip" */
+        7, 'o', 'p', 'e', 'n', 'd', 'n', 's', /* "opendns" */
+        3, 'c', 'o', 'm',                     /* "com" */
+        0,                                    /* End of name */
+        0, 1,                                 /* Type: A (IPv4) */
+        0, 1                                  /* Class: IN (Internet) */
+    };
+    
+    if (!publicIP || bufLen < 16) return 0;
+    publicIP[0] = '\0';
+    
+    /* Create UDP socket */
+    sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        return 0;
+    }
+    
+    /* Set timeout */
+    tv.tv_sec = 3;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
+    /* Setup DNS server address */
+    memset(&dnsServer, 0, sizeof(dnsServer));
+    dnsServer.sin_family = AF_INET;
+    dnsServer.sin_port = htons(DNS_PORT);
+    inet_pton(AF_INET, DNS_SERVER_IP, &dnsServer.sin_addr);
+    
+    /* Build DNS query packet */
+    memset(queryBuf, 0, sizeof(queryBuf));
+    dnsHeader = (DNS_HEADER_T*)queryBuf;
+    dnsHeader->id = htons(0x1234);
+    dnsHeader->flags = htons(0x0100);  /* Standard query, recursion desired */
+    dnsHeader->qdcount = htons(1);
+    dnsHeader->ancount = 0;
+    dnsHeader->nscount = 0;
+    dnsHeader->arcount = 0;
+    
+    /* Copy question after header */
+    queryLen = sizeof(DNS_HEADER_T);
+    memcpy(queryBuf + queryLen, dnsQuestion, sizeof(dnsQuestion));
+    queryLen += sizeof(dnsQuestion);
+    
+    /* Send DNS query */
+    if (sendto(sock, queryBuf, queryLen, 0,
+               (struct sockaddr*)&dnsServer, sizeof(dnsServer)) < 0) {
+        close(sock);
+        return 0;
+    }
+    
+    /* Wait for response */
+    FD_ZERO(&readfds);
+    FD_SET(sock, &readfds);
+    tv.tv_sec = 5;
+    tv.tv_usec = 0;
+    
+    if (select(sock + 1, &readfds, NULL, NULL, &tv) <= 0) {
+        close(sock);
+        return 0;
+    }
+    
+    /* Receive response */
+    recvLen = recv(sock, responseBuf, sizeof(responseBuf), 0);
+    close(sock);
+    
+    if (recvLen <= (ssize_t)(sizeof(DNS_HEADER_T) + sizeof(dnsQuestion))) {
+        return 0;
+    }
+    
+    /* Parse response */
+    dnsHeader = (DNS_HEADER_T*)responseBuf;
+    
+    /* Check for valid response */
+    if ((ntohs(dnsHeader->flags) & 0x8000) == 0) return 0;
+    if ((ntohs(dnsHeader->flags) & 0x000F) != 0) return 0;
+    if (ntohs(dnsHeader->ancount) == 0) return 0;
+    
+    /* Skip header and question to find answer */
+    ptr = responseBuf + sizeof(DNS_HEADER_T);
+    
+    /* Skip question */
+    while (*ptr != 0 && ptr < responseBuf + recvLen) {
+        ptr += (*ptr) + 1;
+    }
+    ptr += 1 + 4;  /* null + type + class */
+    
+    /* Skip answer name (compressed pointer or labels) */
+    if ((*ptr & 0xC0) == 0xC0) {
+        ptr += 2;
+    } else {
+        while (*ptr != 0 && ptr < responseBuf + recvLen) {
+            ptr += (*ptr) + 1;
+        }
+        ptr++;
+    }
+    
+    /* Check we have enough data */
+    if (ptr + 10 > responseBuf + recvLen) return 0;
+    
+    /* Check type A */
+    if (ptr[0] != 0 || ptr[1] != 1) return 0;
+    ptr += 2 + 2 + 4;  /* type + class + ttl */
+    
+    /* Get rdlength */
+    uint16_t rdlength = (ptr[0] << 8) | ptr[1];
+    ptr += 2;
+    
+    if (rdlength != 4 || ptr + 4 > responseBuf + recvLen) return 0;
+    
+    /* Extract IP address */
+    snprintf(publicIP, bufLen, "%d.%d.%d.%d", ptr[0], ptr[1], ptr[2], ptr[3]);
+    
+    return 1;
+}
+
+/* ============================================================
  * STATUS DISPLAY
  * ============================================================ */
 
 static void PrintStatus(WORD port, const char *bindIp)
 {
     char serverId[SERVER_ID_MAX_LEN];
+    char publicIp[64] = {0};
+    char displayIp[64] = {0};
+    
+    snprintf(displayIp, sizeof(displayIp), "%s", bindIp);
     
     pthread_mutex_lock(&g_printMutex);
     
@@ -279,20 +436,45 @@ static void PrintStatus(WORD port, const char *bindIp)
         fprintf(stdout, "  Status:    RUNNING\n");
     }
     
-    /* Generate Server ID for reference */
-    if (strcmp(bindIp, "0.0.0.0") != 0) {
-        if (Crypto_EncodeServerID(bindIp, port, serverId) == CRYPTO_SUCCESS) {
+    /* Detect public IP via OpenDNS if bound to 0.0.0.0 */
+    if (strcmp(bindIp, "0.0.0.0") == 0) {
+        if (g_bColor) {
+            fprintf(stdout, "\n%sDetecting public IP via OpenDNS...%s\n", COLOR_DIM, COLOR_RESET);
+        } else {
+            fprintf(stdout, "\nDetecting public IP via OpenDNS...\n");
+        }
+        
+        if (GetPublicIPviaOpenDNS(publicIp, sizeof(publicIp)) && publicIp[0] != '\0') {
+            snprintf(displayIp, sizeof(displayIp), "%s", publicIp);
             if (g_bColor) {
-                fprintf(stdout, "\n%s  Server ID: %s%s%s\n", COLOR_DIM, COLOR_BOLD, serverId, COLOR_RESET);
+                fprintf(stdout, "%sPublic IP detected: %s%s%s\n", COLOR_DIM, COLOR_GREEN, publicIp, COLOR_RESET);
             } else {
-                fprintf(stdout, "\n  Server ID: %s\n", serverId);
+                fprintf(stdout, "Public IP detected: %s\n", publicIp);
+            }
+        } else {
+            if (g_bColor) {
+                fprintf(stdout, "%s%sWARNING: Could not detect public IP%s\n", COLOR_YELLOW, COLOR_BOLD, COLOR_RESET);
+            } else {
+                fprintf(stdout, "WARNING: Could not detect public IP\n");
             }
         }
-    } else {
-        if (g_bColor) {
-            fprintf(stdout, "\n%s  Note: Bind to specific IP or use public IP for Server ID%s\n", COLOR_DIM, COLOR_RESET);
-        } else {
-            fprintf(stdout, "\n  Note: Bind to specific IP or use public IP for Server ID\n");
+    }
+    
+    /* Generate Server ID */
+    if (displayIp[0] != '\0' && strcmp(displayIp, "0.0.0.0") != 0) {
+        if (Crypto_EncodeServerID(displayIp, port, serverId) == CRYPTO_SUCCESS) {
+            fprintf(stdout, "\n");
+            if (g_bColor) {
+                fprintf(stdout, "%s╔══════════════════════════════════════════════════════════╗%s\n", COLOR_GREEN, COLOR_RESET);
+                fprintf(stdout, "%s║%s  SERVER ID: %s%-44s%s║%s\n", COLOR_GREEN, COLOR_RESET, COLOR_BOLD, serverId, COLOR_GREEN, COLOR_RESET);
+                fprintf(stdout, "%s╚══════════════════════════════════════════════════════════╝%s\n", COLOR_GREEN, COLOR_RESET);
+                fprintf(stdout, "\n%sGive this Server ID to your customers!%s\n", COLOR_DIM, COLOR_RESET);
+            } else {
+                fprintf(stdout, "============================================================\n");
+                fprintf(stdout, "  SERVER ID: %s\n", serverId);
+                fprintf(stdout, "============================================================\n");
+                fprintf(stdout, "\nGive this Server ID to your customers!\n");
+            }
         }
     }
     
