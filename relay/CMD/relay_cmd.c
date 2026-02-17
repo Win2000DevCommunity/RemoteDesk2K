@@ -390,14 +390,8 @@ static BOOL WINAPI ConsoleCtrlHandler(DWORD dwCtrlType)
         case CTRL_CLOSE_EVENT:
         case CTRL_LOGOFF_EVENT:
         case CTRL_SHUTDOWN_EVENT:
-            printf("\n");
-            LogMessage("[SHUTDOWN]", CON_YELLOW, "Received shutdown signal...");
+            /* Just signal shutdown - let main() handle cleanup to avoid race conditions */
             g_bRunning = FALSE;
-            
-            /* Stop the relay server */
-            if (g_pServer) {
-                Relay_Stop(g_pServer);
-            }
             return TRUE;
     }
     return FALSE;
@@ -583,9 +577,13 @@ int main(int argc, char *argv[])
         Sleep(100);
     }
     
-    /* Shutdown */
+    /* Shutdown - disable log callback first to prevent race conditions */
     printf("\n");
+    LogMessage("[SHUTDOWN]", CON_YELLOW, "Received shutdown signal...");
     LogMessage("[INFO]", CON_WHITE, "Shutting down relay server...");
+    
+    /* Clear log callback before destroying server */
+    Relay_SetLogCallback(NULL);
     
     if (g_pServer) {
         Relay_Destroy(g_pServer);
@@ -593,10 +591,12 @@ int main(int argc, char *argv[])
     }
     
     WSACleanup();
-    DeleteCriticalSection(&g_csConsole);
     
+    /* Final message before deleting critical section */
     LogMessage("[OK]", CON_GREEN, "Server stopped gracefully");
     printf("\n");
+    
+    DeleteCriticalSection(&g_csConsole);
     
     return 0;
 }
