@@ -168,14 +168,14 @@ static int              g_nCurrentTab = 0;
 /* Right Panel Controls - Tab 2: Relay Connect */
 static HWND             g_hRelayPartnerId = NULL;   /* Partner ID for relay connection */
 static HWND             g_hRelayPartnerPwd = NULL;  /* Password for relay connection */
-static HWND             g_hServerId = NULL;          /* Encrypted Server ID (given by admin) */
+static HWND             g_hServerId = NULL;          /* Relay address field */
 static HWND             g_hRelayConnectSvrBtn = NULL;  /* Step 1: Connect to server */
 static HWND             g_hRelayConnectPartnerBtn = NULL; /* Step 2: Connect to partner */
 static BOOL             g_bConnectedToRelay = FALSE;  /* TRUE when registered with relay */
 
-/* Relay connection settings (decoded from Server ID) */
-static char             g_szRelayServerIp[64] = "";  /* IP decoded from Server ID */
-static WORD             g_wRelayServerPort = 5900;   /* Port decoded from Server ID */
+/* Relay connection settings (from domain:port, IP:port, or decoded Server ID) */
+static char             g_szRelayServerIp[128] = ""; /* Domain/IP for relay server */
+static WORD             g_wRelayServerPort = 5000;   /* Port for relay server */
 static SOCKET           g_relaySocket = INVALID_SOCKET;
 static CRITICAL_SECTION g_csRelay;
 
@@ -654,12 +654,12 @@ void CreateMainControls(HWND hwnd)
         /* Step 2: Then connect to partner by ID */
         y = contentY + 45;
         
-        /* Server ID (encrypted IP:Port - provided by server admin) */
-        CreateWindowExA(0, "STATIC", "Server ID",
+        /* Relay Address (domain:port, IP:port, or Server ID) */
+        CreateWindowExA(0, "STATIC", "Relay Addr",
                        WS_CHILD | SS_LEFT,
                        rightX + 10, y, 70, 20, hwnd, (HMENU)IDC_SERVER_ID_LABEL, g_hInstance, NULL);
         g_hServerId = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
-                                     WS_CHILD | ES_LEFT | ES_UPPERCASE,
+                                     WS_CHILD | ES_LEFT,
                                      rightX + 80, y - 2, 200, 24, hwnd, (HMENU)IDC_SERVER_ID, g_hInstance, NULL);
         
         y += 30;
@@ -756,12 +756,45 @@ void SwitchTab(int tabIndex)
     RefreshMainWindow();
 }
 
+/* Helper: Parse domain:port or IP:port format */
+static BOOL ParseAddressPort(const char *input, char *addressOut, size_t addressSize, WORD *portOut)
+{
+    const char *colonPos;
+    size_t hostLen;
+    int port;
+    
+    colonPos = strrchr(input, ':');  /* Use strrchr for IPv6 compatibility */
+    if (!colonPos) return FALSE;
+    
+    hostLen = colonPos - input;
+    if (hostLen == 0 || hostLen >= addressSize) return FALSE;
+    
+    port = atoi(colonPos + 1);
+    if (port <= 0 || port > 65535) return FALSE;
+    
+    strncpy(addressOut, input, hostLen);
+    addressOut[hostLen] = '\0';
+    *portOut = (WORD)port;
+    return TRUE;
+}
+
+/* Helper: Check if input looks like domain:port or IP:port (contains ':' and valid port) */
+static BOOL LooksLikeAddressPort(const char *input)
+{
+    const char *colonPos = strrchr(input, ':');
+    int port;
+    if (!colonPos) return FALSE;
+    port = atoi(colonPos + 1);
+    return (port > 0 && port <= 65535);
+}
+
 /* Step 1: Connect to relay server and register */
 void ConnectToRelayServer(void)
 {
-    char serverIdStr[32];
+    char serverIdStr[128];  /* Increased for domain:port */
     int result;
     SOCKET relaySocket = INVALID_SOCKET;
+    BOOL useDirect;
     
     /* If already connected, disconnect first */
     if (g_bConnectedToRelay) {
@@ -782,31 +815,47 @@ void ConnectToRelayServer(void)
         return;
     }
     
-    /* Get Server ID and decode it to IP:Port */
+    /* Get Server ID or domain:port */
     GetWindowTextA(g_hServerId, serverIdStr, sizeof(serverIdStr));
     
     if (serverIdStr[0] == '\0') {
-        MessageBoxA(g_hMainWnd, "Please enter the Server ID!\n\n"
-                   "The Server ID is provided by your system administrator.",
+        MessageBoxA(g_hMainWnd, "Please enter the relay address!\n\n"
+                   "Use domain:port (e.g., relay.example.com:5000)\n"
+                   "or a Server ID (e.g., XXXX-XXXX-XXXX-X)",
                    APP_TITLE, MB_ICONWARNING);
         return;
     }
     
-    /* Validate and decode Server ID */
-    if (!Crypto_ValidateServerIDFormat(serverIdStr)) {
-        MessageBoxA(g_hMainWnd, "Invalid Server ID format!\n\n"
-                   "Server ID should look like: XXXX-XXXX-XXXX-X",
-                   APP_TITLE, MB_ICONWARNING);
-        return;
-    }
+    /* Try to parse as domain:port or IP:port first */
+    useDirect = LooksLikeAddressPort(serverIdStr);
     
-    result = Crypto_DecodeServerID(serverIdStr, g_szRelayServerIp, &g_wRelayServerPort);
-    if (result != CRYPTO_SUCCESS) {
-        MessageBoxA(g_hMainWnd, "Invalid Server ID!\n\n"
-                   "The Server ID could not be decoded.\n"
-                   "Please check with your administrator.",
-                   APP_TITLE, MB_ICONERROR);
-        return;
+    if (useDirect) {
+        /* Direct domain:port or IP:port format */
+        if (!ParseAddressPort(serverIdStr, g_szRelayServerIp, sizeof(g_szRelayServerIp), &g_wRelayServerPort)) {
+            MessageBoxA(g_hMainWnd, "Invalid address format!\n\n"
+                       "Use domain:port (e.g., relay.example.com:5000)\n"
+                       "or IP:port (e.g., 192.168.1.1:5000)",
+                       APP_TITLE, MB_ICONWARNING);
+            return;
+        }
+    } else {
+        /* Try as Server ID (legacy format) */
+        if (!Crypto_ValidateServerIDFormat(serverIdStr)) {
+            MessageBoxA(g_hMainWnd, "Invalid relay address!\n\n"
+                       "Use domain:port (e.g., relay.example.com:5000)\n"
+                       "or a Server ID (e.g., XXXX-XXXX-XXXX-X)",
+                       APP_TITLE, MB_ICONWARNING);
+            return;
+        }
+        
+        result = Crypto_DecodeServerID(serverIdStr, g_szRelayServerIp, &g_wRelayServerPort);
+        if (result != CRYPTO_SUCCESS) {
+            MessageBoxA(g_hMainWnd, "Invalid Server ID!\n\n"
+                       "The Server ID could not be decoded.\n"
+                       "Please check with your administrator.",
+                       APP_TITLE, MB_ICONERROR);
+            return;
+        }
     }
     
     UpdateStatusBar("Connecting to relay...", FALSE);
