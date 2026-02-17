@@ -480,12 +480,12 @@ static void PrintStatus(WORD port, const char *bindIp)
                 fprintf(stdout, "%s╔══════════════════════════════════════════════════════════╗%s\n", COLOR_GREEN, COLOR_RESET);
                 fprintf(stdout, "%s║%s  SERVER ID: %s%-44s%s║%s\n", COLOR_GREEN, COLOR_RESET, COLOR_BOLD, serverId, COLOR_GREEN, COLOR_RESET);
                 fprintf(stdout, "%s╚══════════════════════════════════════════════════════════╝%s\n", COLOR_GREEN, COLOR_RESET);
-                fprintf(stdout, "\n%sGive this Server ID to your customers!%s\n", COLOR_DIM, COLOR_RESET);
+                fprintf(stdout, "\n%sServer ID !%s\n", COLOR_DIM, COLOR_RESET);
             } else {
                 fprintf(stdout, "============================================================\n");
                 fprintf(stdout, "  SERVER ID: %s\n", serverId);
                 fprintf(stdout, "============================================================\n");
-                fprintf(stdout, "\nGive this Server ID to your customers!\n");
+                fprintf(stdout, "\nGive this Server ID to your clients!\n");
             }
         }
     }

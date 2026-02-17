@@ -225,3 +225,24 @@ RemoteDesk2K/
   - File transfer support
   - Clipboard sharing
   - Full screen and scaling modes
+
+---
+
+## ⚠️ WSL/Windows Port Binding Warning
+
+If you run the relay server inside **WSL (Windows Subsystem for Linux)** on Windows:
+
+- Any port you bind in WSL (e.g., 80, 8080, 5000, etc.) will also appear as LISTENING in Windows.
+- Only one process (either in Windows or WSL) can actually receive connections on a given port at a time.
+- If you run a relay server on the same port in both Windows and WSL, you will get conflicts, unpredictable behavior, or connection delays.
+- Windows clients may connect to the wrong process, or connections may be delayed/confused if both environments are using the same port.
+
+**Best Practice:**
+- Always make sure the port is free in both Windows and WSL before starting your relay server.
+- Never run a server on the same port in both Windows and WSL at the same time.
+- Use `netstat`/`ss` in both environments to confirm only one listener.
+- Prefer using a high port (e.g., 50000) for development/testing in WSL.
+
+**This issue does NOT occur on real, separate Linux machines.**
+
+---

@@ -255,10 +255,12 @@ static BOOL RemoveStaleConnections(PRELAY_SERVER pServer, DWORD clientId, PRELAY
              * - REGISTERED (state=1): waiting but not paired, can be replaced */
             
             /* Found stale connection with same ID - mark for cleanup */
-            char idStr[20];
-            FormatClientId(clientId, idStr);
-            RelayLog("[CLEANUP] Removing stale connection for ID %s (state=%d)\r\n", 
-                    idStr, pConn->state);
+            {
+                char idStr[20];
+                FormatClientId(clientId, idStr);
+                RelayLog("[CLEANUP] Removing stale connection for ID %s (state=%d)\r\n", 
+                        idStr, pConn->state);
+            }
             
             /* Signal disconnect and close socket */
             if (pConn->hDisconnectEvent) {
