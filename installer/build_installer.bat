@@ -67,8 +67,8 @@ echo ============================================================
 echo.
 echo The installer now contains RemoteDesk2K.exe embedded inside!
 echo.
-echo To customize Server ID:
-echo 1. Edit installer.c and set DEFAULT_SERVER_ID
+echo To customize Relay Address:
+echo 1. Edit installer.c and set DEFAULT_RELAY_ADDR (e.g. "relay.example.com:5000")
 echo 2. Rebuild with build_installer.bat
 echo.
 echo Distribution: Just give RD2K_Setup.exe to users (single file!)

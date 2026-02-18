@@ -3,10 +3,11 @@
  * Classic Windows 2000 style GUI installer
  * 
  * Features:
- * - Pre-configured Server ID (set by admin who builds installer)
+ * - Pre-configured Relay Address (set by admin who builds installer)
+ * - Supports domain:port, IP:port, or Server ID formats
  * - Installs to Program Files\RemoteDesk2K
  * - Creates Start Menu shortcut
- * - Creates client_config.ini with Server ID
+ * - Creates client_config.ini with relay address
  */
 
 #include <windows.h>
@@ -22,7 +23,7 @@
 /* ============================================================================
  * CONFIGURATION - Admin sets this before building installer
  * ============================================================================ */
-#define DEFAULT_SERVER_ID       ""   /* Set your Server ID here, e.g. "A7K2-M9PL-X3QR" */
+#define DEFAULT_RELAY_ADDR      ""   /* Set relay address: domain:port, IP:port, or Server ID */
 #define APP_NAME               "RemoteDesk2K"
 #define APP_VERSION            "1.0"
 #define INSTALLER_TITLE        "RemoteDesk2K Setup"
@@ -266,15 +267,15 @@ void CreateControls(HWND hwnd) {
     
     y = 80;
     
-    /* Server ID section */
-    CreateWindowExA(0, "STATIC", "Server ID (provided by administrator):",
+    /* Relay Address section */
+    CreateWindowExA(0, "STATIC", "Relay Address (e.g. relay.example.com:5000):",
         WS_CHILD | WS_VISIBLE,
-        20, y, 300, 18, hwnd, (HMENU)IDC_SERVER_LABEL, g_hInstance, NULL);
+        20, y, 350, 18, hwnd, (HMENU)IDC_SERVER_LABEL, g_hInstance, NULL);
     y += 22;
     
-    g_hServerIdEdit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", DEFAULT_SERVER_ID,
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_CENTER,
-        20, y, 200, 24, hwnd, (HMENU)IDC_SERVER_ID, g_hInstance, NULL);
+    g_hServerIdEdit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", DEFAULT_RELAY_ADDR,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        20, y, 250, 24, hwnd, (HMENU)IDC_SERVER_ID, g_hInstance, NULL);
     y += 35;
     
     /* Install path section */
@@ -456,7 +457,7 @@ BOOL DoInstall(HWND hwnd) {
     char installPath[MAX_PATH];
     char dstPath[MAX_PATH];
     char configPath[MAX_PATH];
-    char serverId[64];
+    char relayAddr[128];
     char desktopPath[MAX_PATH];
     char startMenuPath[MAX_PATH];
     char shortcutPath[MAX_PATH];
@@ -465,14 +466,16 @@ BOOL DoInstall(HWND hwnd) {
     
     /* Get values from controls */
     GetWindowTextA(g_hPathEdit, installPath, sizeof(installPath));
-    GetWindowTextA(g_hServerIdEdit, serverId, sizeof(serverId));
+    GetWindowTextA(g_hServerIdEdit, relayAddr, sizeof(relayAddr));
     createDesktop = (SendMessage(g_hDesktopChk, BM_GETCHECK, 0, 0) == BST_CHECKED);
     createStartMenu = (SendMessage(g_hStartMenuChk, BM_GETCHECK, 0, 0) == BST_CHECKED);
     
-    /* Validate Server ID */
-    if (serverId[0] == '\0') {
-        MessageBoxA(hwnd, "Please enter the Server ID provided by your administrator.",
-                   "Server ID Required", MB_ICONWARNING);
+    /* Validate Relay Address */
+    if (relayAddr[0] == '\0') {
+        MessageBoxA(hwnd, "Please enter the relay address.\n\n"
+                   "Use domain:port (e.g., relay.example.com:5000)\n"
+                   "or IP:port (e.g., 192.168.1.1:5000)",
+                   "Relay Address Required", MB_ICONWARNING);
         SetFocus(g_hServerIdEdit);
         return FALSE;
     }
@@ -517,7 +520,7 @@ BOOL DoInstall(HWND hwnd) {
     fp = fopen(configPath, "w");
     if (fp) {
         fprintf(fp, "[Client]\r\n");
-        fprintf(fp, "ServerID=%s\r\n", serverId);
+        fprintf(fp, "ServerID=%s\r\n", relayAddr);
         fprintf(fp, "LastPartnerID=\r\n");
         fprintf(fp, "LastDirectPartnerID=\r\n");
         fclose(fp);

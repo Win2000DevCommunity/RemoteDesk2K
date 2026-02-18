@@ -312,11 +312,11 @@ static void GetClientConfigPath(void) {
 
 /* Save client config to INI file */
 static void SaveClientConfig(void) {
-    char serverIdStr[64], partnerIdStr[32];
+    char serverIdStr[128], partnerIdStr[32];
     
     if (g_szClientConfigPath[0] == '\0') GetClientConfigPath();
     
-    /* Get Server ID */
+    /* Get Relay Address */
     if (g_hServerId) {
         GetWindowTextA(g_hServerId, serverIdStr, sizeof(serverIdStr));
         WritePrivateProfileStringA(CLIENT_CONFIG_SECTION, "ServerID", serverIdStr, g_szClientConfigPath);
@@ -337,7 +337,7 @@ static void SaveClientConfig(void) {
 
 /* Load client config from INI file */
 static void LoadClientConfig(void) {
-    char serverIdStr[64], partnerIdStr[32], directPartnerIdStr[32];
+    char serverIdStr[128], partnerIdStr[32], directPartnerIdStr[32];
     
     if (g_szClientConfigPath[0] == '\0') GetClientConfigPath();
     
