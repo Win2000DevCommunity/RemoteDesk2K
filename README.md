@@ -65,6 +65,13 @@ Currently, there is **no public cloud-hosted relay server**. To use relay mode:
 - **Admin-Only Generation** - Only relay server admin can generate Server IDs
 - **One-Click Copy** - Copy Server ID to clipboard for easy distribution
 - **Simple Client Experience** - Users just enter the Server ID to connect
+- **Domain:Port Support** - Clients can also connect using `domain.com:port` format
+
+### 🛡️ Stability & Protection
+- **Single Instance** - Only one instance of each app can run at a time
+- **Duplicate ID Detection** - Warning when your ID is already connected on the server
+- **Graceful Shutdown** - Clean resource cleanup when closing apps
+- **Memory Safety** - Proper initialization prevents display artifacts
 
 
 ## Build Environment
@@ -91,11 +98,18 @@ build.bat              # Creates RemoteDesk2K.exe
 
 # Build relay server (admin only)
 cd ../relay
-build_relay.bat        # Creates relay.exe
+build_relay.bat        # Creates relay.exe (GUI) and relay_cmd.exe (CLI)
 
 # Build installer (optional)
 cd ../installer
 build_installer.bat    # Creates RD2K_Setup.exe (embeds client)
+```
+
+### Linux Relay Build
+```bash
+cd RemoteDesk2K/linux
+make                   # Creates relay (Linux binary)
+./relay 5000           # Start relay on port 5000
 ```
 
 ## Project Structure
@@ -109,10 +123,17 @@ RemoteDesk2K/
 │   ├── input.c/h        # Input handling
 │   ├── progress.c/h     # Progress dialogs
 │   └── build.bat        # Client build script
-├── relay/               # Relay server (separate)
+├── relay/               # Relay server (Windows)
 │   ├── relay.c          # Relay server logic
-│   ├── relay_gui.c      # Relay server GUI
+│   ├── relay_gui.c      # Relay server GUI (relay.exe)
+│   ├── CMD/             # Command-line relay (relay_cmd.exe)
+│   │   └── relay_cmd.c
 │   └── build_relay.bat  # Relay build script
+├── linux/               # Relay server (Linux)
+│   ├── relay.c          # Linux relay logic
+│   ├── relay_main.c     # Linux main entry point
+│   ├── common.h         # Linux-specific definitions
+│   └── Makefile         # Build with 'make'
 ├── common/              # Shared code
 │   ├── common.h         # Protocol definitions
 │   ├── network.c/h      # Network communication
@@ -135,18 +156,26 @@ RemoteDesk2K/
 
 ### As Viewer (Controlling)
 1. Run `RemoteDesk2K.exe`
-2. Enter the **Server ID** (e.g., `A7K2-M9PL-X3QR`) provided by admin
+2. Enter either:
+   - **Server ID** (e.g., `A7K2-M9PL-X3QR`) provided by admin, or
+   - **Domain:Port** (e.g., `relay.example.com:5000`) directly
 3. Enter partner's **Password**
 4. Click "Connect to partner"
 5. Use the viewer window to control remote PC
 
-### Relay Server Admin
-1. Run `relay.exe`
+### Relay Server Admin (Windows)
+1. Run `relay.exe` (GUI) or `relay_cmd.exe` (CLI)
 2. Configure relay IP and port
-3. Click **Start Server**
+3. Click **Start Server** (or just start for CLI)
 4. **Server ID** is auto-generated and displayed
 5. Click **Copy** to copy Server ID
 6. Distribute Server ID to your client users
+
+### Relay Server Admin (Linux)
+1. Build with `make` in the `linux/` folder
+2. Run `./relay <port>` (e.g., `./relay 5000`)
+3. Copy the generated **Server ID** from console output
+4. Distribute Server ID to your client users
 
 > **Note:** Clients only see the Server ID, never the real IP:port. This protects your server infrastructure.
 
@@ -204,6 +233,14 @@ RemoteDesk2K/
 - 24-bit color depth
 
 ## Version History
+
+- **1.3.0** - Stability & Protection Update
+  - **Single instance protection** - Only one instance of each app can run at a time
+  - **Duplicate ID detection** - Clear warning when trying to connect with an already-connected ID
+  - **Graceful shutdown** - Clean resource cleanup when closing applications
+  - **Fixed display artifacts** - No more random colored squares appearing in viewer
+  - Improved memory initialization for screen decompression
+  - Works on both Windows and Linux relay servers
 
 - **1.2.0** - Server ID Privacy Update
   - Encrypted Server ID system (`XXXX-XXXX-XXXX` format)
