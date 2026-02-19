@@ -187,10 +187,20 @@ static RELAY_CONNECTION* FindConnectionById(RELAY_SERVER *pServer, DWORD clientI
     return NULL;
 }
 
+/* Remove stale connections with same clientId (for reconnection handling) 
+ * IMPORTANT: Protect PAIRED connections always, REGISTERED with timeout.
+ * Dead sockets will be cleaned up naturally when recv() fails.
+ * Returns TRUE if ID is available for registration, FALSE if already in use */
 static BOOL RemoveStaleConnections(RELAY_SERVER *pServer, DWORD clientId, RELAY_CONNECTION *pExclude)
 {
     DWORD i;
     BOOL bIdAvailable = TRUE;
+    DWORD currentTime = GetTickCount();
+    
+    /* Short timeout for registered connections (5 seconds).
+     * This allows legitimate reconnections while preventing rapid loops.
+     * Dead sockets are detected when recv() fails, which triggers cleanup. */
+    #define REGISTERED_TIMEOUT_MS 5000
     
     if (!pServer) return FALSE;
     
@@ -199,57 +209,57 @@ static BOOL RemoveStaleConnections(RELAY_SERVER *pServer, DWORD clientId, RELAY_
     for (i = 0; i < pServer->maxConnections; i++) {
         RELAY_CONNECTION *pConn = pServer->connections[i];
         if (pConn && pConn != pExclude && pConn->clientId == clientId) {
+            char idStr[20];
+            DWORD idleTime;
+            FormatClientId(clientId, idStr);
             
+            /* Check how long since last activity */
+            idleTime = currentTime - pConn->lastActivity;
+            
+            /* PAIRED connections - always protect, never kick out */
             if (pConn->state == RELAY_STATE_PAIRED) {
-                char idStr[20];
-                FormatClientId(clientId, idStr);
-                
-                if (!IsSocketAlive(pConn->socket)) {
-                    RelayLog("[CLEANUP] PAIRED connection for ID %s has dead socket\n", idStr);
-                    
-                    if (pConn->pPartner && pConn->pPartner->socket != INVALID_SOCKET) {
-                        RELAY_PARTNER_DISCONNECTED notification;
-                        notification.reason = RELAY_DISCONNECT_PARTNER_LEFT;
-                        notification.partnerId = pConn->clientId;
-                        SendRelayPacket(pConn->pPartner->socket, RELAY_MSG_PARTNER_DISCONNECTED,
-                                       (const BYTE*)&notification, sizeof(notification));
-                        pConn->pPartner->pPartner = NULL;
-                        pConn->pPartner->state = RELAY_STATE_REGISTERED;
-                    }
-                    
-                    pConn->shouldStop = 1;
-                    if (pConn->socket != INVALID_SOCKET) {
-                        close(pConn->socket);
-                        pConn->socket = INVALID_SOCKET;
-                    }
-                    pConn->state = RELAY_STATE_DISCONNECTED;
-                    pServer->connections[i] = NULL;
-                    if (pServer->activeConnections > 0) pServer->activeConnections--;
-                    continue;
-                }
-                
-                RelayLog("[PROTECT] ID %s is in active session - blocking duplicate\n", idStr);
+                RelayLog("[PROTECT] ID %s is in active session (PAIRED) - rejecting duplicate\n", idStr);
                 bIdAvailable = FALSE;
                 continue;
             }
             
-            char idStr[20];
-            FormatClientId(clientId, idStr);
-            RelayLog("[CLEANUP] Removing stale connection for ID %s (state=%d)\n", idStr, pConn->state);
+            /* REGISTERED connections - protect unless timed out */
+            if (pConn->state == RELAY_STATE_REGISTERED) {
+                if (idleTime < REGISTERED_TIMEOUT_MS) {
+                    RelayLog("[PROTECT] ID %s is recently registered (%u ms ago) - rejecting duplicate\n", 
+                            idStr, idleTime);
+                    bIdAvailable = FALSE;
+                    continue;
+                }
+                /* Timed out REGISTERED connection - allow removal */
+                RelayLog("[TIMEOUT] ID %s was REGISTERED but idle for %u ms - allowing reconnect\n", 
+                        idStr, idleTime);
+            }
             
+            /* Remove: DISCONNECTED, CONNECTED(zombie), or timed-out REGISTERED */
+            RelayLog("[CLEANUP] Removing connection for ID %s (state=%d, idle=%u ms)\n", 
+                    idStr, pConn->state, idleTime);
+            
+            /* Signal stop and close socket */
             pConn->shouldStop = 1;
             if (pConn->socket != INVALID_SOCKET) {
                 close(pConn->socket);
                 pConn->socket = INVALID_SOCKET;
             }
             pConn->state = RELAY_STATE_DISCONNECTED;
+            
+            /* Clear slot and update count */
             pServer->connections[i] = NULL;
-            if (pServer->activeConnections > 0) pServer->activeConnections--;
+            if (pServer->activeConnections > 0) {
+                pServer->activeConnections--;
+            }
         }
     }
     
     pthread_mutex_unlock(&pServer->connMutex);
     return bIdAvailable;
+    
+    #undef REGISTERED_TIMEOUT_MS
 }
 
 static void ConfigureClientSocket(SOCKET sock)
