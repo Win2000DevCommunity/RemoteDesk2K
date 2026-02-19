@@ -11,6 +11,7 @@
 #include "common.h"
 #include "crypto.h"
 #include "relay.h"
+#include <sys/file.h>  /* For flock() */
 
 /* ============================================================
  * GLOBAL STATE
@@ -23,6 +24,10 @@ static int g_bColor = 1;
 static FILE *g_logFile = NULL;
 static pthread_mutex_t g_printMutex = PTHREAD_MUTEX_INITIALIZER;
 static char g_customIp[64] = "";  /* Custom IP for Server ID (for local testing) */
+static int g_lockFd = -1;  /* Lock file descriptor for single instance */
+
+/* Lock file path */
+#define LOCK_FILE_PATH  "/tmp/rd2k_relay.lock"
 
 /* ANSI color codes */
 #define COLOR_RESET     "\033[0m"
@@ -35,8 +40,56 @@ static char g_customIp[64] = "";  /* Custom IP for Server ID (for local testing)
 #define COLOR_BOLD      "\033[1m"
 #define COLOR_DIM       "\033[2m"
 
-/* ============================================================
- * LOGGING
+/* ============================================================ * SINGLE INSTANCE LOCK
+ * ============================================================ */
+
+/* Acquire single instance lock using file locking
+ * Returns: 0 on success, -1 if another instance is running */
+static int AcquireLock(void)
+{
+    g_lockFd = open(LOCK_FILE_PATH, O_CREAT | O_RDWR, 0644);
+    if (g_lockFd < 0) {
+        perror(\"Failed to open lock file\");
+        return -1;
+    }
+    
+    /* Try to acquire exclusive lock (non-blocking) */
+    if (flock(g_lockFd, LOCK_EX | LOCK_NB) < 0) {
+        if (errno == EWOULDBLOCK) {
+            fprintf(stderr, \"\\n*** ERROR: Another instance of Relay Server is already running! ***\\n\");
+            fprintf(stderr, \"Close the other instance first.\\n\\n\");
+        } else {
+            perror(\"Failed to acquire lock\");
+        }
+        close(g_lockFd);
+        g_lockFd = -1;
+        return -1;
+    }
+    
+    /* Write PID to lock file */
+    {
+        char pid_str[32];
+        int len = snprintf(pid_str, sizeof(pid_str), \"%d\\n\", (int)getpid());
+        if (ftruncate(g_lockFd, 0) == 0) {
+            (void)write(g_lockFd, pid_str, len);
+        }
+    }
+    
+    return 0;
+}
+
+/* Release single instance lock */
+static void ReleaseLock(void)
+{
+    if (g_lockFd >= 0) {
+        flock(g_lockFd, LOCK_UN);
+        close(g_lockFd);
+        g_lockFd = -1;
+        unlink(LOCK_FILE_PATH);
+    }
+}
+
+/* ============================================================ * LOGGING
  * ============================================================ */
 
 static void GetTimestamp(char *buffer, size_t len)
@@ -548,6 +601,11 @@ int main(int argc, char *argv[])
         }
     }
     
+    /* Acquire single instance lock */
+    if (AcquireLock() < 0) {
+        return 1;  /* Another instance is running */
+    }
+    
     /* Open log file if specified */
     if (logFile) {
         g_logFile = fopen(logFile, "a");
@@ -617,6 +675,9 @@ int main(int argc, char *argv[])
         fclose(g_logFile);
         g_logFile = NULL;
     }
+    
+    /* Release single instance lock */
+    ReleaseLock();
     
     if (!g_bDaemon && g_bColor) {
         fprintf(stdout, "%s%sGoodbye!%s\n", COLOR_BOLD, COLOR_GREEN, COLOR_RESET);

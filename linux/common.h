@@ -60,6 +60,7 @@ typedef int         SOCKET;
 
 /* Relay message types */
 #define RELAY_MSG_REGISTER          0x50
+#define RELAY_MSG_REGISTER_RESPONSE 0x58
 #define RELAY_MSG_CONNECT_REQUEST   0x51
 #define RELAY_MSG_CONNECT_RESPONSE  0x52
 #define RELAY_MSG_DATA              0x53
@@ -96,6 +97,16 @@ typedef struct {
     DWORD   clientId;
     DWORD   reserved;
 } RELAY_REGISTER_MSG;
+
+/* Register response status codes */
+#define RELAY_REGISTER_OK           0
+#define RELAY_REGISTER_DUPLICATE    1
+#define RELAY_REGISTER_ERROR        2
+
+typedef struct {
+    DWORD   status;
+    DWORD   reserved;
+} RELAY_REGISTER_RESPONSE;
 
 typedef struct {
     DWORD   partnerId;

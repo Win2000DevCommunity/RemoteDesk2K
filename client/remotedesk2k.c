@@ -178,6 +178,10 @@ static char             g_szRelayServerIp[128] = ""; /* Domain/IP for relay serv
 static WORD             g_wRelayServerPort = 5000;   /* Port for relay server */
 static SOCKET           g_relaySocket = INVALID_SOCKET;
 static CRITICAL_SECTION g_csRelay;
+static HANDLE           g_hMutex = NULL;  /* Single instance mutex */
+
+/* Single instance mutex name */
+#define CLIENT_MUTEX_NAME    "RemoteDesk2K_Client_SingleInstance"
 
 /* Connection State */
 static DWORD            g_myId = 0;
@@ -367,6 +371,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     
     g_hInstance = hInstance;
     
+    /* Check for single instance */
+    g_hMutex = CreateMutexA(NULL, TRUE, CLIENT_MUTEX_NAME);
+    if (g_hMutex == NULL || GetLastError() == ERROR_ALREADY_EXISTS) {
+        MessageBoxA(NULL, "RemoteDesk2K is already running!\n\nCheck the taskbar or system tray.", APP_TITLE, MB_ICONWARNING | MB_OK);
+        if (g_hMutex) CloseHandle(g_hMutex);
+        return 1;
+    }
+    
     /* Initialize Winsock */
     if (InitializeNetwork() != 0) {
         MessageBoxA(NULL, "Failed to initialize network!", APP_TITLE, MB_ICONERROR);
@@ -487,6 +499,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     DeleteObject(g_hBrushHeader);
     
     CleanupNetwork();
+    
+    /* Release single instance mutex */
+    if (g_hMutex) {
+        CloseHandle(g_hMutex);
+        g_hMutex = NULL;
+    }
     
     return (int)msg.wParam;
 }
@@ -893,7 +911,19 @@ void ConnectToRelayServer(void)
         UpdateStatusBar("Failed to register", FALSE);
         SetWindowTextA(g_hRelayConnectSvrBtn, "Connect to Server");
         EnableWindow(g_hRelayConnectSvrBtn, TRUE);
-        MessageBoxA(g_hMainWnd, "Failed to register with relay server!", APP_TITLE, MB_ICONERROR);
+        
+        /* Show specific error message for duplicate ID */
+        if (result == RD2K_ERR_DUPLICATE_ID) {
+            MessageBoxA(g_hMainWnd, 
+                       "Your ID is already connected to this relay server!\n\n"
+                       "This can happen if:\n"
+                       "- Another instance of RemoteDesk2K is running\n"
+                       "- A previous connection didn't close properly\n\n"
+                       "Wait a few seconds and try again.",
+                       APP_TITLE, MB_ICONWARNING);
+        } else {
+            MessageBoxA(g_hMainWnd, "Failed to register with relay server!", APP_TITLE, MB_ICONERROR);
+        }
         return;
     }
     
@@ -1261,6 +1291,16 @@ BOOL AttemptRelayReconnection(void)
     result = Relay_Register(relaySocket, g_myId);
     if (result != RD2K_SUCCESS) {
         closesocket(relaySocket);
+        
+        /* If duplicate ID error, show message and stop reconnecting */
+        if (result == RD2K_ERR_DUPLICATE_ID) {
+            MessageBoxA(g_hMainWnd, 
+                       "Your ID is already connected to this relay server!\n\n"
+                       "Another instance may be running, or the previous "
+                       "connection hasn't timed out yet.\n\n"
+                       "Please wait and try again.",
+                       APP_TITLE, MB_ICONWARNING);
+        }
         return FALSE;
     }
     

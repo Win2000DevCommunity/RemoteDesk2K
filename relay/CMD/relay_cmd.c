@@ -50,7 +50,11 @@
 static PRELAY_SERVER g_pServer = NULL;
 static BOOL g_bRunning = FALSE;
 static HANDLE g_hConsole = INVALID_HANDLE_VALUE;
+static HANDLE g_hMutex = NULL;  /* Single instance mutex */
 static CRITICAL_SECTION g_csConsole;
+
+/* Single instance mutex name */
+#define RELAY_CMD_MUTEX_NAME    "RemoteDesk2K_RelayCMD_SingleInstance"
 
 /* Forward declarations */
 static void PrintBanner(void);
@@ -452,6 +456,17 @@ int main(int argc, char *argv[])
         PrintBanner();
     }
     
+    /* Check for single instance using named mutex */
+    g_hMutex = CreateMutexA(NULL, TRUE, RELAY_CMD_MUTEX_NAME);
+    if (g_hMutex == NULL || GetLastError() == ERROR_ALREADY_EXISTS) {
+        fprintf(stderr, "\n");
+        fprintf(stderr, "  *** ERROR: Another instance of Relay Server is already running! ***\n");
+        fprintf(stderr, "  Close the other instance first, then try again.\n");
+        fprintf(stderr, "\n");
+        if (g_hMutex) CloseHandle(g_hMutex);
+        return 1;
+    }
+    
     /* Initialize Winsock */
     result = WSAStartup(MAKEWORD(2, 2), &wsaData);
     if (result != 0) {
@@ -597,6 +612,12 @@ int main(int argc, char *argv[])
     printf("\n");
     
     DeleteCriticalSection(&g_csConsole);
+    
+    /* Release single instance mutex */
+    if (g_hMutex) {
+        CloseHandle(g_hMutex);
+        g_hMutex = NULL;
+    }
     
     return 0;
 }

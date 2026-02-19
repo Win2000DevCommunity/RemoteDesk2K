@@ -366,6 +366,7 @@ static int ProcessRelayMessage(RELAY_SERVER *pServer, RELAY_CONNECTION *pConn,
     switch (header.msgType) {
         case RELAY_MSG_REGISTER: {
             RELAY_REGISTER_MSG reg;
+            RELAY_REGISTER_RESPONSE regResponse;
             char idStr[20];
             BOOL bIdAvailable;
             
@@ -377,13 +378,24 @@ static int ProcessRelayMessage(RELAY_SERVER *pServer, RELAY_CONNECTION *pConn,
             FormatClientId(reg.clientId, idStr);
             
             if (!bIdAvailable) {
-                RelayLog("[REJECT] Registration rejected for ID %s\n", idStr);
-                return -1;
+                /* Send duplicate ID error to client */
+                RelayLog("[REJECT] Registration rejected for ID %s - already connected\n", idStr);
+                regResponse.status = RELAY_REGISTER_DUPLICATE;
+                regResponse.reserved = 0;
+                SendRelayPacket(pConn->socket, RELAY_MSG_REGISTER_RESPONSE,
+                               (const BYTE*)&regResponse, sizeof(regResponse));
+                return -1;  /* Disconnect after sending response */
             }
             
             pConn->clientId = reg.clientId;
             pConn->state = RELAY_STATE_REGISTERED;
             pConn->lastActivity = GetTickCount();
+            
+            /* Send success response */
+            regResponse.status = RELAY_REGISTER_OK;
+            regResponse.reserved = 0;
+            SendRelayPacket(pConn->socket, RELAY_MSG_REGISTER_RESPONSE,
+                           (const BYTE*)&regResponse, sizeof(regResponse));
             
             RelayLog("[REGISTER] Client ID: %s registered\n", idStr);
             return 0;

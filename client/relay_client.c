@@ -141,13 +141,66 @@ int Relay_ConnectToServer(const char *relayServerAddr, WORD relayPort,
 int Relay_Register(SOCKET relaySocket, DWORD clientId)
 {
     RELAY_REGISTER_MSG msg;
+    BYTE buffer[256];
+    RELAY_HEADER header;
+    RELAY_REGISTER_RESPONSE response;
+    int result;
+    DWORD recvLen;
     
     if (relaySocket == INVALID_SOCKET) return RD2K_ERR_SOCKET;
     
     msg.clientId = clientId;
     msg.reserved = 0;
     
-    return SendRelayPacket(relaySocket, RELAY_MSG_REGISTER, (const BYTE*)&msg, sizeof(msg));
+    /* Send registration request */
+    result = SendRelayPacket(relaySocket, RELAY_MSG_REGISTER, (const BYTE*)&msg, sizeof(msg));
+    if (result != RD2K_SUCCESS) {
+        return result;
+    }
+    
+    /* Wait for registration response (5 second timeout) */
+    result = WaitForSocketReady(relaySocket, FALSE, 5000);
+    if (result <= 0) {
+        return RD2K_ERR_TIMEOUT;
+    }
+    
+    /* Receive response */
+    recvLen = recv(relaySocket, (char*)buffer, sizeof(buffer), 0);
+    if (recvLen == 0 || recvLen == SOCKET_ERROR) {
+        return RD2K_ERR_RECV;
+    }
+    
+    if (recvLen < sizeof(RELAY_HEADER)) {
+        return RD2K_ERR_PROTOCOL;
+    }
+    
+    CopyMemory(&header, buffer, sizeof(RELAY_HEADER));
+    
+    /* Decrypt if encrypted */
+    if ((header.flags & 0x01) && header.dataLength > 0) {
+        Crypto_Decrypt(buffer + sizeof(RELAY_HEADER), header.dataLength);
+    }
+    
+    if (header.msgType != RELAY_MSG_REGISTER_RESPONSE) {
+        return RD2K_ERR_PROTOCOL;
+    }
+    
+    if (recvLen < sizeof(RELAY_HEADER) + sizeof(RELAY_REGISTER_RESPONSE)) {
+        return RD2K_ERR_PROTOCOL;
+    }
+    
+    CopyMemory(&response, buffer + sizeof(RELAY_HEADER), sizeof(RELAY_REGISTER_RESPONSE));
+    
+    /* Check registration result */
+    if (response.status == RELAY_REGISTER_DUPLICATE) {
+        return RD2K_ERR_DUPLICATE_ID;
+    }
+    
+    if (response.status != RELAY_REGISTER_OK) {
+        return RD2K_ERR_CONNECT;
+    }
+    
+    return RD2K_SUCCESS;
 }
 
 int Relay_RequestPartner(SOCKET relaySocket, DWORD partnerId, DWORD password)

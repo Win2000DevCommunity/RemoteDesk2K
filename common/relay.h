@@ -20,6 +20,7 @@
 
 /* Relay protocol message types */
 #define RELAY_MSG_REGISTER          0x50    /* Register with relay server (send your ID) */
+#define RELAY_MSG_REGISTER_RESPONSE 0x58    /* Registration response from relay */
 #define RELAY_MSG_CONNECT_REQUEST   0x51    /* Request connection to partner (send partner ID) */
 #define RELAY_MSG_CONNECT_RESPONSE  0x52    /* Relay response: accepted/rejected */
 #define RELAY_MSG_DATA              0x53    /* Tunneled data from partner */
@@ -43,6 +44,16 @@ typedef struct _RELAY_REGISTER_MSG {
     DWORD   clientId;       /* Your encrypted ID */
     DWORD   reserved;
 } RELAY_REGISTER_MSG, *PRELAY_REGISTER_MSG;
+
+/* Register response from relay server */
+#define RELAY_REGISTER_OK           0   /* Registration successful */
+#define RELAY_REGISTER_DUPLICATE    1   /* ID already registered */
+#define RELAY_REGISTER_ERROR        2   /* Server error */
+
+typedef struct _RELAY_REGISTER_RESPONSE {
+    DWORD   status;         /* RELAY_REGISTER_* */
+    DWORD   reserved;
+} RELAY_REGISTER_RESPONSE, *PRELAY_REGISTER_RESPONSE;
 
 /* Connect request: ask relay to connect you to partner */
 typedef struct _RELAY_CONNECT_REQUEST {

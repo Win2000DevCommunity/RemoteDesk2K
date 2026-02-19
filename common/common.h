@@ -115,6 +115,7 @@
 #define RD2K_ERR_DISCONNECTED   -10 /* Connection disconnected */
 #define RD2K_ERR_PARTNER_LEFT   -11 /* Partner disconnected from relay */
 #define RD2K_ERR_SERVER_LOST    -12 /* Relay server connection lost */
+#define RD2K_ERR_DUPLICATE_ID   -13 /* Your ID is already connected to server */
 
 /* Reconnection settings */
 #define RECONNECT_MAX_ATTEMPTS  5

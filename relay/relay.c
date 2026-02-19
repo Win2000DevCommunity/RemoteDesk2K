@@ -389,6 +389,7 @@ static int ProcessRelayMessage(PRELAY_SERVER pServer, PRELAY_CONNECTION pConn,
     switch (header.msgType) {
         case RELAY_MSG_REGISTER: {
             RELAY_REGISTER_MSG reg;
+            RELAY_REGISTER_RESPONSE response;
             char idStr[20];
             BOOL bIdAvailable;
             
@@ -404,14 +405,24 @@ static int ProcessRelayMessage(PRELAY_SERVER pServer, PRELAY_CONNECTION pConn,
             FormatClientId(reg.clientId, idStr);
             
             if (!bIdAvailable) {
-                /* ID is already in use by an active paired session - disconnect this client */
-                RelayLog("[REJECT] Registration rejected for ID %s - already in active session\r\n", idStr);
-                return -1;  /* Signal error to disconnect this duplicate client */
+                /* ID is already in use - send duplicate ID error to client */
+                RelayLog("[REJECT] Registration rejected for ID %s - already connected\r\n", idStr);
+                response.status = RELAY_REGISTER_DUPLICATE;
+                response.reserved = 0;
+                SendRelayPacket(pConn->socket, RELAY_MSG_REGISTER_RESPONSE,
+                               (const BYTE*)&response, sizeof(response));
+                return -1;  /* Disconnect after sending response */
             }
             
             pConn->clientId = reg.clientId;
             pConn->state = RELAY_STATE_REGISTERED;
             pConn->lastActivity = GetTickCount();
+            
+            /* Send success response */
+            response.status = RELAY_REGISTER_OK;
+            response.reserved = 0;
+            SendRelayPacket(pConn->socket, RELAY_MSG_REGISTER_RESPONSE,
+                           (const BYTE*)&response, sizeof(response));
             
             /* Log client registration with friendly ID */
             RelayLog("[REGISTER] Client ID: %s registered\r\n", idStr);

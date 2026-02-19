@@ -68,6 +68,10 @@ static HWND hLblConnected = NULL;
 static PRELAY_SERVER g_pRelayServer = NULL;
 static BOOL g_bRelayRunning = FALSE;
 static char g_szConfigPath[MAX_PATH] = {0};
+static HANDLE g_hMutex = NULL;  /* Single instance mutex */
+
+/* Single instance mutex name */
+#define RELAY_GUI_MUTEX_NAME    "RemoteDesk2K_RelayGUI_SingleInstance"
 
 /* Forward declarations */
 static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -693,6 +697,14 @@ int RelayGui_Run(HINSTANCE hInstance, int nCmdShow) {
     
     g_hInstance = hInstance;
     
+    /* Check for single instance */
+    g_hMutex = CreateMutexA(NULL, TRUE, RELAY_GUI_MUTEX_NAME);
+    if (g_hMutex == NULL || GetLastError() == ERROR_ALREADY_EXISTS) {
+        MessageBoxA(NULL, "Another instance of Relay Server is already running!\n\nClose the other instance first.", "RemoteDesk2K Relay Server", MB_ICONWARNING | MB_OK);
+        if (g_hMutex) CloseHandle(g_hMutex);
+        return 1;
+    }
+    
     /* Initialize Winsock */
     if (WSAStartup(MAKEWORD(2,2), &wsaData) != 0) {
         MessageBoxA(NULL, "Failed to initialize network!", "Error", MB_ICONERROR);
@@ -771,6 +783,12 @@ int RelayGui_Run(HINSTANCE hInstance, int nCmdShow) {
     DeleteObject(g_hBrushHeader);
     
     WSACleanup();
+    
+    /* Release single instance mutex */
+    if (g_hMutex) {
+        CloseHandle(g_hMutex);
+        g_hMutex = NULL;
+    }
     
     return (int)msg.wParam;
 }
