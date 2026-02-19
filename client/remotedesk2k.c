@@ -2506,7 +2506,7 @@ BOOL CreateViewerBitmap(void)
     }
     
     g_decompressBufferSize = g_remoteScreen.width * g_remoteScreen.height * 4;
-    g_pDecompressBuffer = (BYTE*)malloc(g_decompressBufferSize);
+    g_pDecompressBuffer = (BYTE*)calloc(1, g_decompressBufferSize);  /* Use calloc to zero memory */
     
     ReleaseDC(NULL, hdcScreen);
     return TRUE;
@@ -2573,6 +2573,10 @@ void HandleScreenUpdate(const BYTE *data, DWORD dataLength)
         DWORD decompSize;
         
         if (pRect->dataSize == 0 || pRect->dataSize > dataLength - sizeof(RD2K_RECT)) return;
+        
+        /* Clear decompress buffer to black before decompression to avoid artifacts
+         * from partial decompression or corrupted data */
+        ZeroMemory(g_pDecompressBuffer, expectedSize);
         
         decompSize = DecompressRLE(pCompressed, pRect->dataSize,
                                    g_pDecompressBuffer, g_decompressBufferSize);

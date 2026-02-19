@@ -66,7 +66,7 @@ PSCREEN_CAPTURE ScreenCapture_Create(void)
     pCapture->pixelDataSize = ((pCapture->width * 3 + 3) & ~3) * pCapture->height;
     pCapture->pPrevFrame = (BYTE*)calloc(1, pCapture->pixelDataSize);
     pCapture->compressBufferSize = pCapture->pixelDataSize + (pCapture->pixelDataSize / 8) + 256;
-    pCapture->pCompressBuffer = (BYTE*)malloc(pCapture->compressBufferSize);
+    pCapture->pCompressBuffer = (BYTE*)calloc(1, pCapture->compressBufferSize);  /* Zero to avoid garbage */
     
     return pCapture;
 }
