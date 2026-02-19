@@ -156,52 +156,43 @@ static PRELAY_CONNECTION FindConnectionById(PRELAY_SERVER pServer, DWORD clientI
     return NULL;
 }
 
-/* Check if a socket is still connected (not dead) */
+/* Check if a socket is still connected (not dead) 
+ * Returns TRUE if socket appears alive, FALSE only if definitely dead.
+ * Uses conservative checks to avoid false negatives on Wine/Linux. */
 static BOOL IsSocketAlive(SOCKET sock)
 {
-    char buf;
-    int result;
-    fd_set readfds;
-    struct timeval tv;
+    int optval;
+    int optlen = sizeof(optval);
     
     if (sock == INVALID_SOCKET) return FALSE;
     
-    /* Use select with 0 timeout to check socket state without blocking */
-    FD_ZERO(&readfds);
-    FD_SET(sock, &readfds);
-    tv.tv_sec = 0;
-    tv.tv_usec = 0;
-    
-    result = select(0, &readfds, NULL, NULL, &tv);
-    
-    if (result == SOCKET_ERROR) {
-        return FALSE;  /* Socket error - dead */
+    /* Check socket error status - most reliable cross-platform method */
+    if (getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&optval, &optlen) == SOCKET_ERROR) {
+        return FALSE;  /* Cannot query socket - probably dead */
     }
     
-    if (result > 0) {
-        /* Data available - try to peek without removing from buffer */
-        result = recv(sock, &buf, 1, MSG_PEEK);
-        if (result == 0) {
-            return FALSE;  /* Connection closed gracefully */
-        }
-        if (result == SOCKET_ERROR) {
-            int err = WSAGetLastError();
-            if (err != WSAEWOULDBLOCK) {
-                return FALSE;  /* Real error - dead */
-            }
-        }
+    if (optval != 0) {
+        return FALSE;  /* Socket has error pending - dead */
     }
     
-    return TRUE;  /* Socket appears alive */
+    /* Socket appears healthy */
+    return TRUE;
 }
 
 /* Remove stale connections with same clientId (for reconnection handling) 
- * IMPORTANT: Only protect PAIRED connections if socket is still alive!
- * Returns TRUE if ID is available for registration, FALSE if already paired */
+ * IMPORTANT: Protect PAIRED connections always, REGISTERED with timeout.
+ * Dead sockets will be cleaned up naturally when recv() fails.
+ * Returns TRUE if ID is available for registration, FALSE if already in use */
 static BOOL RemoveStaleConnections(PRELAY_SERVER pServer, DWORD clientId, PRELAY_CONNECTION pExclude)
 {
     DWORD i;
     BOOL bIdAvailable = TRUE;
+    DWORD currentTime = GetTickCount();
+    
+    /* Short timeout for registered connections (5 seconds).
+     * This allows legitimate reconnections while preventing rapid loops.
+     * Dead sockets are detected when recv() fails, which triggers cleanup. */
+    #define REGISTERED_TIMEOUT_MS 5000
     
     if (!pServer) return FALSE;
     
@@ -210,57 +201,36 @@ static BOOL RemoveStaleConnections(PRELAY_SERVER pServer, DWORD clientId, PRELAY
     for (i = 0; i < pServer->maxConnections; i++) {
         PRELAY_CONNECTION pConn = pServer->connections[i];
         if (pConn && pConn != pExclude && pConn->clientId == clientId) {
+            char idStr[20];
+            DWORD idleTime;
+            FormatClientId(clientId, idStr);
             
-            /* For PAIRED connections, check if socket is actually still alive */
+            /* Check how long since last activity */
+            idleTime = currentTime - pConn->lastActivity;
+            
+            /* PAIRED connections - always protect, never kick out */
             if (pConn->state == RELAY_STATE_PAIRED) {
-                char idStr[20];
-                FormatClientId(clientId, idStr);
-                
-                /* Check if socket is dead - if so, clean it up! */
-                if (!IsSocketAlive(pConn->socket)) {
-                    RelayLog("[CLEANUP] PAIRED connection for ID %s has dead socket - allowing reconnect\r\n", idStr);
-                    
-                    /* Notify partner that their partner disconnected */
-                    if (pConn->pPartner && pConn->pPartner->socket != INVALID_SOCKET) {
-                        RELAY_PARTNER_DISCONNECTED notification;
-                        notification.reason = RELAY_DISCONNECT_PARTNER_LEFT;
-                        notification.partnerId = pConn->clientId;
-                        SendRelayPacket(pConn->pPartner->socket, RELAY_MSG_PARTNER_DISCONNECTED,
-                                       (const BYTE*)&notification, sizeof(notification));
-                        pConn->pPartner->pPartner = NULL;
-                        pConn->pPartner->state = RELAY_STATE_REGISTERED;
-                    }
-                    
-                    /* Clean up the dead connection */
-                    if (pConn->hDisconnectEvent) SetEvent(pConn->hDisconnectEvent);
-                    if (pConn->socket != INVALID_SOCKET) {
-                        closesocket(pConn->socket);
-                        pConn->socket = INVALID_SOCKET;
-                    }
-                    pConn->state = RELAY_STATE_DISCONNECTED;
-                    pServer->connections[i] = NULL;
-                    if (pServer->activeConnections > 0) pServer->activeConnections--;
-                    continue;  /* Allow new registration */
-                }
-                
-                /* Socket is alive - protect this active session */
-                RelayLog("[PROTECT] ID %s is already in active session (PAIRED) - blocking duplicate\r\n", idStr);
+                RelayLog("[PROTECT] ID %s is in active session (PAIRED) - rejecting duplicate\r\n", idStr);
                 bIdAvailable = FALSE;
                 continue;
             }
             
-            /* Only remove truly stale connections:
-             * - DISCONNECTED (state=4): already dead
-             * - CONNECTED (state=0): never completed registration, zombie
-             * - REGISTERED (state=1): waiting but not paired, can be replaced */
-            
-            /* Found stale connection with same ID - mark for cleanup */
-            {
-                char idStr[20];
-                FormatClientId(clientId, idStr);
-                RelayLog("[CLEANUP] Removing stale connection for ID %s (state=%d)\r\n", 
-                        idStr, pConn->state);
+            /* REGISTERED connections - protect unless timed out */
+            if (pConn->state == RELAY_STATE_REGISTERED) {
+                if (idleTime < REGISTERED_TIMEOUT_MS) {
+                    RelayLog("[PROTECT] ID %s is recently registered (%lu ms ago) - rejecting duplicate\r\n", 
+                            idStr, idleTime);
+                    bIdAvailable = FALSE;
+                    continue;
+                }
+                /* Timed out REGISTERED connection - allow removal */
+                RelayLog("[TIMEOUT] ID %s was REGISTERED but idle for %lu ms - allowing reconnect\r\n", 
+                        idStr, idleTime);
             }
+            
+            /* Remove: DISCONNECTED, CONNECTED(zombie), or timed-out REGISTERED */
+            RelayLog("[CLEANUP] Removing connection for ID %s (state=%d, idle=%lu ms)\r\n", 
+                    idStr, pConn->state, idleTime);
             
             /* Signal disconnect and close socket */
             if (pConn->hDisconnectEvent) {
@@ -277,14 +247,13 @@ static BOOL RemoveStaleConnections(PRELAY_SERVER pServer, DWORD clientId, PRELAY
             if (pServer->activeConnections > 0) {
                 pServer->activeConnections--;
             }
-            
-            /* Note: Connection struct will be freed by its worker thread or leaked
-             * if thread already exited. For a proper fix, we'd need reference counting. */
         }
     }
     
     LeaveCriticalSection(&pServer->csConnections);
     return bIdAvailable;
+    
+    #undef REGISTERED_TIMEOUT_MS
 }
 
 /* Configure client socket for optimal relay performance */
