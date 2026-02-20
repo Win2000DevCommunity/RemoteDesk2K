@@ -880,6 +880,17 @@ void ConnectToRelayServer(void)
     SetWindowTextA(g_hRelayConnectSvrBtn, "Connecting...");
     EnableWindow(g_hRelayConnectSvrBtn, FALSE);
     
+    /* Regenerate ID in case network changed since startup */
+    {
+        DWORD newId = GenerateUniqueId();
+        if (newId != g_myId && newId != 0x7F000001) {
+            char idStr[32];
+            g_myId = newId;
+            FormatId(g_myId, idStr);
+            SetWindowTextA(g_hYourId, idStr);
+        }
+    }
+    
     EnterCriticalSection(&g_csRelay);
     
     /* Close any existing relay connection */
@@ -1280,6 +1291,17 @@ BOOL AttemptRelayReconnection(void)
 {
     int result;
     SOCKET relaySocket = INVALID_SOCKET;
+    
+    /* Regenerate ID in case network changed */
+    {
+        DWORD newId = GenerateUniqueId();
+        if (newId != g_myId && newId != 0x7F000001) {
+            char idStr[32];
+            g_myId = newId;
+            FormatId(g_myId, idStr);
+            SetWindowTextA(g_hYourId, idStr);
+        }
+    }
     
     /* Try to connect to relay server */
     result = Relay_ConnectToServer(g_szRelayServerIp, g_wRelayServerPort, g_myId, &relaySocket);
@@ -1831,8 +1853,13 @@ void ProcessServerNetwork(void)
     
     if (!g_pServerNet) return;
     
-    /* Check for incoming relay connection (when connected to relay server) */
-    if (!g_bClientConnected && g_bConnectedToRelay && g_relaySocket != INVALID_SOCKET) {
+    /* Check for incoming relay connection (when connected to relay server)
+     * IMPORTANT: Don't process relay data while we're connecting as viewer
+     * or while we're actively connected as viewer - the relay socket is shared!
+     * g_bConnecting: connection in progress (background thread using socket)
+     * g_bClientConnected2: actively viewing remote (viewer using socket for screen data) */
+    if (!g_bClientConnected && !g_bConnecting && !g_bClientConnected2 && 
+        g_bConnectedToRelay && g_relaySocket != INVALID_SOCKET) {
         FD_ZERO(&readSet);
         FD_SET(g_relaySocket, &readSet);
         timeout.tv_sec = 0;

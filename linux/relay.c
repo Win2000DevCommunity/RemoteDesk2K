@@ -7,6 +7,10 @@
 
 #include "common.h"
 #include "crypto.h"
+#include <netinet/tcp.h>
+
+/* Inactivity timeout - disconnect clients that don't send any data */
+#define CLIENT_INACTIVITY_TIMEOUT_MS  60000  /* 60 seconds */
 
 /* ============================================================
  * LOGGING
@@ -271,8 +275,17 @@ static void ConfigureClientSocket(SOCKET sock)
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &opt, sizeof(opt));
     setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &opt, sizeof(opt));
     
+    /* Enable keep-alive with aggressive settings */
     opt = 1;
     setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
+    
+    /* TCP keepalive: start probing after 30s, probe every 5s, fail after 3 probes */
+    opt = 30;
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &opt, sizeof(opt));
+    opt = 5;
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &opt, sizeof(opt));
+    opt = 3;
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &opt, sizeof(opt));
 }
 
 static RELAY_CONNECTION* AddConnection(RELAY_SERVER *pServer, SOCKET sock)
@@ -525,14 +538,32 @@ static void* ClientWorkerThread(void *arg)
     
     RelayLog("[INFO] Client worker thread started\n");
     
+    /* Initialize last activity time for timeout tracking */
+    pConn->lastActivity = GetTickCount();
+    
     while (pConn->state != RELAY_STATE_DISCONNECTED && pServer->bRunning && !pConn->shouldStop) {
         RELAY_HEADER header;
         DWORD totalPacketSize;
         int recvLen;
+        DWORD currentTime;
+        DWORD inactiveTime;
         
         recvLen = RecvExact(pConn->socket, (BYTE*)&header, sizeof(RELAY_HEADER), 1000);
         
-        if (recvLen == 0) continue;
+        if (recvLen == 0) {
+            /* Timeout with no data - check for inactivity timeout */
+            currentTime = GetTickCount();
+            inactiveTime = currentTime - pConn->lastActivity;
+            
+            if (inactiveTime > CLIENT_INACTIVITY_TIMEOUT_MS) {
+                char idStr[20];
+                FormatClientId(pConn->clientId, idStr);
+                RelayLog("[TIMEOUT] Client %s inactive for %u ms - disconnecting\n", 
+                        idStr, inactiveTime);
+                break;
+            }
+            continue;
+        }
         if (recvLen < 0) break;
         if (recvLen < (int)sizeof(RELAY_HEADER)) break;
         

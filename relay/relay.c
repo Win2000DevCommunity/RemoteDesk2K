@@ -7,6 +7,20 @@
 #include "relay.h"
 #include "crypto.h"
 
+/* TCP keepalive structure for SIO_KEEPALIVE_VALS (not in old SDK headers) */
+#ifndef SIO_KEEPALIVE_VALS
+#define SIO_KEEPALIVE_VALS _WSAIOW(IOC_VENDOR, 4)
+#endif
+
+struct tcp_keepalive {
+    u_long onoff;
+    u_long keepalivetime;
+    u_long keepaliveinterval;
+};
+
+/* Inactivity timeout - disconnect clients that don't send any data */
+#define CLIENT_INACTIVITY_TIMEOUT_MS  60000  /* 60 seconds */
+
 /* Logging callback for GUI console output */
 typedef void (*RELAY_LOG_CALLBACK)(const char* message);
 static RELAY_LOG_CALLBACK g_pfnLogCallback = NULL;
@@ -260,6 +274,8 @@ static BOOL RemoveStaleConnections(PRELAY_SERVER pServer, DWORD clientId, PRELAY
 static void ConfigureClientSocket(SOCKET sock)
 {
     int opt;
+    struct tcp_keepalive keepalive;
+    DWORD bytesReturned;
     
     /* Disable Nagle's algorithm for lower latency */
     opt = 1;
@@ -270,9 +286,16 @@ static void ConfigureClientSocket(SOCKET sock)
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char*)&opt, sizeof(opt));
     setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char*)&opt, sizeof(opt));
     
-    /* Enable keep-alive */
+    /* Enable keep-alive with aggressive settings */
     opt = 1;
     setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (const char*)&opt, sizeof(opt));
+    
+    /* Configure keepalive: probe after 30s, interval 5s (detect dead connection in ~45s) */
+    keepalive.onoff = 1;
+    keepalive.keepalivetime = 30000;    /* 30 seconds before first probe */
+    keepalive.keepaliveinterval = 5000; /* 5 seconds between probes */
+    WSAIoctl(sock, SIO_KEEPALIVE_VALS, &keepalive, sizeof(keepalive),
+             NULL, 0, &bytesReturned, NULL, NULL);
 }
 
 /* Add a new connection to the server */
@@ -597,11 +620,16 @@ static DWORD WINAPI ClientWorkerThread(LPVOID lpParam)
     
     RelayLog("[INFO] Client worker thread started for socket %d\r\n", (int)pConn->socket);
     
+    /* Initialize last activity time for timeout tracking */
+    pConn->lastActivity = GetTickCount();
+    
     /* Connection loop - proper TCP stream handling */
     while (pConn->state != RELAY_STATE_DISCONNECTED && pServer->bRunning) {
         RELAY_HEADER header;
         DWORD totalPacketSize;
         int recvLen;
+        DWORD currentTime;
+        DWORD inactiveTime;
         
         /* Check for disconnect event (non-blocking) */
         if (WaitForSingleObject(pConn->hDisconnectEvent, 0) == WAIT_OBJECT_0) {
@@ -613,7 +641,17 @@ static DWORD WINAPI ClientWorkerThread(LPVOID lpParam)
         recvLen = RecvExact(pConn->socket, (BYTE*)&header, sizeof(RELAY_HEADER), 1000);
         
         if (recvLen == 0) {
-            /* Timeout with no data - just loop and check disconnect event */
+            /* Timeout with no data - check for inactivity timeout */
+            currentTime = GetTickCount();
+            inactiveTime = currentTime - pConn->lastActivity;
+            
+            if (inactiveTime > CLIENT_INACTIVITY_TIMEOUT_MS) {
+                char idStr[20];
+                FormatClientId(pConn->clientId, idStr);
+                RelayLog("[TIMEOUT] Client %s inactive for %lu ms - disconnecting\r\n", 
+                        idStr, inactiveTime);
+                break;
+            }
             continue;
         }
         
