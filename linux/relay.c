@@ -629,6 +629,10 @@ static void* ClientWorkerThread(void *arg)
         pConn->recvBuffer = NULL;
     }
     
+    /* Free the connection struct to prevent memory leak.
+     * Thread is detached so no join needed. */
+    free(pConn);
+    
     return NULL;
 }
 
