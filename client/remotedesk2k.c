@@ -1448,12 +1448,27 @@ void HandlePartnerDisconnect(BOOL isServerSide)
     if (isServerSide) {
         g_bClientConnected = FALSE;
         if (g_pServerNet) {
+            /* IMPORTANT: Detach relay socket before disconnect to preserve relay connection!
+             * The relay socket is shared (g_relaySocket) and should NOT be closed here.
+             * Only the partner session is ending, not the relay server connection. */
+            if (g_pServerNet->bRelayMode && g_pServerNet->relaySocket == g_relaySocket) {
+                g_pServerNet->relaySocket = INVALID_SOCKET;
+                g_pServerNet->socket = INVALID_SOCKET;  /* Also shared */
+                g_pServerNet->bRelayMode = FALSE;
+            }
             Network_Disconnect(g_pServerNet);
             Network_Listen(g_pServerNet);
         }
     } else {
         g_bClientConnected2 = FALSE;
         if (g_pClientNet) {
+            /* IMPORTANT: Detach relay socket before destroy to preserve relay connection!
+             * The relay socket is shared (g_relaySocket) and should NOT be closed here.
+             * Only the partner session is ending, not the relay server connection. */
+            if (g_pClientNet->bRelayMode && g_pClientNet->relaySocket == g_relaySocket) {
+                g_pClientNet->relaySocket = INVALID_SOCKET;
+                g_pClientNet->bRelayMode = FALSE;
+            }
             Network_Destroy(g_pClientNet);
             g_pClientNet = NULL;
         }
@@ -2025,6 +2040,12 @@ void ProcessServerNetwork(void)
                 }
                 /* Direct connection or other error - connection lost */
                 g_bClientConnected = FALSE;
+                /* Detach relay socket before disconnect to preserve relay connection */
+                if (g_pServerNet->bRelayMode && g_pServerNet->relaySocket == g_relaySocket) {
+                    g_pServerNet->relaySocket = INVALID_SOCKET;
+                    g_pServerNet->socket = INVALID_SOCKET;
+                    g_pServerNet->bRelayMode = FALSE;
+                }
                 Network_Disconnect(g_pServerNet);
                 Network_Listen(g_pServerNet);
                 KillTimer(g_hMainWnd, TIMER_SCREEN);
@@ -2102,6 +2123,12 @@ void ProcessServerNetwork(void)
                 
                 case MSG_DISCONNECT:
                     g_bClientConnected = FALSE;
+                    /* Detach relay socket before disconnect to preserve relay connection */
+                    if (g_pServerNet->bRelayMode && g_pServerNet->relaySocket == g_relaySocket) {
+                        g_pServerNet->relaySocket = INVALID_SOCKET;
+                        g_pServerNet->socket = INVALID_SOCKET;
+                        g_pServerNet->bRelayMode = FALSE;
+                    }
                     Network_Disconnect(g_pServerNet);
                     Network_Listen(g_pServerNet);
                     KillTimer(g_hMainWnd, TIMER_SCREEN);
@@ -2295,6 +2322,15 @@ void DisconnectFromPartner(void)
     if (g_pClientNet) {
         wasRelayMode = g_pClientNet->bRelayMode;
         Network_SendPacket(g_pClientNet, MSG_DISCONNECT, NULL, 0);
+        
+        /* IMPORTANT: Detach relay socket before destroy to preserve relay connection!
+         * The relay socket is shared (g_relaySocket) and should NOT be closed here.
+         * Only the partner session is ending, not the relay server connection. */
+        if (g_pClientNet->bRelayMode && g_pClientNet->relaySocket == g_relaySocket) {
+            g_pClientNet->relaySocket = INVALID_SOCKET;
+            g_pClientNet->bRelayMode = FALSE;
+        }
+        
         Network_Destroy(g_pClientNet);
         g_pClientNet = NULL;
     }

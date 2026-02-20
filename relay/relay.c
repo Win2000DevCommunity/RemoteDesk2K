@@ -777,8 +777,13 @@ static DWORD WINAPI ClientWorkerThread(LPVOID lpParam)
             CloseHandle(pConn->hDisconnectEvent);
             pConn->hDisconnectEvent = NULL;
         }
-        /* Note: Don't free pConn here - the thread handle is still in use.
-         * The connection struct will be cleaned up when server stops. */
+        /* Close thread handle (safe from within the thread - just releases reference).
+         * Then free the connection struct to prevent memory leak. */
+        if (pConn->hThread) {
+            CloseHandle(pConn->hThread);
+            pConn->hThread = NULL;
+        }
+        free(pConn);
     }
     
     return 0;
