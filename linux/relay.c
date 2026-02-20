@@ -452,23 +452,52 @@ static int ProcessRelayMessage(RELAY_SERVER *pServer, RELAY_CONNECTION *pConn,
         }
         
         case RELAY_MSG_DATA: {
+            DWORD now = GetTickCount();
             if (pConn->pPartner && pConn->pPartner->socket != INVALID_SOCKET) {
                 SendRelayPacket(pConn->pPartner->socket, RELAY_MSG_DATA,
                                buffer + sizeof(RELAY_HEADER), header.dataLength);
+                /* Update BOTH partners' activity - CRITICAL for preventing timeout */
+                pConn->pPartner->lastActivity = now;
             }
-            pConn->lastActivity = GetTickCount();
+            pConn->lastActivity = now;
             return 0;
         }
         
         case RELAY_MSG_DISCONNECT: {
             char idStr[20];
+            char partnerIdStr[20];
             FormatClientId(pConn->clientId, idStr);
-            RelayLog("[DISCONNECT] Client %s disconnected\n", idStr);
+            RelayLog("[DISCONNECT] Client %s requested disconnect\n", idStr);
+            
+            /* Mark this client as disconnected */
             pConn->state = RELAY_STATE_DISCONNECTED;
+            
+            /* If has partner, notify and disconnect partner too */
             if (pConn->pPartner) {
-                pConn->pPartner->state = RELAY_STATE_DISCONNECTED;
-                pConn->pPartner->pPartner = NULL;
+                CONNECTION *pPartner = pConn->pPartner;
+                FormatClientId(pPartner->clientId, partnerIdStr);
+                
+                /* Notify partner that session ended */
+                if (pPartner->socket != INVALID_SOCKET) {
+                    SendRelayPacket(pPartner->socket, RELAY_MSG_PARTNER_DISCONNECTED, NULL, 0);
+                    RelayLog("[DISCONNECT] Sent PARTNER_DISCONNECTED to %s\n", partnerIdStr);
+                }
+                
+                /* Signal partner's disconnect event (if using threaded mode) */
+                if (pPartner->hDisconnectEvent) {
+                    pthread_cond_signal(pPartner->hDisconnectEvent);
+                }
+                
+                /* Mark partner as disconnected */
+                pPartner->state = RELAY_STATE_DISCONNECTED;
+                
+                /* Clear partner linkage */
+                pPartner->pPartner = NULL;
+                pConn->pPartner = NULL;
+                
+                RelayLog("[DISCONNECT] Session %s <-> %s terminated\n", idStr, partnerIdStr);
             }
+            
             return 1;
         }
         

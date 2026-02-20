@@ -1337,22 +1337,16 @@ BOOL AttemptRelayReconnection(void)
 /* Handle relay server connection lost */
 void HandleRelayServerLost(void)
 {
-    int attempt;
-    char msg[256];
-    BOOL reconnected = FALSE;
-    
-    /* IMPORTANT: Prevent re-entry while already reconnecting */
+    /* Prevent re-entry */
     if (g_bReconnecting) {
         return;
     }
-    
-    /* Set flag FIRST to prevent re-entry */
     g_bReconnecting = TRUE;
     
     /* Cancel any pending file transfer */
     FileTransfer_Cancel();
     
-    /* Stop all timers IMMEDIATELY */
+    /* Stop all timers */
     KillTimer(g_hMainWnd, TIMER_NETWORK);
     KillTimer(g_hMainWnd, TIMER_PING);
     KillTimer(g_hMainWnd, TIMER_RELAY_CHECK);
@@ -1370,7 +1364,7 @@ void HandleRelayServerLost(void)
     /* Close viewer window */
     DestroyViewerWindow();
     
-    /* Close existing relay socket */
+    /* Close relay socket */
     EnterCriticalSection(&g_csRelay);
     if (g_relaySocket != INVALID_SOCKET) {
         closesocket(g_relaySocket);
@@ -1379,56 +1373,20 @@ void HandleRelayServerLost(void)
     g_bConnectedToRelay = FALSE;
     LeaveCriticalSection(&g_csRelay);
     
-    /* Start reconnection attempts */
-    UpdateStatusBar("Relay server lost - reconnecting...", FALSE);
-    
-    for (attempt = 1; attempt <= RECONNECT_MAX_ATTEMPTS; attempt++) {
-        sprintf(msg, "Reconnecting... Attempt %d of %d", attempt, RECONNECT_MAX_ATTEMPTS);
-        UpdateStatusBar(msg, FALSE);
-        
-        /* Try to reconnect */
-        if (AttemptRelayReconnection()) {
-            reconnected = TRUE;
-            break;
-        }
-        
-        /* Wait before next attempt - but check if app is closing */
-        if (attempt < RECONNECT_MAX_ATTEMPTS) {
-            Sleep(RECONNECT_DELAY_MS);
-        }
-    }
-    
     g_bReconnecting = FALSE;
     
-    if (reconnected) {
-        /* Successfully reconnected to relay server */
-        UpdateStatusBar("Reconnected to relay server", TRUE);
-        SetWindowTextA(g_hRelayConnectSvrBtn, "Disconnect Server");
-        EnableWindow(g_hRelayConnectSvrBtn, TRUE);
-        EnableWindow(g_hRelayConnectPartnerBtn, TRUE);
-        
-        /* Restart relay health check timer */
-        SetTimer(g_hMainWnd, TIMER_RELAY_CHECK, RELAY_CHECK_INTERVAL, NULL);
-        
-        /* Show ONE message - only if partner was connected */
-        MessageBoxA(g_hMainWnd, 
-                   "Reconnected to relay server.\n\n"
-                   "Note: Your partner connection was lost.\n"
-                   "You need to reconnect to your partner.",
-                   APP_TITLE, MB_ICONINFORMATION);
-    } else {
-        /* Failed to reconnect after all attempts */
-        DisconnectFromRelayServer(TRUE);
-        UpdateStatusBar("Failed to reconnect to relay", FALSE);
-        
-        sprintf(msg, "Failed to reconnect to relay server after %d attempts.\n\n"
-                    "Please check:\n"
-                    "- Relay server is running\n"
-                    "- Network connection\n"
-                    "- Server IP and port",
-                RECONNECT_MAX_ATTEMPTS);
-        MessageBoxA(g_hMainWnd, msg, APP_TITLE, MB_ICONERROR);
-    }
+    /* Reset UI to disconnected state - NO auto-reconnect */
+    UpdateStatusBar("Relay server connection lost", FALSE);
+    SetWindowTextA(g_hRelayConnectSvrBtn, "Connect to Server");
+    EnableWindow(g_hRelayConnectSvrBtn, TRUE);
+    SetWindowTextA(g_hRelayConnectPartnerBtn, "Connect to Partner");
+    EnableWindow(g_hRelayConnectPartnerBtn, FALSE);
+    
+    /* Inform user - they must manually reconnect */
+    MessageBoxA(g_hMainWnd, 
+               "Connection to relay server was lost.\n\n"
+               "Click 'Connect to Server' to reconnect.",
+               APP_TITLE, MB_ICONWARNING);
 }
 
 /* Handle partner disconnect from relay */
@@ -1437,54 +1395,66 @@ void HandlePartnerDisconnect(BOOL isServerSide)
     /* Cancel any pending file transfer */
     FileTransfer_Cancel();
     
-    /* Stop network timers */
+    /* Stop all network timers */
     KillTimer(g_hMainWnd, TIMER_NETWORK);
     KillTimer(g_hMainWnd, TIMER_PING);
-    if (isServerSide) {
-        KillTimer(g_hMainWnd, TIMER_SCREEN);
+    KillTimer(g_hMainWnd, TIMER_SCREEN);
+    KillTimer(g_hMainWnd, TIMER_RELAY_CHECK);
+    
+    /* Mark all connections as ended */
+    g_bClientConnected = FALSE;
+    g_bClientConnected2 = FALSE;
+    
+    /* Cleanup network structures - detach relay socket first */
+    if (g_pServerNet) {
+        if (g_pServerNet->bRelayMode && g_pServerNet->relaySocket == g_relaySocket) {
+            g_pServerNet->relaySocket = INVALID_SOCKET;
+            g_pServerNet->socket = INVALID_SOCKET;
+            g_pServerNet->bRelayMode = FALSE;
+        }
+        Network_Disconnect(g_pServerNet);
     }
     
-    /* Mark connection state */
-    if (isServerSide) {
-        g_bClientConnected = FALSE;
-        if (g_pServerNet) {
-            /* IMPORTANT: Detach relay socket before disconnect to preserve relay connection!
-             * The relay socket is shared (g_relaySocket) and should NOT be closed here.
-             * Only the partner session is ending, not the relay server connection. */
-            if (g_pServerNet->bRelayMode && g_pServerNet->relaySocket == g_relaySocket) {
-                g_pServerNet->relaySocket = INVALID_SOCKET;
-                g_pServerNet->socket = INVALID_SOCKET;  /* Also shared */
-                g_pServerNet->bRelayMode = FALSE;
-            }
-            Network_Disconnect(g_pServerNet);
-            Network_Listen(g_pServerNet);
+    if (g_pClientNet) {
+        if (g_pClientNet->bRelayMode && g_pClientNet->relaySocket == g_relaySocket) {
+            g_pClientNet->relaySocket = INVALID_SOCKET;
+            g_pClientNet->bRelayMode = FALSE;
         }
-    } else {
-        g_bClientConnected2 = FALSE;
-        if (g_pClientNet) {
-            /* IMPORTANT: Detach relay socket before destroy to preserve relay connection!
-             * The relay socket is shared (g_relaySocket) and should NOT be closed here.
-             * Only the partner session is ending, not the relay server connection. */
-            if (g_pClientNet->bRelayMode && g_pClientNet->relaySocket == g_relaySocket) {
-                g_pClientNet->relaySocket = INVALID_SOCKET;
-                g_pClientNet->bRelayMode = FALSE;
-            }
-            Network_Destroy(g_pClientNet);
-            g_pClientNet = NULL;
-        }
-        DestroyViewerWindow();
+        Network_Destroy(g_pClientNet);
+        g_pClientNet = NULL;
     }
     
-    /* Update UI - still connected to relay, but partner is gone */
-    SetWindowTextA(g_hRelayConnectPartnerBtn, "Connect to Partner");
-    EnableWindow(g_hRelayConnectPartnerBtn, TRUE);
+    /* Destroy viewer window */
+    DestroyViewerWindow();
+    
+    /* CRITICAL: Fully disconnect from relay server!
+     * The server terminates BOTH clients when one disconnects.
+     * We must close our socket and reset state to "disconnected". */
+    EnterCriticalSection(&g_csRelay);
+    if (g_relaySocket != INVALID_SOCKET) {
+        closesocket(g_relaySocket);
+        g_relaySocket = INVALID_SOCKET;
+    }
+    g_bConnectedToRelay = FALSE;
+    LeaveCriticalSection(&g_csRelay);
+    
+    /* Update UI to fully disconnected state - user must click Connect again */
+    SetWindowTextA(g_hRelayConnectSvrBtn, "Connect to Server");
     EnableWindow(g_hRelayConnectSvrBtn, TRUE);
+    SetWindowTextA(g_hRelayConnectPartnerBtn, "Connect to Partner");
+    EnableWindow(g_hRelayConnectPartnerBtn, FALSE);  /* Can't connect partner without server */
     
-    UpdateStatusBar("Partner disconnected from relay", TRUE);
+    /* Also reset direct connection button */
+    SetWindowTextA(g_hConnectBtn, "Connect to partner");
+    EnableWindow(g_hConnectBtn, TRUE);
+    
+    UpdateStatusBar("Session ended - click Connect to reconnect", FALSE);
     MessageBoxA(g_hMainWnd, 
-               "Your partner has disconnected from the relay.\n\n"
-               "You are still connected to the relay server.\n"
-               "You can connect to a new partner.",
+               "The remote session has ended.\n\n"
+               "Possible causes:\n"
+               "- Your partner disconnected\n"
+               "- Network connection lost\n\n"
+               "Click 'Connect to Server' to reconnect.",
                APP_TITLE, MB_ICONINFORMATION);
 }
 
