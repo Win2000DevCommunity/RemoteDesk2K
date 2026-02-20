@@ -260,49 +260,20 @@ int Relay_WaitForConnection(SOCKET relaySocket, DWORD timeoutMs)
     return response.status;
 }
 
-/* Check if relay connection is still alive by trying to peek at socket */
+/* Send keepalive ping to relay to reset server's inactivity timer.
+ * Also checks if connection is still alive by sending actual data. */
 int Relay_CheckConnection(SOCKET relaySocket)
 {
-    fd_set readSet, errorSet;
-    struct timeval timeout;
     int result;
-    char buf;
-    int err;
     
     if (relaySocket == INVALID_SOCKET) return RD2K_ERR_SOCKET;
     
-    /* Check socket for errors */
-    FD_ZERO(&readSet);
-    FD_ZERO(&errorSet);
-    FD_SET(relaySocket, &readSet);
-    FD_SET(relaySocket, &errorSet);
-    
-    timeout.tv_sec = 0;
-    timeout.tv_usec = 0;
-    
-    result = select(0, &readSet, NULL, &errorSet, &timeout);
-    
-    if (result == SOCKET_ERROR) {
+    /* Send PING to relay server - this keeps the connection alive
+     * and resets the server's inactivity timer.
+     * Server will respond with PONG, but we don't wait for it. */
+    result = SendRelayPacket(relaySocket, RELAY_MSG_PING, NULL, 0);
+    if (result != RD2K_SUCCESS) {
         return RD2K_ERR_SERVER_LOST;
-    }
-    
-    /* Check if there's an error condition */
-    if (FD_ISSET(relaySocket, &errorSet)) {
-        return RD2K_ERR_SERVER_LOST;
-    }
-    
-    /* If readable, check if it's because connection closed (recv returns 0) */
-    if (FD_ISSET(relaySocket, &readSet)) {
-        result = recv(relaySocket, &buf, 1, MSG_PEEK);
-        if (result == 0) {
-            return RD2K_ERR_SERVER_LOST;  /* Connection closed */
-        }
-        if (result == SOCKET_ERROR) {
-            err = WSAGetLastError();
-            if (err != WSAEWOULDBLOCK) {
-                return RD2K_ERR_SERVER_LOST;
-            }
-        }
     }
     
     return RD2K_SUCCESS;

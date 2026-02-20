@@ -123,7 +123,7 @@ static char             g_szClientConfigPath[MAX_PATH] = {0};
 #define PING_INTERVAL           5000
 #define LISTEN_CHECK_INTERVAL   100
 #define TOOLBAR_HIDE_DELAY      3000
-#define RELAY_CHECK_INTERVAL    3000  /* Check relay connection every 3 seconds */
+#define RELAY_CHECK_INTERVAL    30000 /* Send relay keepalive every 30 seconds */
 
 /* Colors */
 #define COLOR_PANEL_BG          GetSysColor(COLOR_INFOBK)  /* Windows classic InfoBackground */
