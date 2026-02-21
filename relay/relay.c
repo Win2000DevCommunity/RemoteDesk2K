@@ -758,14 +758,16 @@ static DWORD WINAPI ClientWorkerThread(LPVOID lpParam)
             
             RelayLog("[NOTIFY] Sent disconnect notification to partner %s\r\n", partnerIdStr);
             
-            /* Signal partner's worker thread to check connection state */
+            /* Signal partner's worker thread to exit */
             if (pConn->pPartner->hDisconnectEvent) {
                 SetEvent(pConn->pPartner->hDisconnectEvent);
             }
             
-            /* Clear the partner's reference to us */
+            /* Clear the partner's reference to us and mark DISCONNECTED
+             * CRITICAL: Partner must be DISCONNECTED, not REGISTERED!
+             * This ensures their ID is cleaned up when they reconnect. */
             pConn->pPartner->pPartner = NULL;
-            pConn->pPartner->state = RELAY_STATE_REGISTERED;  /* Back to registered state */
+            pConn->pPartner->state = RELAY_STATE_DISCONNECTED;
         }
     }
     

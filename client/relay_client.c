@@ -279,6 +279,19 @@ int Relay_CheckConnection(SOCKET relaySocket)
     return RD2K_SUCCESS;
 }
 
+/* Send graceful disconnect message to relay server.
+ * MUST be called BEFORE closing the socket!
+ * This tells the server to immediately unregister our ID
+ * and properly terminate any session with our partner. */
+int Relay_SendDisconnect(SOCKET relaySocket)
+{
+    if (relaySocket == INVALID_SOCKET) return RD2K_ERR_SOCKET;
+    
+    /* Send DISCONNECT message - server will clean up our connection
+     * and notify our partner if we're in a session. */
+    return SendRelayPacket(relaySocket, RELAY_MSG_DISCONNECT, NULL, 0);
+}
+
 int Relay_SendData(SOCKET relaySocket, const BYTE *data, DWORD length)
 {
     if (relaySocket == INVALID_SOCKET) return RD2K_ERR_SOCKET;

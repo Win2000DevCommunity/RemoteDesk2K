@@ -1234,6 +1234,10 @@ void DisconnectFromRelayServer(BOOL silent)
     EnterCriticalSection(&g_csRelay);
     
     if (g_relaySocket != INVALID_SOCKET) {
+        /* CRITICAL: Send DISCONNECT message BEFORE closing socket!
+         * This tells the server to immediately unregister our ID
+         * and properly clean up any session with our partner. */
+        Relay_SendDisconnect(g_relaySocket);
         closesocket(g_relaySocket);
         g_relaySocket = INVALID_SOCKET;
     }

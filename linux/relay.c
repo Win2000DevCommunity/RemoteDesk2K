@@ -628,8 +628,14 @@ static void* ClientWorkerThread(void *arg)
             notification.partnerId = pConn->clientId;
             SendRelayPacket(pConn->pPartner->socket, RELAY_MSG_PARTNER_DISCONNECTED,
                            (const BYTE*)&notification, sizeof(notification));
+            /* Signal partner's disconnect event so their thread exits */
+            if (pConn->pPartner->hDisconnectEvent) {
+                pthread_cond_signal(pConn->pPartner->hDisconnectEvent);
+            }
             pConn->pPartner->pPartner = NULL;
-            pConn->pPartner->state = RELAY_STATE_REGISTERED;
+            /* CRITICAL: Set to DISCONNECTED, not REGISTERED!
+             * This ensures ID is cleaned up when they reconnect. */
+            pConn->pPartner->state = RELAY_STATE_DISCONNECTED;
         }
     }
     

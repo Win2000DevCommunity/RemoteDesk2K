@@ -183,6 +183,12 @@ int Relay_SendData(SOCKET relaySocket, const BYTE *data, DWORD length);
    Returns: RD2K_SUCCESS = connected, RD2K_ERR_SERVER_LOST = disconnected */
 int Relay_CheckConnection(SOCKET relaySocket);
 
+/* Send graceful disconnect to relay server (MUST call before closesocket!)
+   - relaySocket: Socket to relay server
+   This cleans up your ID from the server immediately.
+   Returns: RD2K_SUCCESS = sent, error otherwise */
+int Relay_SendDisconnect(SOCKET relaySocket);
+
 /* Receive data through relay tunnel (non-blocking or timeout)
    - relaySocket: Socket to relay server
    - buffer: Buffer to receive data
