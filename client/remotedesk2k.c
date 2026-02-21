@@ -1862,6 +1862,13 @@ void ProcessServerNetwork(void)
              */
             recvLen = Relay_RecvData(g_relaySocket, headerBuf, sizeof(RD2K_HEADER), 500);
             
+            /* CRITICAL: Handle disconnect/server lost BEFORE checking for handshake!
+             * Without this, client UI doesn't update when session ends. */
+            if (recvLen == RD2K_ERR_PARTNER_LEFT || recvLen == RD2K_ERR_SERVER_LOST) {
+                HandlePartnerDisconnect(TRUE);
+                return;
+            }
+            
             if (recvLen == sizeof(RD2K_HEADER)) {
                 CopyMemory(&header, headerBuf, sizeof(RD2K_HEADER));
                 
@@ -1869,6 +1876,12 @@ void ProcessServerNetwork(void)
                     /* Now receive the handshake data (comes in second relay packet) */
                     recvLen = Relay_RecvData(g_relaySocket, g_pServerNet->recvBuffer, 
                                             header.dataLength, 2000);
+                    
+                    /* Handle disconnect during handshake */
+                    if (recvLen == RD2K_ERR_PARTNER_LEFT || recvLen == RD2K_ERR_SERVER_LOST) {
+                        HandlePartnerDisconnect(TRUE);
+                        return;
+                    }
                     
                     if (recvLen == (int)header.dataLength) {
                         RD2K_HANDSHAKE *pHandshake = (RD2K_HANDSHAKE*)g_pServerNet->recvBuffer;

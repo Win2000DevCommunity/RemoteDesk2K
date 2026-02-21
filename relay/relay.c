@@ -19,7 +19,7 @@ struct tcp_keepalive {
 };
 
 /* Inactivity timeout - disconnect clients that don't send any data */
-#define CLIENT_INACTIVITY_TIMEOUT_MS  60000  /* 60 seconds */
+#define CLIENT_INACTIVITY_TIMEOUT_MS  5000  /* 5 seconds - fast timeout for relay */
 
 /* Logging callback for GUI console output */
 typedef void (*RELAY_LOG_CALLBACK)(const char* message);

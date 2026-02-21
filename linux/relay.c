@@ -10,7 +10,7 @@
 #include <netinet/tcp.h>
 
 /* Inactivity timeout - disconnect clients that don't send any data */
-#define CLIENT_INACTIVITY_TIMEOUT_MS  60000  /* 60 seconds */
+#define CLIENT_INACTIVITY_TIMEOUT_MS  5000  /* 5 seconds - fast timeout for relay */
 
 /* ============================================================
  * LOGGING
