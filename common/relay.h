@@ -28,6 +28,7 @@
 #define RELAY_MSG_PING              0x55    /* Keep-alive ping */
 #define RELAY_MSG_PONG              0x56    /* Keep-alive response */
 #define RELAY_MSG_PARTNER_DISCONNECTED 0x57 /* Partner has disconnected */
+#define RELAY_MSG_PARTNER_CONNECTED    0x59 /* Partner has connected to you */
 
 /* Relay protocol header for relay-specific messages */
 #pragma pack(push, 1)
@@ -79,6 +80,12 @@ typedef struct _RELAY_PARTNER_DISCONNECTED {
     DWORD   reason;         /* RELAY_DISCONNECT_* */
     DWORD   partnerId;      /* ID of partner that disconnected */
 } RELAY_PARTNER_DISCONNECTED, *PRELAY_PARTNER_DISCONNECTED;
+
+/* Partner connected notification - sent to "server" when "client" pairs with them */
+typedef struct _RELAY_PARTNER_CONNECTED {
+    DWORD   partnerId;      /* ID of partner that connected to you */
+    DWORD   reserved;
+} RELAY_PARTNER_CONNECTED, *PRELAY_PARTNER_CONNECTED;
 
 #pragma pack(pop)
 
@@ -188,6 +195,12 @@ int Relay_CheckConnection(SOCKET relaySocket);
    This cleans up your ID from the server immediately.
    Returns: RD2K_SUCCESS = sent, error otherwise */
 int Relay_SendDisconnect(SOCKET relaySocket);
+
+/* Check if a partner has connected to us (non-blocking poll)
+   - relaySocket: Socket to relay server
+   - pPartnerId: Output - partner's ID if connected
+   Returns: RD2K_SUCCESS if partner connected, 0 if no partner yet, negative on error */
+int Relay_CheckForPartner(SOCKET relaySocket, DWORD *pPartnerId);
 
 /* Receive data through relay tunnel (non-blocking or timeout)
    - relaySocket: Socket to relay server

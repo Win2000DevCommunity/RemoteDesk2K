@@ -222,42 +222,65 @@ int Relay_WaitForConnection(SOCKET relaySocket, DWORD timeoutMs)
     RELAY_HEADER header;
     RELAY_CONNECT_RESPONSE response;
     int result;
+    DWORD startTime = GetTickCount();
+    DWORD elapsed;
+    DWORD remainingMs;
     
     if (relaySocket == INVALID_SOCKET) return RD2K_ERR_SOCKET;
     
-    /* Wait for response */
-    result = WaitForSocketReady(relaySocket, FALSE, timeoutMs);
-    if (result <= 0) {
-        return RD2K_ERR_TIMEOUT;
+    /* Loop until we get CONNECT_RESPONSE or timeout */
+    while (1) {
+        elapsed = GetTickCount() - startTime;
+        if (elapsed >= timeoutMs) {
+            return RD2K_ERR_TIMEOUT;
+        }
+        remainingMs = timeoutMs - elapsed;
+        
+        /* Wait for data */
+        result = WaitForSocketReady(relaySocket, FALSE, remainingMs > 1000 ? 1000 : remainingMs);
+        if (result < 0) {
+            return RD2K_ERR_RECV;
+        }
+        if (result == 0) {
+            continue;  /* Timeout on this wait, try again */
+        }
+        
+        recvLen = recv(relaySocket, (char*)buffer, sizeof(buffer), 0);
+        if (recvLen == 0) {
+            return RD2K_ERR_SERVER_LOST;
+        }
+        if (recvLen == SOCKET_ERROR) {
+            int err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK) continue;
+            return RD2K_ERR_RECV;
+        }
+        
+        if (recvLen < (int)sizeof(RELAY_HEADER)) {
+            continue;  /* Incomplete packet, try again */
+        }
+        
+        CopyMemory(&header, buffer, sizeof(RELAY_HEADER));
+        
+        /* Decrypt if encrypted */
+        if ((header.flags & 0x01) && header.dataLength > 0 && 
+            recvLen >= (int)(sizeof(RELAY_HEADER) + header.dataLength)) {
+            Crypto_Decrypt(buffer + sizeof(RELAY_HEADER), header.dataLength);
+        }
+        
+        /* Skip non-CONNECT_RESPONSE messages (like PONG, PARTNER_DISCONNECTED, etc.) */
+        if (header.msgType != RELAY_MSG_CONNECT_RESPONSE) {
+            /* Just skip this message and continue waiting */
+            continue;
+        }
+        
+        /* Got CONNECT_RESPONSE! */
+        if (recvLen < (int)(sizeof(RELAY_HEADER) + sizeof(RELAY_CONNECT_RESPONSE))) {
+            return RD2K_ERR_PROTOCOL;
+        }
+        
+        CopyMemory(&response, buffer + sizeof(RELAY_HEADER), sizeof(RELAY_CONNECT_RESPONSE));
+        return response.status;
     }
-    
-    recvLen = recv(relaySocket, (char*)buffer, sizeof(buffer), 0);
-    if (recvLen == 0 || recvLen == SOCKET_ERROR) {
-        return RD2K_ERR_RECV;
-    }
-    
-    if (recvLen < sizeof(RELAY_HEADER)) {
-        return RD2K_ERR_PROTOCOL;
-    }
-    
-    CopyMemory(&header, buffer, sizeof(RELAY_HEADER));
-    
-    /* Decrypt if encrypted */
-    if ((header.flags & 0x01) && header.dataLength > 0) {
-        Crypto_Decrypt(buffer + sizeof(RELAY_HEADER), header.dataLength);
-    }
-    
-    if (header.msgType != RELAY_MSG_CONNECT_RESPONSE) {
-        return RD2K_ERR_PROTOCOL;
-    }
-    
-    if (recvLen < sizeof(RELAY_HEADER) + sizeof(RELAY_CONNECT_RESPONSE)) {
-        return RD2K_ERR_PROTOCOL;
-    }
-    
-    CopyMemory(&response, buffer + sizeof(RELAY_HEADER), sizeof(RELAY_CONNECT_RESPONSE));
-    
-    return response.status;
 }
 
 /* Send keepalive ping to relay to reset server's inactivity timer.
@@ -290,6 +313,79 @@ int Relay_SendDisconnect(SOCKET relaySocket)
     /* Send DISCONNECT message - server will clean up our connection
      * and notify our partner if we're in a session. */
     return SendRelayPacket(relaySocket, RELAY_MSG_DISCONNECT, NULL, 0);
+}
+
+/* Check if a partner has connected to us (non-blocking).
+ * Call this periodically when registered but not yet paired.
+ * Returns: partner ID if someone connected, 0 if no partner yet, negative on error */
+int Relay_CheckForPartner(SOCKET relaySocket, DWORD *pPartnerId)
+{
+    BYTE buffer[64];
+    RELAY_HEADER header;
+    RELAY_PARTNER_CONNECTED partnerConnected;
+    int result;
+    int recvLen;
+    
+    if (relaySocket == INVALID_SOCKET) return RD2K_ERR_SOCKET;
+    if (!pPartnerId) return RD2K_ERR_SOCKET;
+    
+    *pPartnerId = 0;
+    
+    /* Non-blocking check for data */
+    result = WaitForSocketReady(relaySocket, FALSE, 0);
+    if (result < 0) {
+        return RD2K_ERR_SERVER_LOST;
+    }
+    if (result == 0) {
+        return 0;  /* No data available - no partner yet */
+    }
+    
+    /* Data available - receive header */
+    recvLen = recv(relaySocket, (char*)buffer, sizeof(buffer), 0);
+    if (recvLen == 0) {
+        return RD2K_ERR_SERVER_LOST;  /* Server closed connection */
+    }
+    if (recvLen == SOCKET_ERROR) {
+        int err = WSAGetLastError();
+        if (err == WSAEWOULDBLOCK) {
+            return 0;  /* No data */
+        }
+        return RD2K_ERR_RECV;
+    }
+    
+    if (recvLen < (int)sizeof(RELAY_HEADER)) {
+        return 0;  /* Incomplete data, try again later */
+    }
+    
+    CopyMemory(&header, buffer, sizeof(RELAY_HEADER));
+    
+    /* Decrypt if encrypted */
+    if ((header.flags & 0x01) && header.dataLength > 0 && 
+        recvLen >= (int)(sizeof(RELAY_HEADER) + header.dataLength)) {
+        Crypto_Decrypt(buffer + sizeof(RELAY_HEADER), header.dataLength);
+    }
+    
+    /* Check for partner connected notification */
+    if (header.msgType == RELAY_MSG_PARTNER_CONNECTED) {
+        if (recvLen >= (int)(sizeof(RELAY_HEADER) + sizeof(RELAY_PARTNER_CONNECTED))) {
+            CopyMemory(&partnerConnected, buffer + sizeof(RELAY_HEADER), sizeof(partnerConnected));
+            *pPartnerId = partnerConnected.partnerId;
+            return RD2K_SUCCESS;  /* Partner connected! */
+        }
+    }
+    
+    /* Check for partner disconnected */
+    if (header.msgType == RELAY_MSG_PARTNER_DISCONNECTED) {
+        return RD2K_ERR_PARTNER_LEFT;
+    }
+    
+    /* Check for disconnect */
+    if (header.msgType == RELAY_MSG_DISCONNECT) {
+        return RD2K_ERR_SERVER_LOST;
+    }
+    
+    /* PONG or other message - ignore */
+    return 0;
 }
 
 int Relay_SendData(SOCKET relaySocket, const BYTE *data, DWORD length)

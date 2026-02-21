@@ -483,13 +483,28 @@ static int ProcessRelayMessage(PRELAY_SERVER pServer, PRELAY_CONNECTION pConn,
                         clientIdStr, partnerIdStr, pPartner->state);
             } else {
                 /* Partner available - Pair the connections */
+                RELAY_PARTNER_CONNECTED partnerNotify;
+                
                 pConn->pPartner = pPartner;
                 pPartner->pPartner = pConn;
                 pConn->state = RELAY_STATE_PAIRED;
                 pPartner->state = RELAY_STATE_PAIRED;
                 response.status = RD2K_SUCCESS;
+                
+                /* CRITICAL: Notify the partner that someone connected to them!
+                 * Without this, the partner doesn't know they're paired and
+                 * won't start the handshake → authentication fails! */
+                partnerNotify.partnerId = pConn->clientId;
+                partnerNotify.reserved = 0;
+                SendRelayPacket(pPartner->socket, RELAY_MSG_PARTNER_CONNECTED,
+                               (const BYTE*)&partnerNotify, sizeof(partnerNotify));
+                
+                /* Update partner's activity too */
+                pPartner->lastActivity = GetTickCount();
+                
                 RelayLog("[CONNECT] Client %s <-> Partner %s: PAIRED\r\n", 
                         clientIdStr, partnerIdStr);
+                RelayLog("[NOTIFY] Sent PARTNER_CONNECTED to %s\r\n", partnerIdStr);
             }
             
             /* Send response to requesting client */
