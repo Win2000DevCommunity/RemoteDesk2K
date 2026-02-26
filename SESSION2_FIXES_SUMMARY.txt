@@ -1,0 +1,320 @@
+================================================================================
+                    REMOTEDESK2K SESSION 2 BUG FIXES SUMMARY
+                              February 24, 2026
+================================================================================
+
+This document describes the bugs that prevented Session 2 from working after
+Session 1 ended, and the fixes applied to resolve them.
+
+================================================================================
+                              ISSUE #1
+    "Authentication failed" when reconnecting after Session 1 ends
+                    (both forced kill and normal disconnect)
+================================================================================
+
+SYMPTOM:
+--------
+- Session 1: Viewer connects to Server - works perfectly
+- Session 1 ends (viewer closes or disconnects)
+- Session 2: New viewer tries to connect to same Server
+- Result: "Authentication failed" error
+
+ROOT CAUSE:
+-----------
+When the viewer disconnected, the Server received MSG_DISCONNECT but the
+handler only cleared the g_bClientConnected flag. It did NOT clear the
+g_bClientConnected2 flag.
+
+The problem: ProcessServerNetwork() checks this condition before processing
+relay socket data:
+
+    if (!g_bConnecting && !g_bClientConnected2 && 
+        g_bConnectedToRelay && g_relaySocket != INVALID_SOCKET)
+
+When g_bClientConnected2 stayed TRUE after Session 1 ended, the Server
+NEVER checked the relay socket for Session 2's handshake packets!
+The new viewer's handshake was sitting in the socket buffer, unread,
+until it timed out = "Authentication failed".
+
+LOCATION OF BUG:
+----------------
+File: client/remotedesk2k.c
+Function: ProcessServerNetwork() - MSG_DISCONNECT handler (around line 2310)
+
+OLD CODE:
+---------
+    case MSG_DISCONNECT:
+        DebugLog("[PSN] Received MSG_DISCONNECT from partner\n");
+        g_bClientConnected = FALSE;
+        KillTimer(g_hMainWnd, TIMER_SCREEN);
+        UpdateStatusBar("Partner disconnected", TRUE);
+        break;
+
+FIX APPLIED:
+------------
+    case MSG_DISCONNECT:
+        DebugLog("[PSN] Received MSG_DISCONNECT from partner\n");
+        /* CRITICAL FIX: Use Session_OnPartnerLeft to properly clean up!
+         * This clears BOTH g_bClientConnected AND g_bClientConnected2,
+         * restarts timers, and transitions to REGISTERED state.
+         * Without this, g_bClientConnected2 stays TRUE and blocks
+         * relay socket checks for Session 2's handshake! */
+        Session_OnPartnerLeft(DISCONNECT_REASON_PARTNER_LEFT);
+        break;
+
+WHY THIS WORKS:
+---------------
+Session_OnPartnerLeft() is the proper cleanup function that:
+1. Clears g_bClientConnected = FALSE
+2. Clears g_bClientConnected2 = FALSE  <-- THE CRITICAL FIX
+3. Restarts the relay check timer
+4. Updates session state to REGISTERED
+5. Updates the status bar appropriately
+
+Now Session 2's handshake packets are properly received and processed.
+
+
+================================================================================
+                              ISSUE #2
+    Double Session_OnPartnerLeft calls causing state confusion
+================================================================================
+
+SYMPTOM:
+--------
+Debug logs showed Session_OnPartnerLeft being called TWICE on each disconnect:
+    [00:24:51.753] Session_OnPartnerLeft called, reason=1
+    [00:24:51.816] Session_OnPartnerLeft called, reason=1
+
+ROOT CAUSE:
+-----------
+When viewer disconnects, TWO messages arrive at the Server:
+1. MSG_DISCONNECT - Application-level message in DATA packet
+2. RELAY_MSG_PARTNER_DISCONNECTED - Relay control message
+
+Both triggered Session_OnPartnerLeft(), causing double processing.
+
+FIX APPLIED:
+------------
+File: client/session_manager.c
+Function: Session_OnPartnerLeft() (around line 552)
+
+Added a guard at the start of the function:
+
+    /* CRITICAL FIX: Ignore if already in correct state.
+     * This can happen when both MSG_DISCONNECT and RELAY_MSG_PARTNER_DISCONNECTED
+     * arrive - we only need to process the first one. */
+    if (oldState == SESSION_STATE_REGISTERED || oldState == SESSION_STATE_DISCONNECTED) {
+        SMDebugLog("PartnerLeft: IGNORED - already in state %d\n", oldState);
+        LeaveCriticalSection(&g_session.csSession);
+        return;
+    }
+
+Similar guard added to Session_OnServerLost() (around line 637).
+
+
+================================================================================
+                              ISSUE #3
+    "Relay connection timed out!" when disconnecting with button
+                        then trying to reconnect
+================================================================================
+
+SYMPTOM:
+--------
+- Session 1: Viewer connects to Server via relay - works
+- Viewer clicks "Disconnect" button (NOT force close)
+- Viewer tries to connect again (Session 2)
+- Result: "Relay connection timed out!" after 30 seconds
+
+RELAY LOG SHOWED:
+-----------------
+    [00:19:56] [UNPAIR] Client 200 193 033 033 ending session
+    [00:19:56] [SESSION] Client 200 193 033 033 disconnected   <-- WRONG!
+    [00:19:56] [DISCONNECT] Client connection closed           <-- WRONG!
+    [00:20:05] [REGISTER] Client 200 193 033 033 registered    <-- Had to re-register
+
+The viewer's relay connection was being CLOSED when they clicked Disconnect!
+They had to reconnect to the relay server before Session 2 could work.
+
+ROOT CAUSE:
+-----------
+The relay server's RELAY_MSG_UNPAIR handler was treating it as a full
+disconnect instead of just ending the pairing:
+
+File: relay/relay.c (Windows) and linux/relay.c (Linux)
+Function: ProcessRelayMessage() - RELAY_MSG_UNPAIR case
+
+OLD CODE:
+---------
+    /* Clear this client's references before destroying session */
+    pConn->pPartner = NULL;
+    pConn->pSession = NULL;
+    pConn->state = RELAY_STATE_DISCONNECTED;   <-- BUG: Disconnects client!
+    
+    ...
+    
+    RelayLog("[SESSION] Client %s disconnected\n", idStr);
+    return 1;  /* Signal disconnection - worker thread exits */  <-- BUG!
+
+FIX APPLIED:
+------------
+    /* Clear this client's references before destroying session */
+    pConn->pPartner = NULL;
+    pConn->pSession = NULL;
+    /* CRITICAL FIX: Keep client REGISTERED instead of disconnecting!
+     * This allows them to immediately connect to another partner
+     * without having to re-register with the relay server. */
+    pConn->state = RELAY_STATE_REGISTERED;     <-- FIX: Stay registered
+    pConn->lastActivity = GetTickCount();
+    
+    ...
+    
+    RelayLog("[SESSION] Client %s returned to REGISTERED (unpair)\n", idStr);
+    return 0;  /* Stay connected - keep processing messages */  <-- FIX!
+
+WHY THIS WORKS:
+---------------
+UNPAIR is meant to end the pairing session while keeping the client registered
+on the relay server. The fix:
+1. Sets state to REGISTERED (not DISCONNECTED)
+2. Returns 0 (keep processing) instead of 1 (exit worker thread)
+
+Now the viewer stays connected to relay after clicking Disconnect and can
+immediately connect to a new partner without the 30-second timeout.
+
+
+================================================================================
+                           FILES MODIFIED
+================================================================================
+
+1. RemoteDesk2K/client/remotedesk2k.c
+   - MSG_DISCONNECT handler: Call Session_OnPartnerLeft() instead of manual cleanup
+
+2. RemoteDesk2K/client/session_manager.c
+   - Session_OnPartnerLeft(): Added guard to ignore duplicate calls
+   - Session_OnServerLost(): Added guard to ignore duplicate calls
+
+3. RemoteDesk2K/relay/relay.c (Windows)
+   - RELAY_MSG_UNPAIR handler: Stay REGISTERED instead of disconnecting
+
+4. RemoteDesk2K/linux/relay.c (Linux)
+   - RELAY_MSG_UNPAIR handler: Stay REGISTERED instead of disconnecting
+
+
+================================================================================
+                         TESTING VERIFICATION
+================================================================================
+
+After applying all fixes:
+
+1. Session 1: Viewer connects to Server via relay - WORKS
+2. Session 1 ends (viewer clicks Disconnect)
+3. Session 2: Same viewer connects to Server again - WORKS (no timeout!)
+4. Session 2 ends (viewer force-closes process)
+5. Session 3: New viewer connects to Server - WORKS (no "auth failed"!)
+
+The relay server log now shows:
+    [00:24:50] [UNPAIR] Client ending session
+    [00:24:50] [SESSION] Partner returned to REGISTERED
+    [00:24:50] [SESSION] Client returned to REGISTERED (unpair)  <-- Stays connected!
+    [00:24:55] [CONNECT] NEW SESSION 2  <-- Immediate reconnect works!
+
+
+================================================================================
+                              END OF DOCUMENT
+================================================================================
+
+
+================================================================================
+                              ISSUE #4 (ADDED)
+    Connection drops with -4 error when screen is static (no changes)
+================================================================================
+
+SYMPTOM:
+--------
+- Viewer connects to Server via relay - works
+- User is idle (not moving mouse, screen not changing)
+- After ~30-60 seconds: -4 error (RD2K_ERR_RECV)
+- Connection dies, both sides disconnected
+
+DEBUG LOG SHOWED:
+-----------------
+    [09:29:56.979] Auth OK, sending handshake ACK
+    ... (68 seconds of no activity) ...
+    [09:31:04.652] Network_RecvPacket ERROR: result=-4
+
+ROOT CAUSE:
+-----------
+The relay server has a 30-second inactivity timeout for PAIRED connections:
+
+    #define ACTIVITY_TIMEOUT_MS     30000
+
+If no data flows for 30 seconds, the relay kills the connection.
+
+The problem:
+- Viewer sends MSG_PING every 5 seconds via TIMER_PING ✅
+- Server only sends screen data when screen CHANGES ❌
+- If screen is static, server sends nothing → relay times out
+
+FIX APPLIED:
+------------
+File: client/remotedesk2k.c
+
+1. Added server-side keepalive in TIMER_PING handler:
+
+    case TIMER_PING:
+        /* CRITICAL FIX: Both sides need to send keepalives! */
+        if (g_pClientNet && g_bClientConnected2) {
+            Network_SendPacket(g_pClientNet, MSG_PING, NULL, 0);  /* Viewer side */
+        }
+        /* Server side keepalive - keeps relay alive when screen is static */
+        if (g_bClientConnected && g_pServerNet) {
+            Network_SendPacket(g_pServerNet, MSG_PING, NULL, 0);  /* NEW! */
+        }
+        break;
+
+2. Start TIMER_PING when server accepts connection:
+
+    SetTimer(g_hMainWnd, TIMER_SCREEN, SCREEN_INTERVAL, NULL);
+    SetTimer(g_hMainWnd, TIMER_PING, PING_INTERVAL, NULL);  /* NEW! */
+
+3. Kill TIMER_PING in StopServer():
+
+    KillTimer(g_hMainWnd, TIMER_SCREEN);
+    KillTimer(g_hMainWnd, TIMER_NETWORK);
+    KillTimer(g_hMainWnd, TIMER_PING);  /* NEW! */
+
+WHY THIS WORKS:
+---------------
+Both viewer AND server now send MSG_PING every 5 seconds. This keeps
+the relay's lastActivity timestamp updated on both ends, preventing
+the 30-second inactivity timeout even when the screen is static.
+
+
+================================================================================
+                      COMPLETE LIST OF FILES MODIFIED
+================================================================================
+
+CLIENT (RemoteDesk2K\client):
+-----------------------------
+1. remotedesk2k.c
+   - MSG_DISCONNECT handler: Call Session_OnPartnerLeft() (Issue #1)
+   - TIMER_PING: Add server-side keepalive (Issue #4)
+   - SetTimer calls: Start TIMER_PING for server connections (Issue #4)
+   - StopServer(): Kill TIMER_PING (Issue #4)
+
+2. session_manager.c
+   - Session_OnPartnerLeft(): Added guard for duplicate calls (Issue #2)
+   - Session_OnServerLost(): Added guard for duplicate calls (Issue #2)
+
+RELAY SERVER (RemoteDesk2K\relay and RemoteDesk2K\linux):
+---------------------------------------------------------
+3. relay/relay.c (Windows)
+   - RELAY_MSG_UNPAIR handler: Stay REGISTERED instead of disconnecting (Issue #3)
+
+4. linux/relay.c (Linux)
+   - RELAY_MSG_UNPAIR handler: Stay REGISTERED instead of disconnecting (Issue #3)
+
+
+================================================================================
+                              END OF DOCUMENT
+================================================================================

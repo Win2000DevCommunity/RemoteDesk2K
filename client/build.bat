@@ -42,14 +42,14 @@ REM       relay.c is for RELAY SERVER only (built by build_relay.bat)
 echo Compiling source files...
 "%CL_PATH%" /nologo /O2 /W3 /D_WIN32_WINNT=0x0500 /DWINVER=0x0500 /D_WIN32_IE=0x0500 ^
    /I"..\common" /I"%DDK_PATH%\inc\crt" /I"%DDK_PATH%\inc\w2k" /I"%SDK_PATH%\Include" ^
-   /c ..\common\screen.c ..\common\network.c input.c remotedesk2k.c nogs.c server_config_tab.c clipboard.c filetransfer.c progress.c ..\common\crypto.c relay_client.c
+   /c ..\common\screen.c ..\common\network.c input.c remotedesk2k.c nogs.c server_config_tab.c clipboard.c filetransfer.c progress.c ..\common\crypto.c relay_client.c session_manager.c
 if errorlevel 1 goto :error
 
 REM Link all objects
 echo Linking RemoteDesk2K.exe...
 "%LINK_PATH%" /nologo /subsystem:windows ^
      /LIBPATH:"%SDK_PATH%\Lib" /LIBPATH:"%DDK_PATH%\lib\crt\i386" /LIBPATH:"%DDK_PATH%\lib\w2k\i386" ^
-     screen.obj network.obj input.obj remotedesk2k.obj nogs.obj server_config_tab.obj clipboard.obj filetransfer.obj progress.obj crypto.obj relay_client.obj ^
+     screen.obj network.obj input.obj remotedesk2k.obj nogs.obj server_config_tab.obj clipboard.obj filetransfer.obj progress.obj crypto.obj relay_client.obj session_manager.obj ^
      kernel32.lib user32.lib gdi32.lib ws2_32.lib comctl32.lib ^
      comdlg32.lib shell32.lib advapi32.lib ole32.lib oleaut32.lib ^
      /out:RemoteDesk2K.exe

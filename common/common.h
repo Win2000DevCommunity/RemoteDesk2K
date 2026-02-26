@@ -116,6 +116,7 @@
 #define RD2K_ERR_PARTNER_LEFT   -11 /* Partner disconnected from relay */
 #define RD2K_ERR_SERVER_LOST    -12 /* Relay server connection lost */
 #define RD2K_ERR_DUPLICATE_ID   -13 /* Your ID is already connected to server */
+#define RD2K_ERR_NO_DATA        -14 /* No app data available (relay control message received) */
 
 /* Reconnection settings */
 #define RECONNECT_MAX_ATTEMPTS  5

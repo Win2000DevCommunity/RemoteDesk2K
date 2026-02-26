@@ -15,7 +15,7 @@
 #define RELAY_DEFAULT_PORT          5900
 #define RELAY_MAX_CONNECTIONS       1024
 #define RELAY_CONNECTION_TIMEOUT    300000  /* 5 minutes in milliseconds */
-#define RELAY_BUFFER_SIZE           (64 * 1024)  /* 64 KB per connection */
+#define RELAY_BUFFER_SIZE           (512 * 1024)  /* 512 KB per connection - must handle large screen updates */
 #define RELAY_QUEUE_SIZE            16
 
 /* Relay protocol message types */
@@ -24,11 +24,12 @@
 #define RELAY_MSG_CONNECT_REQUEST   0x51    /* Request connection to partner (send partner ID) */
 #define RELAY_MSG_CONNECT_RESPONSE  0x52    /* Relay response: accepted/rejected */
 #define RELAY_MSG_DATA              0x53    /* Tunneled data from partner */
-#define RELAY_MSG_DISCONNECT        0x54    /* Graceful disconnect */
+#define RELAY_MSG_DISCONNECT        0x54    /* Graceful disconnect (close socket) */
 #define RELAY_MSG_PING              0x55    /* Keep-alive ping */
 #define RELAY_MSG_PONG              0x56    /* Keep-alive response */
 #define RELAY_MSG_PARTNER_DISCONNECTED 0x57 /* Partner has disconnected */
 #define RELAY_MSG_PARTNER_CONNECTED    0x59 /* Partner has connected to you */
+#define RELAY_MSG_UNPAIR            0x5A    /* End pairing but stay REGISTERED */
 
 /* Relay protocol header for relay-specific messages */
 #pragma pack(push, 1)
@@ -93,8 +94,36 @@ typedef struct _RELAY_PARTNER_CONNECTED {
 #define RELAY_STATE_CONNECTED       0    /* Socket connected to relay */
 #define RELAY_STATE_REGISTERED      1    /* Registered (ID known) */
 #define RELAY_STATE_WAITING         2    /* Waiting for partner */
-#define RELAY_STATE_PAIRED          3    /* Connected to partner */
+#define RELAY_STATE_PAIRED          3    /* Connected to partner (in session) */
 #define RELAY_STATE_DISCONNECTED    4    /* Disconnected */
+
+/* Session state machine */
+#define SESSION_STATE_EMPTY         0    /* No session */
+#define SESSION_STATE_ACTIVE        1    /* Both clients connected */
+#define SESSION_STATE_PARTIAL       2    /* One client disconnected, can rejoin anytime */
+#define SESSION_STATE_CLOSING       3    /* Both clients gone, cleanup pending */
+
+/* Session cleanup - only checks for empty sessions, no rejoin timeout */
+#define SESSION_CLEANUP_INTERVAL_MS 5000   /* Check every 5 seconds */
+
+/* Session structure - PRIMARY KEY for paired connections
+ * Sessions persist indefinitely while at least one client is connected.
+ * Clients can join/leave/rejoin freely without timeouts or restrictions. */
+typedef struct _RELAY_SESSION {
+    DWORD               sessionId;          /* Unique session identifier */
+    DWORD               state;              /* SESSION_STATE_* */
+    DWORD               clientId1;          /* First client's ID (server role) */
+    DWORD               clientId2;          /* Second client's ID (viewer role) */
+    struct _RELAY_CONNECTION* pClient1;     /* First client connection (may be NULL if disconnected) */
+    struct _RELAY_CONNECTION* pClient2;     /* Second client connection (may be NULL if disconnected) */
+    DWORD               createdTime;        /* When session was created */
+    DWORD               lastActivity;       /* Last activity timestamp */
+    DWORD               client1DisconnectTime;  /* When client1 left (0 if connected) */
+    DWORD               client2DisconnectTime;  /* When client2 left (0 if connected) */
+} RELAY_SESSION, *PRELAY_SESSION;
+
+/* Maximum number of concurrent sessions */
+#define RELAY_MAX_SESSIONS          512
 
 /* Relay server handle (opaque) */
 typedef struct _RELAY_SERVER* PRELAY_SERVER;
@@ -106,12 +135,15 @@ typedef struct _RELAY_CONNECTION {
     DWORD               state;              /* RELAY_STATE_* */
     HANDLE              hThread;            /* Worker thread handle */
     HANDLE              hDisconnectEvent;   /* Signal to stop worker thread */
-    struct _RELAY_CONNECTION* pPartner;     /* Paired connection (if any) */
+    struct _RELAY_CONNECTION* pPartner;     /* Paired connection (if any) - for quick data relay */
+    struct _RELAY_SESSION* pSession;        /* Session this connection belongs to (if PAIRED) */
     struct _RELAY_SERVER* pServer;          /* Parent server reference */
     BYTE*               recvBuffer;         /* Receive buffer */
     DWORD               recvBufferSize;
     DWORD               recvPos;            /* Current position in buffer */
     DWORD               lastActivity;       /* Timestamp of last activity */
+    DWORD               pendingKeepalive;   /* 1 if waiting for PONG response */
+    DWORD               lastKeepaliveSent;  /* When PING was sent (0 if none pending) */
 } RELAY_CONNECTION, *PRELAY_CONNECTION;
 
 /* Relay server statistics (optional) */
@@ -184,11 +216,6 @@ int Relay_WaitForConnection(SOCKET relaySocket, DWORD timeoutMs);
    - length: Length of data
    Returns: bytes sent or negative error code */
 int Relay_SendData(SOCKET relaySocket, const BYTE *data, DWORD length);
-
-/* Check if relay connection is still alive
-   - relaySocket: Socket to relay server
-   Returns: RD2K_SUCCESS = connected, RD2K_ERR_SERVER_LOST = disconnected */
-int Relay_CheckConnection(SOCKET relaySocket);
 
 /* Send graceful disconnect to relay server (MUST call before closesocket!)
    - relaySocket: Socket to relay server

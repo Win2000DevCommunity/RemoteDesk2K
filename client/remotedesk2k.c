@@ -17,6 +17,8 @@
 #include "filetransfer.h"
 #include "progress.h"
 #include "relay.h"
+#include "relay_client.h"
+#include "session_manager.h"
 #include "crypto.h"
 #include <commctrl.h>
 #include <commdlg.h>
@@ -27,6 +29,19 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "shell32.lib")
+
+/* Debug logging to file - simple helper */
+static void DebugLog(const char *msg)
+{
+    FILE *f = fopen("rd2k_debug.log", "a");
+    if (f) {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        fprintf(f, "[%02d:%02d:%02d.%03d] %s", 
+                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg);
+        fclose(f);
+    }
+}
 
 /* Client config file */
 #define CLIENT_CONFIG_FILE      "client_config.ini"
@@ -123,7 +138,7 @@ static char             g_szClientConfigPath[MAX_PATH] = {0};
 #define PING_INTERVAL           5000
 #define LISTEN_CHECK_INTERVAL   100
 #define TOOLBAR_HIDE_DELAY      3000
-#define RELAY_CHECK_INTERVAL    30000 /* Send relay keepalive every 30 seconds */
+#define RELAY_CHECK_INTERVAL    60000  /* 60 seconds - just for NAT keepalive, not critical */
 
 /* Colors */
 #define COLOR_PANEL_BG          GetSysColor(COLOR_INFOBK)  /* Windows classic InfoBackground */
@@ -292,9 +307,12 @@ static HWND             g_hReconnectDlg = NULL;
 static DWORD            g_dwLastPartnerId = 0;
 static DWORD            g_dwLastPartnerPwd = 0;
 
+/* Session manager callback prototypes */
+void OnSessionStateChanged(SESSION_STATE oldState, SESSION_STATE newState);
+void OnSessionError(DISCONNECT_REASON reason, const char *message);
+void OnSessionPartnerChanged(BOOL connected, DWORD partnerId, SESSION_ROLE role);
+
 /* Reconnection function prototypes */
-void HandleRelayServerLost(void);
-void HandlePartnerDisconnect(BOOL isServerSide);
 BOOL AttemptRelayReconnection(void);
 INT_PTR CALLBACK ReconnectDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 void DisconnectFromRelayServer(BOOL silent);
@@ -391,6 +409,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Initialize relay critical section for thread safety */
     InitializeCriticalSection(&g_csRelay);
     
+    /* Initialize session manager for centralized connection state */
+    Session_Initialize();
+    
     /* Initialize common controls */
     icc.dwSize = sizeof(icc);
     icc.dwICC = ICC_WIN95_CLASSES | ICC_BAR_CLASSES;
@@ -463,6 +484,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Initialize file transfer module */
     FileTransfer_Init(g_hMainWnd, hInstance);
     
+    /* Set session manager externals (window handle and network structure pointers) */
+    Session_SetExternals(g_hMainWnd, &g_pServerNet, &g_pClientNet);
+    
+    /* Register session manager callbacks for UI updates */
+    Session_SetStateCallback(OnSessionStateChanged);
+    Session_SetErrorCallback(OnSessionError);
+    Session_SetPartnerCallback(OnSessionPartnerChanged);
+    
     ShowWindow(g_hMainWnd, nCmdShow);
     UpdateWindow(g_hMainWnd);
     
@@ -481,6 +510,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Cleanup */
     StopServer();
     DisconnectFromPartner();
+    Session_Shutdown();  /* Cleanup session manager */
     FileTransfer_Cleanup();
     Clipboard_Cleanup();
     Crypto_Cleanup();
@@ -942,6 +972,10 @@ void ConnectToRelayServer(void)
     g_bConnectedToRelay = TRUE;
     LeaveCriticalSection(&g_csRelay);
     
+    /* Notify session manager about relay connection */
+    Session_OnRelayConnected(relaySocket);
+    Session_OnRelayRegistered(g_myId);
+    
     /* Save Server ID immediately so it's remembered next time */
     SaveClientConfig();
     
@@ -1043,10 +1077,22 @@ static DWORD WINAPI ConnectThreadProc(LPVOID lpParam)
     Network_SendPacket(g_pClientNet, MSG_HANDSHAKE,
                       (const BYTE*)&handshake, sizeof(handshake));
     
-    /* Receive response - blocking */
-    result = Network_RecvPacket(g_pClientNet, &header,
-                               g_pClientNet->recvBuffer,
-                               g_pClientNet->recvBufferSize);
+    /* Receive response - blocking with retry for relay PING/PONG interruptions.
+     * In relay mode, PINGs can arrive while waiting for handshake response.
+     * RD2K_ERR_NO_DATA means a PING arrived - just retry. */
+    {
+        int retryCount = 0;
+        do {
+            result = Network_RecvPacket(g_pClientNet, &header,
+                                       g_pClientNet->recvBuffer,
+                                       g_pClientNet->recvBufferSize);
+            if (result == RD2K_ERR_NO_DATA) {
+                /* PING/PONG arrived instead of app data - retry */
+                retryCount++;
+                Sleep(100);
+            }
+        } while (result == RD2K_ERR_NO_DATA && retryCount < 100); /* 10 second timeout */
+    }
     
     if (result != RD2K_SUCCESS || header.msgType != MSG_HANDSHAKE_ACK) {
         Network_Destroy(g_pClientNet);
@@ -1089,6 +1135,8 @@ void HandleConnectResult(int result, BOOL bRelayMode, PCONNECT_THREAD_DATA pData
             SetWindowTextA(g_hRelayConnectPartnerBtn, "Connect to Partner");
             EnableWindow(g_hRelayConnectPartnerBtn, TRUE);
             EnableWindow(g_hRelayConnectSvrBtn, TRUE);
+            /* Restart relay keepalive timer since connection failed */
+            SetTimer(g_hMainWnd, TIMER_RELAY_CHECK, RELAY_CHECK_INTERVAL, NULL);
         } else {
             SetWindowTextA(g_hConnectBtn, "Connect to partner");
             EnableWindow(g_hConnectBtn, TRUE);
@@ -1125,6 +1173,14 @@ void HandleConnectResult(int result, BOOL bRelayMode, PCONNECT_THREAD_DATA pData
     
     g_bClientConnected2 = TRUE;
     g_pClientNet->state = STATE_CONNECTED;
+    
+    /* CRITICAL FIX: Initialize clipboard sequence to prevent auto-transfer!
+     * If g_lastClipboardSeq is 0 (initial value), the first clipboard check
+     * sees a "change" and syncs files from previous session automatically. */
+    g_lastClipboardSeq = GetClipboardSequenceNumber();
+    
+    /* Notify session manager - we are client role (controlling partner) */
+    Session_OnPartnerPaired(FALSE);
     
     /* Start timers for network processing */
     SetTimer(g_hMainWnd, TIMER_NETWORK, NETWORK_INTERVAL, NULL);
@@ -1163,6 +1219,25 @@ void ConnectToPartnerViaRelay(void)
         MessageBoxA(g_hMainWnd, "Connection already in progress!", APP_TITLE, MB_ICONWARNING);
         return;
     }
+    
+    /* CRITICAL FIX: Stop relay check timer during connection to prevent race condition.
+     * The connect thread uses g_relaySocket for CONNECT_REQUEST/RESPONSE,
+     * and the timer also uses it for PING. Running both simultaneously can
+     * corrupt the relay protocol stream. Timer will restart after connection. */
+    KillTimer(g_hMainWnd, TIMER_RELAY_CHECK);
+    
+    /* CRITICAL FIX: Clean up any existing client network from previous connection.
+     * This prevents resource leaks and ensures clean state for reconnection. */
+    if (g_pClientNet) {
+        /* Detach relay socket to preserve it */
+        if (g_pClientNet->bRelayMode && g_pClientNet->relaySocket == g_relaySocket) {
+            g_pClientNet->relaySocket = INVALID_SOCKET;
+            g_pClientNet->bRelayMode = FALSE;
+        }
+        Network_Destroy(g_pClientNet);
+        g_pClientNet = NULL;
+    }
+    g_bClientConnected2 = FALSE;
     
     /* Get Partner ID and Password from Relay tab */
     GetWindowTextA(g_hRelayPartnerId, idStr, sizeof(idStr));
@@ -1335,131 +1410,163 @@ BOOL AttemptRelayReconnection(void)
     g_bConnectedToRelay = TRUE;
     LeaveCriticalSection(&g_csRelay);
     
+    /* Notify session manager about relay connection */
+    Session_OnRelayConnected(relaySocket);
+    Session_OnRelayRegistered(g_myId);
+    
     return TRUE;
 }
 
-/* Handle relay server connection lost */
-void HandleRelayServerLost(void)
+/* ============================================================================
+ * SESSION MANAGER CALLBACKS - Centralized UI updates for state changes
+ * ============================================================================ */
+
+/*
+ * Called by session_manager when state changes.
+ * Handles all UI updates: buttons, status bar, viewer window.
+ */
+void OnSessionStateChanged(SESSION_STATE oldState, SESSION_STATE newState)
 {
-    /* Prevent re-entry */
-    if (g_bReconnecting) {
-        return;
+    char debugMsg[256];
+    sprintf(debugMsg, "[UI] State change: %s -> %s\n",
+            Session_StateToString(oldState), Session_StateToString(newState));
+    OutputDebugStringA(debugMsg);
+    
+    /* Handle transitions based on new state */
+    switch (newState) {
+        case SESSION_STATE_DISCONNECTED:
+            /* Full disconnect - update all UI */
+            g_bConnectedToRelay = FALSE;
+            g_bClientConnected = FALSE;
+            g_bClientConnected2 = FALSE;
+            
+            DestroyViewerWindow();
+            
+            SetWindowTextA(g_hRelayConnectSvrBtn, "Connect to Server");
+            EnableWindow(g_hRelayConnectSvrBtn, TRUE);
+            SetWindowTextA(g_hRelayConnectPartnerBtn, "Connect to Partner");
+            EnableWindow(g_hRelayConnectPartnerBtn, FALSE);
+            SetWindowTextA(g_hConnectBtn, "Connect to partner");
+            EnableWindow(g_hConnectBtn, TRUE);
+            
+            if (oldState == SESSION_STATE_PAIRED || oldState == SESSION_STATE_PAIRING) {
+                UpdateStatusBar("Session ended", FALSE);
+            } else if (oldState == SESSION_STATE_REGISTERED) {
+                UpdateStatusBar("Relay server connection lost", FALSE);
+            } else {
+                UpdateStatusBar("Disconnected", FALSE);
+            }
+            break;
+            
+        case SESSION_STATE_REGISTERED:
+            /* We're registered with relay, waiting for partner */
+            g_bConnectedToRelay = TRUE;
+            g_bClientConnected = FALSE;
+            g_bClientConnected2 = FALSE;
+            
+            if (oldState == SESSION_STATE_PAIRED || oldState == SESSION_STATE_PAIRING) {
+                /* Partner left, but still on relay */
+                DestroyViewerWindow();
+                UpdateStatusBar("Partner disconnected - waiting for new connection", FALSE);
+            } else if (oldState == SESSION_STATE_CONNECTING_RELAY) {
+                /* Just connected */
+                UpdateStatusBar("Connected to relay, waiting for partner", TRUE);
+            }
+            
+            SetWindowTextA(g_hRelayConnectSvrBtn, "Disconnect");
+            EnableWindow(g_hRelayConnectSvrBtn, TRUE);
+            SetWindowTextA(g_hRelayConnectPartnerBtn, "Connect to Partner");
+            EnableWindow(g_hRelayConnectPartnerBtn, TRUE);
+            SetWindowTextA(g_hConnectBtn, "Connect to partner");
+            EnableWindow(g_hConnectBtn, TRUE);
+            break;
+            
+        case SESSION_STATE_PAIRING:
+            UpdateStatusBar("Partner connecting...", TRUE);
+            break;
+            
+        case SESSION_STATE_PAIRED:
+            /* Both flags set for compatibility - ProcessServerNetwork
+             * uses g_bClientConnected for active session handling,
+             * and g_bClientConnected2 being TRUE prevents re-entry
+             * into the relay handshake check during active session. */
+            g_bClientConnected = TRUE;
+            g_bClientConnected2 = TRUE;
+            UpdateStatusBar("Connected to partner", TRUE);
+            break;
+            
+        default:
+            break;
     }
-    g_bReconnecting = TRUE;
-    
-    /* Cancel any pending file transfer */
-    FileTransfer_Cancel();
-    
-    /* Stop all timers */
-    KillTimer(g_hMainWnd, TIMER_NETWORK);
-    KillTimer(g_hMainWnd, TIMER_PING);
-    KillTimer(g_hMainWnd, TIMER_RELAY_CHECK);
-    
-    /* Mark as disconnected */
-    g_bClientConnected2 = FALSE;
-    g_bClientConnected = FALSE;
-    
-    /* Close network structures */
-    if (g_pClientNet) {
-        Network_Destroy(g_pClientNet);
-        g_pClientNet = NULL;
-    }
-    
-    /* Close viewer window */
-    DestroyViewerWindow();
-    
-    /* Close relay socket */
-    EnterCriticalSection(&g_csRelay);
-    if (g_relaySocket != INVALID_SOCKET) {
-        closesocket(g_relaySocket);
-        g_relaySocket = INVALID_SOCKET;
-    }
-    g_bConnectedToRelay = FALSE;
-    LeaveCriticalSection(&g_csRelay);
-    
-    g_bReconnecting = FALSE;
-    
-    /* Reset UI to disconnected state - NO auto-reconnect */
-    UpdateStatusBar("Relay server connection lost", FALSE);
-    SetWindowTextA(g_hRelayConnectSvrBtn, "Connect to Server");
-    EnableWindow(g_hRelayConnectSvrBtn, TRUE);
-    SetWindowTextA(g_hRelayConnectPartnerBtn, "Connect to Partner");
-    EnableWindow(g_hRelayConnectPartnerBtn, FALSE);
-    
-    /* Inform user - they must manually reconnect */
-    MessageBoxA(g_hMainWnd, 
-               "Connection to relay server was lost.\n\n"
-               "Click 'Connect to Server' to reconnect.",
-               APP_TITLE, MB_ICONWARNING);
 }
 
-/* Handle partner disconnect from relay */
-void HandlePartnerDisconnect(BOOL isServerSide)
+/*
+ * Called by session_manager when an error/disconnect occurs.
+ * Shows appropriate message box to user.
+ */
+void OnSessionError(DISCONNECT_REASON reason, const char *message)
 {
-    /* Cancel any pending file transfer */
-    FileTransfer_Cancel();
+    char debugMsg[256];
+    sprintf(debugMsg, "[UI] Session error: %s - %s\n",
+            Session_ReasonToString(reason), message);
+    OutputDebugStringA(debugMsg);
     
-    /* Stop all network timers */
-    KillTimer(g_hMainWnd, TIMER_NETWORK);
-    KillTimer(g_hMainWnd, TIMER_PING);
-    KillTimer(g_hMainWnd, TIMER_SCREEN);
-    KillTimer(g_hMainWnd, TIMER_RELAY_CHECK);
-    
-    /* Mark all connections as ended */
-    g_bClientConnected = FALSE;
-    g_bClientConnected2 = FALSE;
-    
-    /* Cleanup network structures - detach relay socket first */
-    if (g_pServerNet) {
-        if (g_pServerNet->bRelayMode && g_pServerNet->relaySocket == g_relaySocket) {
-            g_pServerNet->relaySocket = INVALID_SOCKET;
-            g_pServerNet->socket = INVALID_SOCKET;
-            g_pServerNet->bRelayMode = FALSE;
-        }
-        Network_Disconnect(g_pServerNet);
+    /* Show message box for significant errors */
+    switch (reason) {
+        case DISCONNECT_REASON_SERVER_LOST:
+            MessageBoxA(g_hMainWnd, 
+                       "Connection to relay server was lost.\n\n"
+                       "Click 'Connect to Server' to reconnect.",
+                       APP_TITLE, MB_ICONWARNING);
+            break;
+            
+        case DISCONNECT_REASON_PARTNER_LEFT:
+        case DISCONNECT_REASON_PARTNER_TIMEOUT:
+            /* CRITICAL FIX: Don't show MessageBox when staying on relay!
+             * MessageBox blocks the UI thread, preventing timer processing.
+             * If Session 2 viewer connects while MessageBox is shown,
+             * their handshake times out = "Authentication failed".
+             * Status bar already shows "Partner disconnected - waiting for new connection".
+             * Only show MessageBox when completely disconnected (need to reconnect). */
+            if (!Session_IsConnected()) {
+                MessageBoxA(g_hMainWnd, 
+                           "The remote session has ended.\n\n"
+                           "Possible causes:\n"
+                           "- Your partner disconnected\n"
+                           "- Network connection lost\n\n"
+                           "Click 'Connect to Server' to reconnect.",
+                           APP_TITLE, MB_ICONINFORMATION);
+            }
+            /* When Session_IsConnected() is TRUE, skip MessageBox.
+             * User sees status bar update and can continue working. */
+            break;
+            
+        case DISCONNECT_REASON_AUTH_FAILED:
+            MessageBoxA(g_hMainWnd, 
+                       "Authentication failed.\n\n"
+                       "Please check the password and try again.",
+                       APP_TITLE, MB_ICONERROR);
+            break;
+            
+        default:
+            /* Don't show message box for other errors */
+            break;
     }
-    
-    if (g_pClientNet) {
-        if (g_pClientNet->bRelayMode && g_pClientNet->relaySocket == g_relaySocket) {
-            g_pClientNet->relaySocket = INVALID_SOCKET;
-            g_pClientNet->bRelayMode = FALSE;
-        }
-        Network_Destroy(g_pClientNet);
-        g_pClientNet = NULL;
-    }
-    
-    /* Destroy viewer window */
-    DestroyViewerWindow();
-    
-    /* CRITICAL: Fully disconnect from relay server!
-     * The server terminates BOTH clients when one disconnects.
-     * We must close our socket and reset state to "disconnected". */
-    EnterCriticalSection(&g_csRelay);
-    if (g_relaySocket != INVALID_SOCKET) {
-        closesocket(g_relaySocket);
-        g_relaySocket = INVALID_SOCKET;
-    }
-    g_bConnectedToRelay = FALSE;
-    LeaveCriticalSection(&g_csRelay);
-    
-    /* Update UI to fully disconnected state - user must click Connect again */
-    SetWindowTextA(g_hRelayConnectSvrBtn, "Connect to Server");
-    EnableWindow(g_hRelayConnectSvrBtn, TRUE);
-    SetWindowTextA(g_hRelayConnectPartnerBtn, "Connect to Partner");
-    EnableWindow(g_hRelayConnectPartnerBtn, FALSE);  /* Can't connect partner without server */
-    
-    /* Also reset direct connection button */
-    SetWindowTextA(g_hConnectBtn, "Connect to partner");
-    EnableWindow(g_hConnectBtn, TRUE);
-    
-    UpdateStatusBar("Session ended - click Connect to reconnect", FALSE);
-    MessageBoxA(g_hMainWnd, 
-               "The remote session has ended.\n\n"
-               "Possible causes:\n"
-               "- Your partner disconnected\n"
-               "- Network connection lost\n\n"
-               "Click 'Connect to Server' to reconnect.",
-               APP_TITLE, MB_ICONINFORMATION);
+}
+
+/*
+ * Called by session_manager when partner connects/disconnects.
+ * Can be used for logging or additional UI updates.
+ */
+void OnSessionPartnerChanged(BOOL connected, DWORD partnerId, SESSION_ROLE role)
+{
+    char debugMsg[256];
+    sprintf(debugMsg, "[UI] Partner %s: ID=%lu, Role=%s\n",
+            connected ? "connected" : "disconnected",
+            partnerId,
+            role == SESSION_ROLE_SERVER ? "SERVER" : 
+            role == SESSION_ROLE_CLIENT ? "CLIENT" : "NONE");
+    OutputDebugStringA(debugMsg);
 }
 
 /* Update status bar */
@@ -1639,19 +1746,41 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case WM_TIMER:
             switch (wParam) {
                 case TIMER_LISTEN_CHECK:
-                    if (g_bServerRunning && !g_bClientConnected) {
+                    /* Only check for incoming connections when NOT connecting as viewer.
+                     * g_bConnecting means ConnectThreadProc is using the relay socket. */
+                    if (g_bServerRunning && !g_bClientConnected && !g_bConnecting) {
                         ProcessServerNetwork();
                     }
                     break;
                 
                 case TIMER_NETWORK:
+                {
+                    static int timerDebugCounter = 0;
+                    timerDebugCounter++;
+                    /* Only log occasionally to avoid spam */
+                    if (timerDebugCounter % 100 == 1 && !g_bClientConnected && g_bServerRunning) {
+                        char timerDbg[256];
+                        sprintf(timerDbg, "[TIMER_NETWORK] Waiting state: srv=%d relay=%d sock=%d connecting=%d pNet=%p\n",
+                                g_bServerRunning, g_bConnectedToRelay, 
+                                g_relaySocket != INVALID_SOCKET, g_bConnecting, (void*)g_pServerNet);
+                        DebugLog(timerDbg);
+                    }
+                    
+                    /* Process server network when:
+                     * 1. Client is connected (active session), OR
+                     * 2. Connected to relay but waiting for viewer (to receive new PARTNER_CONNECTED) */
                     if (g_bClientConnected) {
+                        ProcessServerNetwork();
+                    } else if (g_bServerRunning && g_bConnectedToRelay && 
+                               g_relaySocket != INVALID_SOCKET && !g_bConnecting) {
+                        /* Waiting for incoming relay connection after viewer left */
                         ProcessServerNetwork();
                     }
                     if (g_bClientConnected2) {
                         ProcessClientNetwork();
                     }
                     break;
+                }
                 
                 case TIMER_SCREEN:
                     if (g_bClientConnected) {
@@ -1660,8 +1789,16 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     break;
                 
                 case TIMER_PING:
+                    /* CRITICAL FIX: Both sides need to send keepalives!
+                     * Viewer side: sends ping to keep relay connection alive
+                     * Server side: ALSO needs ping when screen doesn't change!
+                     * Without server-side ping, relay times out after 30s of no screen changes. */
                     if (g_pClientNet && g_bClientConnected2) {
                         Network_SendPacket(g_pClientNet, MSG_PING, NULL, 0);
+                    }
+                    /* Server side keepalive - keeps relay alive when screen is static */
+                    if (g_bClientConnected && g_pServerNet) {
+                        Network_SendPacket(g_pServerNet, MSG_PING, NULL, 0);
                     }
                     /* Check clipboard changes for server side sync */
                     if (g_bClientConnected && g_pServerNet && !g_bIgnoreClipboard) {
@@ -1674,18 +1811,10 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     break;
                 
                 case TIMER_RELAY_CHECK:
-                    /* Check if relay server is still alive (only when not in active session) */
-                    if (g_bConnectedToRelay && g_relaySocket != INVALID_SOCKET) {
-                        /* Don't check during active partner session - data flow will detect issues */
-                        if (!g_bClientConnected2 && !g_bClientConnected) {
-                            int result = Relay_CheckConnection(g_relaySocket);
-                            if (result != RD2K_SUCCESS) {
-                                /* Relay server disconnected */
-                                KillTimer(g_hMainWnd, TIMER_RELAY_CHECK);
-                                HandleRelayServerLost();
-                            }
-                        }
-                    }
+                    /* With session-based architecture, no keepalives needed!
+                     * Sessions persist even when connections drop.
+                     * TCP will tell us when connection dies.
+                     * This timer is now disabled - just break. */
                     break;
             }
             return 0;
@@ -1815,6 +1944,7 @@ void StopServer(void)
     KillTimer(g_hMainWnd, TIMER_LISTEN_CHECK);
     KillTimer(g_hMainWnd, TIMER_SCREEN);
     KillTimer(g_hMainWnd, TIMER_NETWORK);
+    KillTimer(g_hMainWnd, TIMER_PING);
     
     if (g_pServerNet) {
         Network_Destroy(g_pServerNet);
@@ -1839,22 +1969,57 @@ void ProcessServerNetwork(void)
     int result;
     BYTE headerBuf[sizeof(RD2K_HEADER)];
     int recvLen;
+    char dbgBuf[256];
     
-    if (!g_pServerNet) return;
+    if (!g_pServerNet) {
+        DebugLog("[PSN] g_pServerNet is NULL - returning\n");
+        return;
+    }
+    
+    /* DEBUG: Log all relay check conditions */
+    {
+        static int psnDebugCounter = 0;
+        psnDebugCounter++;
+        if (psnDebugCounter % 50 == 1 && !g_bClientConnected) {
+            sprintf(dbgBuf, "[PSN] Entry: connecting=%d cc2=%d relayFlag=%d relaySock=%d\n",
+                    g_bConnecting, g_bClientConnected2, g_bConnectedToRelay,
+                    g_relaySocket != INVALID_SOCKET);
+            DebugLog(dbgBuf);
+        }
+    }
     
     /* Check for incoming relay connection (when connected to relay server)
      * IMPORTANT: Don't process relay data while we're connecting as viewer
      * or while we're actively connected as viewer - the relay socket is shared!
      * g_bConnecting: connection in progress (background thread using socket)
-     * g_bClientConnected2: actively viewing remote (viewer using socket for screen data) */
-    if (!g_bClientConnected && !g_bConnecting && !g_bClientConnected2 && 
+     * g_bClientConnected2: actively viewing remote (viewer using socket for screen data)
+     * 
+     * NOTE: We allow processing even when g_bClientConnected is TRUE!
+     * This is essential for REJOIN - when viewer disconnects and reconnects,
+     * the new handshake arrives before we processed PARTNER_DISCONNECTED.
+     * We accept the new connection (old one is dead anyway). */
+    if (!g_bConnecting && !g_bClientConnected2 && 
         g_bConnectedToRelay && g_relaySocket != INVALID_SOCKET) {
-        FD_ZERO(&readSet);
-        FD_SET(g_relaySocket, &readSet);
-        timeout.tv_sec = 0;
-        timeout.tv_usec = 0;
         
-        if (select(0, &readSet, NULL, NULL, &timeout) > 0) {
+        int messageCount = 0;  /* C89: declare at block start */
+        
+        sprintf(dbgBuf, "[PSN] Checking relay socket for incoming data (g_bClientConnected=%d)\n", g_bClientConnected);
+        DebugLog(dbgBuf);
+        
+        /* Loop to process all pending messages (e.g., PARTNER_CONNECTED then handshake).
+         * Without loop, if both arrive together, we'd only process PARTNER_CONNECTED
+         * and miss the handshake until next timer tick - causing auth timeout! */
+        while (messageCount < 10) {  /* Safety limit */
+            FD_ZERO(&readSet);
+            FD_SET(g_relaySocket, &readSet);
+            timeout.tv_sec = 0;
+            timeout.tv_usec = 0;
+            
+            if (select(0, &readSet, NULL, NULL, &timeout) <= 0) {
+                break;  /* No more data */
+            }
+            messageCount++;
+            
             /* Data available on relay socket - try to receive handshake
              * Network_SendPacket sends header and data as TWO separate relay packets:
              * 1. First packet: RD2K_HEADER (8 bytes)
@@ -1864,22 +2029,45 @@ void ProcessServerNetwork(void)
             
             /* CRITICAL: Handle disconnect/server lost BEFORE checking for handshake!
              * Without this, client UI doesn't update when session ends. */
-            if (recvLen == RD2K_ERR_PARTNER_LEFT || recvLen == RD2K_ERR_SERVER_LOST) {
-                HandlePartnerDisconnect(TRUE);
+            if (recvLen == RD2K_ERR_PARTNER_LEFT) {
+                Session_OnPartnerLeft(DISCONNECT_REASON_PARTNER_LEFT);
                 return;
             }
+            if (recvLen == RD2K_ERR_SERVER_LOST) {
+                Session_OnServerLost();
+                return;
+            }
+            
+            /* recvLen == 0 means a non-DATA message (like PARTNER_CONNECTED) was consumed.
+             * Continue loop to check for more data (the actual handshake). */
+            if (recvLen == 0) {
+                DebugLog("[PSN] Received non-DATA message (PARTNER_CONNECTED?), continuing\n");
+                continue;
+            }
+            
+            sprintf(dbgBuf, "[PSN] Received %d bytes from relay\n", recvLen);
+            DebugLog(dbgBuf);
             
             if (recvLen == sizeof(RD2K_HEADER)) {
                 CopyMemory(&header, headerBuf, sizeof(RD2K_HEADER));
                 
+                sprintf(dbgBuf, "[PSN] Header: msgType=%d, dataLength=%d\n", header.msgType, header.dataLength);
+                DebugLog(dbgBuf);
+                
                 if (header.msgType == MSG_HANDSHAKE && header.dataLength == sizeof(RD2K_HANDSHAKE)) {
+                    DebugLog("[PSN] Got MSG_HANDSHAKE, receiving handshake data...\n");
+                    
                     /* Now receive the handshake data (comes in second relay packet) */
                     recvLen = Relay_RecvData(g_relaySocket, g_pServerNet->recvBuffer, 
                                             header.dataLength, 2000);
                     
                     /* Handle disconnect during handshake */
-                    if (recvLen == RD2K_ERR_PARTNER_LEFT || recvLen == RD2K_ERR_SERVER_LOST) {
-                        HandlePartnerDisconnect(TRUE);
+                    if (recvLen == RD2K_ERR_PARTNER_LEFT) {
+                        Session_OnPartnerLeft(DISCONNECT_REASON_PARTNER_LEFT);
+                        return;
+                    }
+                    if (recvLen == RD2K_ERR_SERVER_LOST) {
+                        Session_OnServerLost();
                         return;
                     }
                     
@@ -1896,7 +2084,19 @@ void ProcessServerNetwork(void)
                             }
                         }
                         
+                        sprintf(dbgBuf, "[PSN] Auth check: magic=%08X, pwd=%d, myPwd=%d, authOk=%d\n",
+                                pHandshake->magic, pHandshake->password, g_myPassword, authOk);
+                        DebugLog(dbgBuf);
+                        
                         if (authOk) {
+                            DebugLog("[PSN] Auth OK, sending handshake ACK\n");
+                            /* REJOIN case: if already connected, clean up old state first */
+                            if (g_bClientConnected) {
+                                KillTimer(g_hMainWnd, TIMER_NETWORK);
+                                KillTimer(g_hMainWnd, TIMER_SCREEN);
+                                g_bClientConnected = FALSE;
+                            }
+                            
                             /* Set up network structure for relay mode */
                             g_pServerNet->bRelayMode = TRUE;
                             g_pServerNet->relaySocket = g_relaySocket;
@@ -1926,8 +2126,15 @@ void ProcessServerNetwork(void)
                             g_bClientConnected = TRUE;
                             g_pServerNet->state = STATE_CONNECTED;
                             
+                            /* CRITICAL FIX: Initialize clipboard seq to prevent auto-transfer */
+                            g_lastClipboardSeq = GetClipboardSequenceNumber();
+                            
+                            /* Notify session manager - we are server role (allowing control) */
+                            Session_OnPartnerPaired(TRUE);
+                            
                             SetTimer(g_hMainWnd, TIMER_NETWORK, NETWORK_INTERVAL, NULL);
                             SetTimer(g_hMainWnd, TIMER_SCREEN, SCREEN_INTERVAL, NULL);
+                            SetTimer(g_hMainWnd, TIMER_PING, PING_INTERVAL, NULL);  /* Keepalive for relay */
                             
                             UpdateStatusBar("Partner connected via relay", TRUE);
                             return;
@@ -1935,8 +2142,8 @@ void ProcessServerNetwork(void)
                     }
                 }
             }
-            /* If we didn't get a valid handshake, just return - will try again next timer tick */
-        }
+        }  /* End of while loop for processing all pending messages */
+        /* If we didn't get a valid handshake, just return - will try again next timer tick */
     }
     
     /* Check for new direct connections */
@@ -1989,8 +2196,15 @@ void ProcessServerNetwork(void)
                         g_bClientConnected = TRUE;
                         g_pServerNet->state = STATE_CONNECTED;
                         
+                        /* CRITICAL FIX: Initialize clipboard seq to prevent auto-transfer */
+                        g_lastClipboardSeq = GetClipboardSequenceNumber();
+                        
+                        /* Notify session manager - we are server role (allowing control) */
+                        Session_OnPartnerPaired(TRUE);
+                        
                         SetTimer(g_hMainWnd, TIMER_NETWORK, NETWORK_INTERVAL, NULL);
                         SetTimer(g_hMainWnd, TIMER_SCREEN, SCREEN_INTERVAL, NULL);
+                        SetTimer(g_hMainWnd, TIMER_PING, PING_INTERVAL, NULL);  /* Keepalive */
                         
                         UpdateStatusBar("Partner connected", TRUE);
                     } else {
@@ -2013,20 +2227,31 @@ void ProcessServerNetwork(void)
                                        g_pServerNet->recvBufferSize);
             
             if (result != RD2K_SUCCESS) {
+                sprintf(dbgBuf, "[PSN] Network_RecvPacket ERROR: result=%d\n", result);
+                DebugLog(dbgBuf);
+                
                 /* Check if this is a relay mode connection */
                 if (g_pServerNet && g_pServerNet->bRelayMode) {
-                    if (result == RD2K_ERR_SERVER_LOST) {
-                        /* Relay server disconnected - attempt reconnection */
-                        HandleRelayServerLost();
+                    /* RD2K_ERR_NO_DATA = relay PING/PONG received instead of app data.
+                     * This is normal during idle - just return and let timer retry. */
+                    if (result == RD2K_ERR_NO_DATA) {
+                        return;  /* Harmless - timer will call again */
+                    }
+                    if (result == RD2K_ERR_SERVER_LOST || result == RD2K_ERR_DISCONNECTED) {
+                        /* Relay server disconnected */
+                        DebugLog("[PSN] Calling Session_OnServerLost\n");
+                        Session_OnServerLost();
                         return;
-                    } else if (result == RD2K_ERR_PARTNER_LEFT) {
-                        /* Partner disconnected from relay */
-                        HandlePartnerDisconnect(TRUE);
+                    } else {
+                        /* Any other relay error = partner left (PARTNER_LEFT, RECV, etc.) */
+                        DebugLog("[PSN] Calling Session_OnPartnerLeft\n");
+                        Session_OnPartnerLeft(DISCONNECT_REASON_PARTNER_LEFT);
                         return;
                     }
                 }
                 /* Direct connection or other error - connection lost */
                 g_bClientConnected = FALSE;
+                g_bClientConnected2 = FALSE;  /* Clear both flags for consistency */
                 /* Detach relay socket before disconnect to preserve relay connection */
                 if (g_pServerNet->bRelayMode && g_pServerNet->relaySocket == g_relaySocket) {
                     g_pServerNet->relaySocket = INVALID_SOCKET;
@@ -2109,17 +2334,27 @@ void ProcessServerNetwork(void)
                     break;
                 
                 case MSG_DISCONNECT:
-                    g_bClientConnected = FALSE;
-                    /* Detach relay socket before disconnect to preserve relay connection */
+                    /* Partner gracefully disconnected.
+                     * CRITICAL: Call Session_OnPartnerLeft to properly reset state!
+                     * This ensures both g_bClientConnected and g_bClientConnected2 are cleared,
+                     * allowing Session 2 to work after Session 1 ends. */
+                    DebugLog("[PSN] Received MSG_DISCONNECT from partner\n");
+                    
+                    /* Detach relay socket before Session_OnPartnerLeft to preserve relay connection */
                     if (g_pServerNet->bRelayMode && g_pServerNet->relaySocket == g_relaySocket) {
                         g_pServerNet->relaySocket = INVALID_SOCKET;
                         g_pServerNet->socket = INVALID_SOCKET;
                         g_pServerNet->bRelayMode = FALSE;
                     }
-                    Network_Disconnect(g_pServerNet);
-                    Network_Listen(g_pServerNet);
+                    
+                    /* Stop screen updates timer */
                     KillTimer(g_hMainWnd, TIMER_SCREEN);
-                    UpdateStatusBar("Partner disconnected", TRUE);
+                    
+                    /* Call Session_OnPartnerLeft - this will:
+                     * 1. Call state callback (OnSessionStateChanged → REGISTERED)
+                     * 2. Clear both g_bClientConnected AND g_bClientConnected2
+                     * 3. Restart relay listening timers */
+                    Session_OnPartnerLeft(DISCONNECT_REASON_PARTNER_LEFT);
                     return;
             }
         }
@@ -2300,6 +2535,7 @@ void ConnectToPartner(void)
 void DisconnectFromPartner(void)
 {
     BOOL wasRelayMode = FALSE;
+    SOCKET relaySocketToNotify = INVALID_SOCKET;
     
     if (!g_bClientConnected2) return;
     
@@ -2308,9 +2544,21 @@ void DisconnectFromPartner(void)
     
     if (g_pClientNet) {
         wasRelayMode = g_pClientNet->bRelayMode;
+        
+        /* Send MSG_DISCONNECT to partner (via relay if in relay mode) */
         Network_SendPacket(g_pClientNet, MSG_DISCONNECT, NULL, 0);
         
-        /* IMPORTANT: Detach relay socket before destroy to preserve relay connection!
+        /* CRITICAL FIX: In relay mode, we must ALSO notify the relay server!
+         * Without this, the server keeps both clients in PAIRED state and
+         * subsequent connection attempts fail with "BUSY".
+         * 
+         * Note: We send RELAY_MSG_DISCONNECT to tell the server our session ended,
+         * but we do NOT close the relay socket - we want to stay REGISTERED. */
+        if (g_pClientNet->bRelayMode && g_relaySocket != INVALID_SOCKET) {
+            relaySocketToNotify = g_relaySocket;
+        }
+        
+        /* Detach relay socket before destroy to preserve relay connection!
          * The relay socket is shared (g_relaySocket) and should NOT be closed here.
          * Only the partner session is ending, not the relay server connection. */
         if (g_pClientNet->bRelayMode && g_pClientNet->relaySocket == g_relaySocket) {
@@ -2320,6 +2568,13 @@ void DisconnectFromPartner(void)
         
         Network_Destroy(g_pClientNet);
         g_pClientNet = NULL;
+    }
+    
+    /* Now send RELAY_MSG_UNPAIR to end pairing but stay REGISTERED.
+     * This notifies the server and partner that session ended,
+     * but we keep our relay connection to allow reconnection. */
+    if (relaySocketToNotify != INVALID_SOCKET) {
+        Relay_SendUnpair(relaySocketToNotify);
     }
     
     DestroyViewerWindow();
@@ -2355,13 +2610,18 @@ void ProcessClientNetwork(void)
         if (result != RD2K_SUCCESS) {
             /* Check if this is a relay mode connection */
             if (g_pClientNet && g_pClientNet->bRelayMode) {
-                if (result == RD2K_ERR_SERVER_LOST) {
-                    /* Relay server disconnected - attempt reconnection */
-                    HandleRelayServerLost();
+                /* RD2K_ERR_NO_DATA = relay PING/PONG received instead of app data.
+                 * This is normal during idle - just return and let timer retry. */
+                if (result == RD2K_ERR_NO_DATA) {
+                    return;  /* Harmless - timer will call again */
+                }
+                if (result == RD2K_ERR_SERVER_LOST || result == RD2K_ERR_DISCONNECTED) {
+                    /* Relay server disconnected */
+                    Session_OnServerLost();
                     return;
-                } else if (result == RD2K_ERR_PARTNER_LEFT) {
-                    /* Partner disconnected from relay */
-                    HandlePartnerDisconnect(FALSE);
+                } else {
+                    /* Any other relay error = partner left (PARTNER_LEFT, RECV, etc.) */
+                    Session_OnPartnerLeft(DISCONNECT_REASON_PARTNER_LEFT);
                     return;
                 }
             }
@@ -2750,23 +3010,14 @@ void SendClipboardData(PRD2K_NETWORK pNet)
     
     /* Check for files first (CF_HDROP) */
     if (IsClipboardFormatAvailable(CF_HDROP)) {
-        hData = GetClipboardData(CF_HDROP);
-        if (hData) {
-            UINT fileCount = DragQueryFileA((HDROP)hData, 0xFFFFFFFF, NULL, 0);
-            UINT i;
-            for (i = 0; i < fileCount; i++) {
-                char filePath[MAX_PATH];
-                if (DragQueryFileA((HDROP)hData, i, filePath, MAX_PATH) > 0) {
-                    /* Check if it's a file (not directory) */
-                    DWORD dwAttr = GetFileAttributesA(filePath);
-                    if (dwAttr != 0xFFFFFFFF && !(dwAttr & FILE_ATTRIBUTE_DIRECTORY)) {
-                        CloseClipboard();
-                        SendFileToRemote(filePath);
-                        return;
-                    }
-                }
-            }
-        }
+        /* CRITICAL FIX: Send file METADATA only, not file content!
+         * File content is only sent when remote user actually pastes (Ctrl+V).
+         * This matches how Ctrl+C works - it doesn't immediately transfer files.
+         * Right-click "Copy" also just copies to clipboard, doesn't transfer.
+         * The actual transfer happens on MSG_FILE_REQUEST from remote. */
+        CloseClipboard();
+        Clipboard_SendFileList(pNet);
+        return;
     }
     
     /* Then check for text */

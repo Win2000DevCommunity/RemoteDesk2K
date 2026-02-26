@@ -217,6 +217,17 @@ void Network_Disconnect(PRD2K_NETWORK pNet)
 {
     if (!pNet) return;
     
+    /* In relay mode, don't close socket - it's a reference to the shared relay socket
+     * which is managed separately by the main code (g_relaySocket) */
+    if (pNet->bRelayMode) {
+        /* Just invalidate the references, don't close */
+        pNet->socket = INVALID_SOCKET;
+        pNet->relaySocket = INVALID_SOCKET;
+        pNet->bRelayMode = FALSE;
+        pNet->state = STATE_DISCONNECTED;
+        return;
+    }
+    
     if (pNet->socket != INVALID_SOCKET) {
         shutdown(pNet->socket, SD_BOTH);
         SAFE_CLOSE_SOCKET(pNet->socket);
@@ -225,13 +236,6 @@ void Network_Disconnect(PRD2K_NETWORK pNet)
     if (pNet->listenSocket != INVALID_SOCKET) {
         SAFE_CLOSE_SOCKET(pNet->listenSocket);
     }
-    
-    /* Close relay socket if in relay mode */
-    if (pNet->relaySocket != INVALID_SOCKET) {
-        shutdown(pNet->relaySocket, SD_BOTH);
-        SAFE_CLOSE_SOCKET(pNet->relaySocket);
-    }
-    pNet->bRelayMode = FALSE;
     
     pNet->state = STATE_DISCONNECTED;
 }
@@ -331,17 +335,31 @@ int Network_RecvExact(PRD2K_NETWORK pNet, BYTE *buffer, DWORD length)
     
     if (!pNet || !buffer) return RD2K_ERR_RECV;
     
-    /* Handle relay mode - use relay protocol to receive data */
+    /* Handle relay mode - use relay protocol to receive data.
+     * CRITICAL FIX: Use short timeouts and minimal retries to avoid blocking UI!
+     * The relay server sends PING keepalives which trigger Network_DataAvailable
+     * but are not DATA packets, causing Relay_RecvData to return 0.
+     * With long retries, this blocked the UI for minutes causing "Ne répond pas"! */
     if (pNet->bRelayMode && pNet->relaySocket != INVALID_SOCKET) {
         while (totalRecv < (int)length) {
             int toRecv = length - totalRecv;
-            recv_bytes = Relay_RecvData(pNet->relaySocket, buffer + totalRecv, toRecv, 60000);
+            /* Use 500ms timeout - short enough to not freeze UI */
+            recv_bytes = Relay_RecvData(pNet->relaySocket, buffer + totalRecv, toRecv, 500);
             if (recv_bytes < 0) {
                 return recv_bytes;  /* Return specific error (e.g., RD2K_ERR_PARTNER_LEFT) */
             }
             if (recv_bytes == 0) {
-                /* Timeout - retry */
-                if (++retryCount >= 10) {
+                /* NON-DATA message (PING/PONG) arrived instead of DATA.
+                 * Return immediately so UI stays responsive!
+                 * Timer will call again shortly if more data comes. */
+                if (totalRecv == 0) {
+                    /* Haven't received anything yet - return "no data" without error.
+                     * This happens when relay PING arrives instead of app data.
+                     * Use special code so callers can distinguish from real errors. */
+                    return RD2K_ERR_NO_DATA;
+                }
+                /* Partial data received - need to complete it, but limit retries */
+                if (++retryCount >= 3) {
                     return RD2K_ERR_RECV;
                 }
                 continue;

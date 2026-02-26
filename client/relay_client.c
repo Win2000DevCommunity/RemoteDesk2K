@@ -9,7 +9,8 @@
  * NOT used by: relay.exe (server)
  */
 
-#include "relay.h"
+#include "relay_client.h"
+#include "relay.h"       /* For RELAY_HEADER, RELAY_MSG_* constants */
 #include "crypto.h"
 
 /* Helper: Wait for socket to be ready */
@@ -102,6 +103,11 @@ int Relay_ConnectToServer(const char *relayServerAddr, WORD relayPort,
     struct hostent *pHost;
     unsigned long ipAddr;
     SOCKET sock;
+    unsigned long nonBlocking;
+    int connectResult;
+    int waitResult;
+    int sockError;
+    int sockErrorLen;
     
     if (!relayServerAddr || !pRelaySocket) return RD2K_ERR_SOCKET;
     
@@ -125,11 +131,39 @@ int Relay_ConnectToServer(const char *relayServerAddr, WORD relayPort,
         CopyMemory(&addr.sin_addr, pHost->h_addr, pHost->h_length);
     }
     
-    /* Connect to relay server */
-    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        closesocket(sock);
-        return RD2K_ERR_CONNECT;
+    /* Set non-blocking mode for connect with timeout */
+    nonBlocking = 1;
+    ioctlsocket(sock, FIONBIO, &nonBlocking);
+    
+    /* Connect to relay server (non-blocking) */
+    connectResult = connect(sock, (struct sockaddr*)&addr, sizeof(addr));
+    if (connectResult == SOCKET_ERROR) {
+        int err = WSAGetLastError();
+        if (err != WSAEWOULDBLOCK) {
+            closesocket(sock);
+            return RD2K_ERR_CONNECT;
+        }
+        
+        /* Wait for connection with 5 second timeout */
+        waitResult = WaitForSocketReady(sock, TRUE, 5000);
+        if (waitResult <= 0) {
+            closesocket(sock);
+            return RD2K_ERR_TIMEOUT;  /* Connection timeout */
+        }
+        
+        /* Check if connect succeeded */
+        sockErrorLen = sizeof(sockError);
+        sockError = 0;
+        getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&sockError, &sockErrorLen);
+        if (sockError != 0) {
+            closesocket(sock);
+            return RD2K_ERR_CONNECT;
+        }
     }
+    
+    /* Set back to blocking mode */
+    nonBlocking = 0;
+    ioctlsocket(sock, FIONBIO, &nonBlocking);
     
     /* Configure socket options for performance */
     ConfigureRelaySocket(sock);
@@ -283,25 +317,6 @@ int Relay_WaitForConnection(SOCKET relaySocket, DWORD timeoutMs)
     }
 }
 
-/* Send keepalive ping to relay to reset server's inactivity timer.
- * Also checks if connection is still alive by sending actual data. */
-int Relay_CheckConnection(SOCKET relaySocket)
-{
-    int result;
-    
-    if (relaySocket == INVALID_SOCKET) return RD2K_ERR_SOCKET;
-    
-    /* Send PING to relay server - this keeps the connection alive
-     * and resets the server's inactivity timer.
-     * Server will respond with PONG, but we don't wait for it. */
-    result = SendRelayPacket(relaySocket, RELAY_MSG_PING, NULL, 0);
-    if (result != RD2K_SUCCESS) {
-        return RD2K_ERR_SERVER_LOST;
-    }
-    
-    return RD2K_SUCCESS;
-}
-
 /* Send graceful disconnect message to relay server.
  * MUST be called BEFORE closing the socket!
  * This tells the server to immediately unregister our ID
@@ -313,6 +328,18 @@ int Relay_SendDisconnect(SOCKET relaySocket)
     /* Send DISCONNECT message - server will clean up our connection
      * and notify our partner if we're in a session. */
     return SendRelayPacket(relaySocket, RELAY_MSG_DISCONNECT, NULL, 0);
+}
+
+/* End current pairing but stay REGISTERED with relay server.
+ * Use this when closing the viewer but wanting to reconnect later.
+ * Both this client and partner will return to REGISTERED state. */
+int Relay_SendUnpair(SOCKET relaySocket)
+{
+    if (relaySocket == INVALID_SOCKET) return RD2K_ERR_SOCKET;
+    
+    /* Send UNPAIR message - server will end our pairing but keep us registered.
+     * Partner will receive PARTNER_DISCONNECTED notification. */
+    return SendRelayPacket(relaySocket, RELAY_MSG_UNPAIR, NULL, 0);
 }
 
 /* Check if a partner has connected to us (non-blocking).
@@ -384,7 +411,7 @@ int Relay_CheckForPartner(SOCKET relaySocket, DWORD *pPartnerId)
         return RD2K_ERR_SERVER_LOST;
     }
     
-    /* PONG or other message - ignore */
+    /* Other message - ignore */
     return 0;
 }
 
@@ -491,9 +518,21 @@ int Relay_RecvData(SOCKET relaySocket, BYTE *buffer, DWORD bufferSize, DWORD tim
             }
             return RD2K_ERR_PARTNER_LEFT;
         }
-        /* Skip non-data message payload if any */
-        if (header.dataLength > 0 && header.dataLength < bufferSize) {
+        /* Skip non-data message payload if any.
+         * CRITICAL: Must use <= not < to handle case where payload size equals buffer size
+         * (e.g., PARTNER_CONNECTED is 8 bytes, same as RD2K_HEADER size passed by caller) */
+        if (header.dataLength > 0 && header.dataLength <= bufferSize) {
             RecvExactClient(relaySocket, buffer, header.dataLength, 1000);
+        } else if (header.dataLength > bufferSize) {
+            /* Payload larger than buffer - must still drain to stay in sync */
+            BYTE drainBuf[64];
+            DWORD remaining = header.dataLength;
+            while (remaining > 0) {
+                DWORD chunk = (remaining > sizeof(drainBuf)) ? sizeof(drainBuf) : remaining;
+                int drained = RecvExactClient(relaySocket, drainBuf, chunk, 1000);
+                if (drained <= 0) break;
+                remaining -= drained;
+            }
         }
         return 0;  /* Ignore, caller should retry */
     }
@@ -515,8 +554,10 @@ int Relay_RecvData(SOCKET relaySocket, BYTE *buffer, DWORD bufferSize, DWORD tim
         return 0;  /* Data was too large, discarded */
     }
     
-    /* Step 2: Receive the complete data payload */
-    recvLen = RecvExactClient(relaySocket, buffer, header.dataLength, 30000);
+    /* Step 2: Receive the complete data payload.
+     * Use shorter timeout (2s) because data should follow header immediately.
+     * If header arrived but data doesn't, connection is likely bad. */
+    recvLen = RecvExactClient(relaySocket, buffer, header.dataLength, 2000);
     
     if (recvLen == 0) {
         return RD2K_ERR_SERVER_LOST;  /* Connection to relay server lost */
