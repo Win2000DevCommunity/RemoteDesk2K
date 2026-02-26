@@ -18,8 +18,11 @@ struct tcp_keepalive {
     u_long keepaliveinterval;
 };
 
-/* Inactivity timeout - disconnect clients that don't send any data */
-#define CLIENT_INACTIVITY_TIMEOUT_MS  5000  /* 5 seconds - fast timeout for relay */
+/* Connection keepalive - only for detecting truly dead sockets
+ * No restrictive timeouts - clients can join/leave/rejoin freely */
+
+/* Hard close timeout only for completely dead connections (5 minutes) */
+#define DEAD_CONNECTION_TIMEOUT_MS  300000  /* 5 minutes for truly dead sockets */
 
 /* Logging callback for GUI console output */
 typedef void (*RELAY_LOG_CALLBACK)(const char* message);
@@ -71,6 +74,14 @@ typedef struct _RELAY_SERVER {
     HANDLE              hStopEvent;
     CRITICAL_SECTION    csConnections;
     BOOL                bRunning;
+    
+    /* Session management */
+    PRELAY_SESSION      *sessions;          /* Array of session pointers */
+    DWORD               maxSessions;
+    DWORD               activeSessions;
+    DWORD               nextSessionId;      /* Counter for unique session IDs */
+    CRITICAL_SECTION    csSessions;
+    HANDLE              hSessionCleanupThread;
 } RELAY_SERVER_CONTEXT;
 
 /* Helper: Format client ID as friendly string "XXX XXX XXX XXX" */
@@ -170,6 +181,372 @@ static PRELAY_CONNECTION FindConnectionById(PRELAY_SERVER pServer, DWORD clientI
     return NULL;
 }
 
+/* ============================================================
+ * SESSION MANAGEMENT FUNCTIONS
+ * 
+ * Sessions are the PRIMARY KEY for paired connections.
+ * When clients pair, a session is created. When one leaves, 
+ * they can rejoin the same session instead of creating a new one.
+ * ============================================================ */
+
+/* Create a new session for pairing two clients */
+static PRELAY_SESSION CreateSession(PRELAY_SERVER pServer, PRELAY_CONNECTION pClient1, PRELAY_CONNECTION pClient2)
+{
+    PRELAY_SESSION pSession;
+    DWORD i;
+    
+    if (!pServer || !pClient1 || !pClient2) return NULL;
+    
+    /* Allocate session */
+    pSession = (PRELAY_SESSION)malloc(sizeof(RELAY_SESSION));
+    if (!pSession) return NULL;
+    
+    ZeroMemory(pSession, sizeof(RELAY_SESSION));
+    
+    EnterCriticalSection(&pServer->csSessions);
+    
+    /* Find free slot */
+    for (i = 0; i < pServer->maxSessions; i++) {
+        if (pServer->sessions[i] == NULL) {
+            /* Found slot - initialize session */
+            pServer->nextSessionId++;
+            pSession->sessionId = pServer->nextSessionId;
+            pSession->state = SESSION_STATE_ACTIVE;
+            pSession->clientId1 = pClient1->clientId;
+            pSession->clientId2 = pClient2->clientId;
+            pSession->pClient1 = pClient1;
+            pSession->pClient2 = pClient2;
+            pSession->createdTime = GetTickCount();
+            pSession->lastActivity = GetTickCount();
+            pSession->client1DisconnectTime = 0;
+            pSession->client2DisconnectTime = 0;
+            
+            /* Link session to clients */
+            pClient1->pSession = pSession;
+            pClient2->pSession = pSession;
+            pClient1->pPartner = pClient2;
+            pClient2->pPartner = pClient1;
+            
+            /* Store in array */
+            pServer->sessions[i] = pSession;
+            pServer->activeSessions++;
+            
+            LeaveCriticalSection(&pServer->csSessions);
+            return pSession;
+        }
+    }
+    
+    LeaveCriticalSection(&pServer->csSessions);
+    free(pSession);
+    return NULL;  /* No free slots */
+}
+
+/* Find existing session involving a client ID */
+static PRELAY_SESSION FindSessionByClientId(PRELAY_SERVER pServer, DWORD clientId)
+{
+    DWORD i;
+    
+    if (!pServer) return NULL;
+    
+    EnterCriticalSection(&pServer->csSessions);
+    
+    for (i = 0; i < pServer->maxSessions; i++) {
+        if (pServer->sessions[i] != NULL) {
+            PRELAY_SESSION pSession = pServer->sessions[i];
+            if ((pSession->clientId1 == clientId || pSession->clientId2 == clientId) &&
+                pSession->state != SESSION_STATE_EMPTY) {
+                LeaveCriticalSection(&pServer->csSessions);
+                return pSession;
+            }
+        }
+    }
+    
+    LeaveCriticalSection(&pServer->csSessions);
+    return NULL;
+}
+
+/* Mark a client as disconnected from session (but session stays alive) */
+static void SessionClientDisconnected(PRELAY_SERVER pServer, PRELAY_SESSION pSession, PRELAY_CONNECTION pClient)
+{
+    if (!pServer || !pSession || !pClient) return;
+    
+    EnterCriticalSection(&pServer->csSessions);
+    
+    if (pSession->pClient1 == pClient) {
+        pSession->pClient1 = NULL;
+        pSession->client1DisconnectTime = GetTickCount();
+    } else if (pSession->pClient2 == pClient) {
+        pSession->pClient2 = NULL;
+        pSession->client2DisconnectTime = GetTickCount();
+    }
+    
+    /* Update session state */
+    if (!pSession->pClient1 && !pSession->pClient2) {
+        /* Both clients gone - mark for cleanup */
+        pSession->state = SESSION_STATE_CLOSING;
+    } else {
+        /* One client remains - wait for rejoin */
+        pSession->state = SESSION_STATE_PARTIAL;
+    }
+    
+    /* Update remaining client's partner pointer */
+    if (pSession->pClient1) {
+        pSession->pClient1->pPartner = NULL;
+    }
+    if (pSession->pClient2) {
+        pSession->pClient2->pPartner = NULL;
+    }
+    
+    pClient->pSession = NULL;
+    pClient->pPartner = NULL;
+    
+    LeaveCriticalSection(&pServer->csSessions);
+}
+
+/* Rejoin a client to an existing session */
+static BOOL SessionClientRejoined(PRELAY_SERVER pServer, PRELAY_SESSION pSession, PRELAY_CONNECTION pClient)
+{
+    BOOL success = FALSE;
+    PRELAY_CONNECTION pOldConnection = NULL;
+    
+    if (!pServer || !pSession || !pClient) return FALSE;
+    
+    EnterCriticalSection(&pServer->csSessions);
+    
+    if (pSession->state == SESSION_STATE_PARTIAL || pSession->state == SESSION_STATE_ACTIVE) {
+        /* Find which slot this client should fill */
+        if (pSession->clientId1 == pClient->clientId) {
+            /* Client1 slot - check if we need to replace old connection */
+            if (pSession->pClient1 != NULL && pSession->pClient1 != pClient) {
+                /* Old connection still in slot - kick it and replace */
+                pOldConnection = pSession->pClient1;
+                pOldConnection->pSession = NULL;
+                pOldConnection->pPartner = NULL;
+                pOldConnection->state = RELAY_STATE_DISCONNECTED;
+                if (pOldConnection->hDisconnectEvent) {
+                    SetEvent(pOldConnection->hDisconnectEvent);
+                }
+                RelayLog("[SESSION] Replacing stale connection in slot 1\r\n");
+            }
+            pSession->pClient1 = pClient;
+            pSession->client1DisconnectTime = 0;
+            pClient->pSession = pSession;
+            pClient->pPartner = pSession->pClient2;
+            if (pSession->pClient2) {
+                pSession->pClient2->pPartner = pClient;
+            }
+            success = TRUE;
+        } else if (pSession->clientId2 == pClient->clientId) {
+            /* Client2 slot - check if we need to replace old connection */
+            if (pSession->pClient2 != NULL && pSession->pClient2 != pClient) {
+                /* Old connection still in slot - kick it and replace */
+                pOldConnection = pSession->pClient2;
+                pOldConnection->pSession = NULL;
+                pOldConnection->pPartner = NULL;
+                pOldConnection->state = RELAY_STATE_DISCONNECTED;
+                if (pOldConnection->hDisconnectEvent) {
+                    SetEvent(pOldConnection->hDisconnectEvent);
+                }
+                RelayLog("[SESSION] Replacing stale connection in slot 2\r\n");
+            }
+            pSession->pClient2 = pClient;
+            pSession->client2DisconnectTime = 0;
+            pClient->pSession = pSession;
+            pClient->pPartner = pSession->pClient1;
+            if (pSession->pClient1) {
+                pSession->pClient1->pPartner = pClient;
+            }
+            success = TRUE;
+        }
+        
+        /* Update state if both clients now connected */
+        if (pSession->pClient1 && pSession->pClient2) {
+            pSession->state = SESSION_STATE_ACTIVE;
+        }
+        
+        pSession->lastActivity = GetTickCount();
+    }
+    
+    LeaveCriticalSection(&pServer->csSessions);
+    return success;
+}
+
+/* Destroy a session and cleanup */
+static void DestroySession(PRELAY_SERVER pServer, PRELAY_SESSION pSession)
+{
+    DWORD i;
+    
+    if (!pServer || !pSession) return;
+    
+    EnterCriticalSection(&pServer->csSessions);
+    
+    /* Remove from array */
+    for (i = 0; i < pServer->maxSessions; i++) {
+        if (pServer->sessions[i] == pSession) {
+            pServer->sessions[i] = NULL;
+            if (pServer->activeSessions > 0) {
+                pServer->activeSessions--;
+            }
+            break;
+        }
+    }
+    
+    /* Unlink from any remaining clients */
+    if (pSession->pClient1) {
+        pSession->pClient1->pSession = NULL;
+        pSession->pClient1->pPartner = NULL;
+    }
+    if (pSession->pClient2) {
+        pSession->pClient2->pSession = NULL;
+        pSession->pClient2->pPartner = NULL;
+    }
+    
+    LeaveCriticalSection(&pServer->csSessions);
+    
+    free(pSession);
+}
+
+/* Session cleanup and activity monitoring thread
+ * - Checks lastActivity timestamp for all connections
+ * - If no activity for 30 seconds, connection is considered dead
+ * - No PING/PONG - just monitors actual data flow
+ * - For PAIRED connections, data relay IS the heartbeat */
+static DWORD WINAPI SessionCleanupThread(LPVOID lpParam)
+{
+    PRELAY_SERVER pServer = (PRELAY_SERVER)lpParam;
+    DWORD i;
+    char idStr[20], idStr1[20], idStr2[20];
+    DWORD now;
+    
+    /* Activity timeout - if no data for this long, connection is dead
+     * 30 seconds is generous - active sessions have constant traffic */
+    /* Set to 0 or a very large value to disable inactivity timeout */
+    #define ACTIVITY_TIMEOUT_MS     0 /* Infinite timeout: never disconnect for inactivity */
+    #define CHECK_INTERVAL_MS       5000    /* Check every 5 seconds */
+    
+    while (pServer->bRunning) {
+        Sleep(CHECK_INTERVAL_MS);
+        
+        if (!pServer->bRunning) break;
+        
+        now = GetTickCount();
+        
+        /* === PHASE 1: Check all connections for activity timeout === */
+        EnterCriticalSection(&pServer->csConnections);
+        
+        for (i = 0; i < pServer->maxConnections; i++) {
+            PRELAY_CONNECTION pConn = pServer->connections[i];
+            PRELAY_CONNECTION pPartner;
+            PRELAY_SESSION pSession;
+            DWORD inactiveTime;
+            
+            if (!pConn) continue;
+            if (pConn->socket == INVALID_SOCKET) continue;
+            if (pConn->state == RELAY_STATE_DISCONNECTED) continue;
+            
+            /* Only timeout PAIRED clients (in a session sending data).
+             * REGISTERED clients can wait indefinitely for a partner. */
+            if (pConn->state != RELAY_STATE_PAIRED) continue;
+            
+            /* Must have clientId set */
+            if (pConn->clientId == 0) continue;
+            
+            /* Calculate how long since last activity */
+            inactiveTime = now - pConn->lastActivity;
+            
+            /* If timeout is disabled, never disconnect for inactivity */
+            if (ACTIVITY_TIMEOUT_MS == 0 || inactiveTime < ACTIVITY_TIMEOUT_MS) {
+                continue;
+            }
+            
+            /* No activity for too long - connection is dead */
+            FormatClientId(pConn->clientId, idStr);
+            RelayLog("[TIMEOUT] Client %s inactive for %lu ms - connection dead\r\n", 
+                    idStr, inactiveTime);
+            
+            /* Save partner before we clear references */
+            pPartner = pConn->pPartner;
+            pSession = pConn->pSession;
+            
+            /* Notify partner so they know to stop waiting, then disconnect them too */
+            if (pPartner && pPartner->socket != INVALID_SOCKET) {
+                RELAY_PARTNER_DISCONNECTED notification;
+                char partnerIdStr[20];
+                FormatClientId(pPartner->clientId, partnerIdStr);
+                
+                notification.reason = RELAY_DISCONNECT_TIMEOUT;
+                notification.partnerId = pConn->clientId;
+                SendRelayPacket(pPartner->socket, RELAY_MSG_PARTNER_DISCONNECTED,
+                               (const BYTE*)&notification, sizeof(notification));
+                
+                /* Clear partner's references */
+                pPartner->pPartner = NULL;
+                pPartner->pSession = NULL;
+                
+                /* Also disconnect partner completely - they need to reconnect */
+                if (pPartner->hDisconnectEvent) {
+                    SetEvent(pPartner->hDisconnectEvent);
+                }
+                closesocket(pPartner->socket);
+                pPartner->socket = INVALID_SOCKET;
+                pPartner->state = RELAY_STATE_DISCONNECTED;
+                
+                RelayLog("[TIMEOUT] Partner %s notified and disconnected\r\n", partnerIdStr);
+            }
+            
+            /* Clear dead client's references */
+            pConn->pPartner = NULL;
+            pConn->pSession = NULL;
+            
+            /* Destroy session BEFORE closing socket (synchronous cleanup) */
+            if (pSession) {
+                DWORD sessionId = pSession->sessionId;
+                LeaveCriticalSection(&pServer->csConnections);
+                DestroySession(pServer, pSession);
+                RelayLog("[TIMEOUT] Session %lu destroyed\r\n", sessionId);
+                EnterCriticalSection(&pServer->csConnections);
+            }
+            
+            /* Close socket and signal worker thread */
+            if (pConn->hDisconnectEvent) {
+                SetEvent(pConn->hDisconnectEvent);
+            }
+            if (pConn->socket != INVALID_SOCKET) {
+                closesocket(pConn->socket);
+                pConn->socket = INVALID_SOCKET;
+            }
+            pConn->state = RELAY_STATE_DISCONNECTED;
+        }
+        
+        LeaveCriticalSection(&pServer->csConnections);
+        
+        /* === PHASE 2: Cleanup dead sessions === */
+        EnterCriticalSection(&pServer->csSessions);
+        
+        for (i = 0; i < pServer->maxSessions; i++) {
+            PRELAY_SESSION pSession = pServer->sessions[i];
+            if (!pSession) continue;
+            
+            FormatClientId(pSession->clientId1, idStr1);
+            FormatClientId(pSession->clientId2, idStr2);
+            
+            /* Only clean up sessions where BOTH clients are gone */
+            if (pSession->state == SESSION_STATE_CLOSING) {
+                /* Both clients gone - remove session */
+                LeaveCriticalSection(&pServer->csSessions);
+                RelayLog("[SESSION] Cleanup: Session %lu (%s <-> %s) - both clients gone\r\n",
+                        pSession->sessionId, idStr1, idStr2);
+                DestroySession(pServer, pSession);
+                EnterCriticalSection(&pServer->csSessions);
+            }
+        }
+        
+        LeaveCriticalSection(&pServer->csSessions);
+    }
+    
+    return 0;
+}
+
 /* Check if a socket is still connected (not dead) 
  * Returns TRUE if socket appears alive, FALSE only if definitely dead.
  * Uses conservative checks to avoid false negatives on Wine/Linux. */
@@ -193,20 +570,14 @@ static BOOL IsSocketAlive(SOCKET sock)
     return TRUE;
 }
 
-/* Remove stale connections with same clientId (for reconnection handling) 
- * IMPORTANT: Protect PAIRED connections always, REGISTERED with timeout.
- * Dead sockets will be cleaned up naturally when recv() fails.
- * Returns TRUE if ID is available for registration, FALSE if already in use */
+/* Remove stale connections with same clientId (for reconnection handling)
+ * With session architecture, we allow free reconnection:
+ * - PAIRED in active session: let old connection die naturally, allow new one
+ * - REGISTERED: close old connection immediately, allow new one
+ * - Always returns TRUE - reconnection is always allowed */
 static BOOL RemoveStaleConnections(PRELAY_SERVER pServer, DWORD clientId, PRELAY_CONNECTION pExclude)
 {
     DWORD i;
-    BOOL bIdAvailable = TRUE;
-    DWORD currentTime = GetTickCount();
-    
-    /* Short timeout for registered connections (5 seconds).
-     * This allows legitimate reconnections while preventing rapid loops.
-     * Dead sockets are detected when recv() fails, which triggers cleanup. */
-    #define REGISTERED_TIMEOUT_MS 5000
     
     if (!pServer) return FALSE;
     
@@ -216,35 +587,22 @@ static BOOL RemoveStaleConnections(PRELAY_SERVER pServer, DWORD clientId, PRELAY
         PRELAY_CONNECTION pConn = pServer->connections[i];
         if (pConn && pConn != pExclude && pConn->clientId == clientId) {
             char idStr[20];
-            DWORD idleTime;
             FormatClientId(clientId, idStr);
             
-            /* Check how long since last activity */
-            idleTime = currentTime - pConn->lastActivity;
+            /* Close any existing connection for this ID - allow reconnection */
+            RelayLog("[RECONNECT] Client %s reconnecting, closing old connection (state=%d)\r\n", 
+                    idStr, pConn->state);
             
-            /* PAIRED connections - always protect, never kick out */
-            if (pConn->state == RELAY_STATE_PAIRED) {
-                RelayLog("[PROTECT] ID %s is in active session (PAIRED) - rejecting duplicate\r\n", idStr);
-                bIdAvailable = FALSE;
-                continue;
-            }
-            
-            /* REGISTERED connections - protect unless timed out */
-            if (pConn->state == RELAY_STATE_REGISTERED) {
-                if (idleTime < REGISTERED_TIMEOUT_MS) {
-                    RelayLog("[PROTECT] ID %s is recently registered (%lu ms ago) - rejecting duplicate\r\n", 
-                            idStr, idleTime);
-                    bIdAvailable = FALSE;
-                    continue;
+            /* If it was in a session, destroy it (partner gets fresh session too) */
+            if (pConn->pSession) {
+                /* Clear partner's session reference */
+                if (pConn->pPartner) {
+                    pConn->pPartner->pSession = NULL;
+                    pConn->pPartner->pPartner = NULL;
                 }
-                /* Timed out REGISTERED connection - allow removal */
-                RelayLog("[TIMEOUT] ID %s was REGISTERED but idle for %lu ms - allowing reconnect\r\n", 
-                        idStr, idleTime);
+                DestroySession(pServer, pConn->pSession);
+                pConn->pSession = NULL;
             }
-            
-            /* Remove: DISCONNECTED, CONNECTED(zombie), or timed-out REGISTERED */
-            RelayLog("[CLEANUP] Removing connection for ID %s (state=%d, idle=%lu ms)\r\n", 
-                    idStr, pConn->state, idleTime);
             
             /* Signal disconnect and close socket */
             if (pConn->hDisconnectEvent) {
@@ -265,9 +623,7 @@ static BOOL RemoveStaleConnections(PRELAY_SERVER pServer, DWORD clientId, PRELAY
     }
     
     LeaveCriticalSection(&pServer->csConnections);
-    return bIdAvailable;
-    
-    #undef REGISTERED_TIMEOUT_MS
+    return TRUE;  /* Always allow reconnection */
 }
 
 /* Configure client socket for optimal relay performance */
@@ -354,8 +710,22 @@ static PRELAY_CONNECTION AddConnection(PRELAY_SERVER pServer, SOCKET sock)
 static void RemoveConnection(PRELAY_SERVER pServer, PRELAY_CONNECTION pConn)
 {
     DWORD i;
+    PRELAY_SESSION pSession;
     
     if (!pServer || !pConn) return;
+    
+    /* Clear partner's session reference if exists */
+    if (pConn->pPartner) {
+        pConn->pPartner->pSession = NULL;
+        pConn->pPartner->pPartner = NULL;
+    }
+    
+    /* Destroy session (not preserve) */
+    pSession = FindSessionByClientId(pServer, pConn->clientId);
+    if (pSession) {
+        DestroySession(pServer, pSession);
+    }
+    pConn->pSession = NULL;
     
     EnterCriticalSection(&pServer->csConnections);
     
@@ -414,28 +784,16 @@ static int ProcessRelayMessage(PRELAY_SERVER pServer, PRELAY_CONNECTION pConn,
             RELAY_REGISTER_MSG reg;
             RELAY_REGISTER_RESPONSE response;
             char idStr[20];
-            BOOL bIdAvailable;
             
             if (length < sizeof(RELAY_HEADER) + sizeof(RELAY_REGISTER_MSG)) {
                 return -1;
             }
             CopyMemory(&reg, buffer + sizeof(RELAY_HEADER), sizeof(RELAY_REGISTER_MSG));
             
-            /* Check for stale connections and verify ID is available.
-             * If ID is already in an active PAIRED session, reject this registration. */
-            bIdAvailable = RemoveStaleConnections(pServer, reg.clientId, pConn);
+            /* Close any existing connections with this ID - allows instant reconnection */
+            RemoveStaleConnections(pServer, reg.clientId, pConn);
             
             FormatClientId(reg.clientId, idStr);
-            
-            if (!bIdAvailable) {
-                /* ID is already in use - send duplicate ID error to client */
-                RelayLog("[REJECT] Registration rejected for ID %s - already connected\r\n", idStr);
-                response.status = RELAY_REGISTER_DUPLICATE;
-                response.reserved = 0;
-                SendRelayPacket(pConn->socket, RELAY_MSG_REGISTER_RESPONSE,
-                               (const BYTE*)&response, sizeof(response));
-                return -1;  /* Disconnect after sending response */
-            }
             
             pConn->clientId = reg.clientId;
             pConn->state = RELAY_STATE_REGISTERED;
@@ -455,6 +813,9 @@ static int ProcessRelayMessage(PRELAY_SERVER pServer, PRELAY_CONNECTION pConn,
         case RELAY_MSG_CONNECT_REQUEST: {
             RELAY_CONNECT_REQUEST req;
             char clientIdStr[20], partnerIdStr[20];
+            PRELAY_SESSION pSession;
+            PRELAY_SESSION pExistingSession;
+            
             if (length < sizeof(RELAY_HEADER) + sizeof(RELAY_CONNECT_REQUEST)) {
                 return -1;
             }
@@ -464,47 +825,120 @@ static int ProcessRelayMessage(PRELAY_SERVER pServer, PRELAY_CONNECTION pConn,
             FormatClientId(pConn->clientId, clientIdStr);
             FormatClientId(req.partnerId, partnerIdStr);
             
-            /* Look for partner */
-            pPartner = FindConnectionById(pServer, req.partnerId);
-            if (!pPartner) {
-                /* Partner not connected to relay server */
-                response.status = RD2K_ERR_CONNECT;
-                RelayLog("[CONNECT] Client %s -> Partner %s: NOT ONLINE\r\n", 
-                        clientIdStr, partnerIdStr);
-            } else if (pPartner->state == RELAY_STATE_PAIRED) {
-                /* Partner is already in a session with someone else */
-                response.status = RD2K_ERR_CONNECT;
-                RelayLog("[CONNECT] Client %s -> Partner %s: BUSY (in another session)\r\n", 
-                        clientIdStr, partnerIdStr);
-            } else if (pPartner->state != RELAY_STATE_REGISTERED) {
-                /* Partner in unexpected state */
-                response.status = RD2K_ERR_CONNECT;
-                RelayLog("[CONNECT] Client %s -> Partner %s: NOT READY (state=%d)\r\n", 
-                        clientIdStr, partnerIdStr, pPartner->state);
-            } else {
-                /* Partner available - Pair the connections */
-                RELAY_PARTNER_CONNECTED partnerNotify;
-                
-                pConn->pPartner = pPartner;
-                pPartner->pPartner = pConn;
-                pConn->state = RELAY_STATE_PAIRED;
-                pPartner->state = RELAY_STATE_PAIRED;
+            /* Check for existing session */
+            pExistingSession = FindSessionByClientId(pServer, pConn->clientId);
+            
+            /* If we have an existing session with a DIFFERENT partner, destroy it first */
+            if (pExistingSession && 
+                pExistingSession->clientId1 != req.partnerId && 
+                pExistingSession->clientId2 != req.partnerId) {
+                /* Destroy old session to connect to new partner */
+                RelayLog("[SESSION] Client %s leaving session %lu to connect to new partner %s\r\n",
+                        clientIdStr, pExistingSession->sessionId, partnerIdStr);
+                DestroySession(pServer, pExistingSession);
+                pExistingSession = NULL;  /* No longer in a session */
+            }
+            
+            /* Can we rejoin an existing session with this partner? */
+            if (pExistingSession && 
+                (pExistingSession->clientId1 == req.partnerId || 
+                 pExistingSession->clientId2 == req.partnerId)) {
+                /* This client can rejoin their existing session with this partner */
                 response.status = RD2K_SUCCESS;
                 
-                /* CRITICAL: Notify the partner that someone connected to them!
-                 * Without this, the partner doesn't know they're paired and
-                 * won't start the handshake → authentication fails! */
-                partnerNotify.partnerId = pConn->clientId;
-                partnerNotify.reserved = 0;
-                SendRelayPacket(pPartner->socket, RELAY_MSG_PARTNER_CONNECTED,
-                               (const BYTE*)&partnerNotify, sizeof(partnerNotify));
-                
-                /* Update partner's activity too */
-                pPartner->lastActivity = GetTickCount();
-                
-                RelayLog("[CONNECT] Client %s <-> Partner %s: PAIRED\r\n", 
-                        clientIdStr, partnerIdStr);
-                RelayLog("[NOTIFY] Sent PARTNER_CONNECTED to %s\r\n", partnerIdStr);
+                /* Rejoin the session */
+                pPartner = FindConnectionById(pServer, req.partnerId);
+                if (SessionClientRejoined(pServer, pExistingSession, pConn)) {
+                    RELAY_PARTNER_CONNECTED partnerNotify;
+                    
+                    pConn->state = RELAY_STATE_PAIRED;
+                    
+                    /* Notify partner if they're still connected */
+                    if (pPartner && pPartner->socket != INVALID_SOCKET) {
+                        pPartner->state = RELAY_STATE_PAIRED;
+                        partnerNotify.partnerId = pConn->clientId;
+                        partnerNotify.reserved = 0;
+                        SendRelayPacket(pPartner->socket, RELAY_MSG_PARTNER_CONNECTED,
+                                       (const BYTE*)&partnerNotify, sizeof(partnerNotify));
+                        pPartner->lastActivity = GetTickCount();
+                        RelayLog("[CONNECT] Client %s REJOINED session %lu with %s\r\n", 
+                                clientIdStr, pExistingSession->sessionId, partnerIdStr);
+                    }
+                } else {
+                    response.status = RD2K_ERR_CONNECT;
+                    RelayLog("[CONNECT] Client %s -> Partner %s: REJOIN FAILED\r\n", 
+                            clientIdStr, partnerIdStr);
+                }
+            } else {
+                /* No existing session - look for partner to create new session */
+                pPartner = FindConnectionById(pServer, req.partnerId);
+                if (!pPartner) {
+                    /* Partner not connected to relay server */
+                    response.status = RD2K_ERR_CONNECT;
+                    RelayLog("[CONNECT] Client %s -> Partner %s: NOT ONLINE\r\n", 
+                            clientIdStr, partnerIdStr);
+                } else if (pPartner->state == RELAY_STATE_PAIRED) {
+                    /* Partner is already in a session - check if it's with a different client */
+                    PRELAY_SESSION pPartnerSession = FindSessionByClientId(pServer, req.partnerId);
+                    if (pPartnerSession && 
+                        (pPartnerSession->clientId1 == pConn->clientId || 
+                         pPartnerSession->clientId2 == pConn->clientId)) {
+                        /* Partner is in session with US - rejoin allowed */
+                        response.status = RD2K_SUCCESS;
+                        if (SessionClientRejoined(pServer, pPartnerSession, pConn)) {
+                            RELAY_PARTNER_CONNECTED partnerNotify;
+                            pConn->state = RELAY_STATE_PAIRED;
+                            partnerNotify.partnerId = pConn->clientId;
+                            partnerNotify.reserved = 0;
+                            SendRelayPacket(pPartner->socket, RELAY_MSG_PARTNER_CONNECTED,
+                                           (const BYTE*)&partnerNotify, sizeof(partnerNotify));
+                            pPartner->lastActivity = GetTickCount();
+                            RelayLog("[CONNECT] Client %s REJOINED session with PAIRED partner %s\r\n", 
+                                    clientIdStr, partnerIdStr);
+                        } else {
+                            response.status = RD2K_ERR_CONNECT;
+                        }
+                    } else {
+                        /* Partner is in session with someone else - BUSY */
+                        response.status = RD2K_ERR_CONNECT;
+                        RelayLog("[CONNECT] Client %s -> Partner %s: BUSY (in another session)\r\n", 
+                                clientIdStr, partnerIdStr);
+                    }
+                } else if (pPartner->state != RELAY_STATE_REGISTERED) {
+                    /* Partner in unexpected state */
+                    response.status = RD2K_ERR_CONNECT;
+                    RelayLog("[CONNECT] Client %s -> Partner %s: NOT READY (state=%d)\r\n", 
+                            clientIdStr, partnerIdStr, pPartner->state);
+                } else {
+                    /* Partner available - Create new session and pair */
+                    pSession = CreateSession(pServer, pPartner, pConn);
+                    if (pSession) {
+                        RELAY_PARTNER_CONNECTED partnerNotify;
+                        
+                        pConn->state = RELAY_STATE_PAIRED;
+                        pPartner->state = RELAY_STATE_PAIRED;
+                        response.status = RD2K_SUCCESS;
+                        
+                        /* CRITICAL: Notify the partner that someone connected to them!
+                         * Without this, the partner doesn't know they're paired and
+                         * won't start the handshake → authentication fails! */
+                        partnerNotify.partnerId = pConn->clientId;
+                        partnerNotify.reserved = 0;
+                        SendRelayPacket(pPartner->socket, RELAY_MSG_PARTNER_CONNECTED,
+                                       (const BYTE*)&partnerNotify, sizeof(partnerNotify));
+                        
+                        /* Update partner's activity too */
+                        pPartner->lastActivity = GetTickCount();
+                        
+                        RelayLog("[CONNECT] Client %s <-> Partner %s: NEW SESSION %lu\r\n", 
+                                clientIdStr, partnerIdStr, pSession->sessionId);
+                        RelayLog("[NOTIFY] Sent PARTNER_CONNECTED to %s\r\n", partnerIdStr);
+                    } else {
+                        response.status = RD2K_ERR_CONNECT;
+                        RelayLog("[CONNECT] Client %s -> Partner %s: SESSION CREATION FAILED\r\n", 
+                                clientIdStr, partnerIdStr);
+                    }
+                }
             }
             
             /* Send response to requesting client */
@@ -519,13 +953,30 @@ static int ProcessRelayMessage(PRELAY_SERVER pServer, PRELAY_CONNECTION pConn,
         
         case RELAY_MSG_DATA: {
             DWORD now = GetTickCount();
-            /* Relay data to partner if paired */
+            PRELAY_CONNECTION pTarget = NULL;
+            
+            /* Find partner - prefer pPartner, fallback to session lookup */
             if (pConn->pPartner && pConn->pPartner->socket != INVALID_SOCKET) {
-                SendRelayPacket(pConn->pPartner->socket, RELAY_MSG_DATA,
+                pTarget = pConn->pPartner;
+            } else if (pConn->pSession) {
+                /* Check session for partner */
+                if (pConn->pSession->pClient1 == pConn && 
+                    pConn->pSession->pClient2 && 
+                    pConn->pSession->pClient2->socket != INVALID_SOCKET) {
+                    pTarget = pConn->pSession->pClient2;
+                } else if (pConn->pSession->pClient2 == pConn && 
+                           pConn->pSession->pClient1 && 
+                           pConn->pSession->pClient1->socket != INVALID_SOCKET) {
+                    pTarget = pConn->pSession->pClient1;
+                }
+            }
+            
+            /* Relay data to partner if found */
+            if (pTarget) {
+                SendRelayPacket(pTarget->socket, RELAY_MSG_DATA,
                                buffer + sizeof(RELAY_HEADER), header.dataLength);
-                /* CRITICAL: Update BOTH partners' activity - data flows both ways!
-                 * Without this, the partner times out while receiving data. */
-                pConn->pPartner->lastActivity = now;
+                /* CRITICAL: Update BOTH partners' activity - data flows both ways! */
+                pTarget->lastActivity = now;
             }
             pConn->lastActivity = now;
             return 0;
@@ -533,43 +984,121 @@ static int ProcessRelayMessage(PRELAY_SERVER pServer, PRELAY_CONNECTION pConn,
         
         case RELAY_MSG_DISCONNECT: {
             char idStr[20];
+            PRELAY_SESSION pSession;
+            PRELAY_CONNECTION pPartner;
             FormatClientId(pConn->clientId, idStr);
             RelayLog("[DISCONNECT] Client %s graceful disconnect\r\n", idStr);
             
-            /* CRITICAL: Immediately terminate the entire session!
-             * When one client disconnects, BOTH must be unregistered. */
-            if (pConn->pPartner) {
+            /* Lock before accessing/modifying partner state */
+            EnterCriticalSection(&pServer->csConnections);
+            pPartner = pConn->pPartner;
+            
+            /* When one client disconnects gracefully, notify partner and return them to REGISTERED */
+            if (pPartner) {
                 RELAY_PARTNER_DISCONNECTED notification;
                 char partnerIdStr[20];
-                FormatClientId(pConn->pPartner->clientId, partnerIdStr);
+                FormatClientId(pPartner->clientId, partnerIdStr);
                 
                 /* Notify partner FIRST before we change state */
                 notification.reason = RELAY_DISCONNECT_PARTNER_LEFT;
                 notification.partnerId = pConn->clientId;
-                SendRelayPacket(pConn->pPartner->socket, RELAY_MSG_PARTNER_DISCONNECTED,
+                SendRelayPacket(pPartner->socket, RELAY_MSG_PARTNER_DISCONNECTED,
                                (const BYTE*)&notification, sizeof(notification));
                 
-                /* Signal partner's thread to exit immediately */
-                if (pConn->pPartner->hDisconnectEvent) {
-                    SetEvent(pConn->pPartner->hDisconnectEvent);
-                }
+                /* Partner returns to REGISTERED - stays connected waiting for new pair */
+                pPartner->pPartner = NULL;
+                pPartner->pSession = NULL;
+                pPartner->state = RELAY_STATE_REGISTERED;
+                pPartner->lastActivity = GetTickCount();
                 
-                /* Clear partner linkage */
-                pConn->pPartner->pPartner = NULL;
-                pConn->pPartner->state = RELAY_STATE_DISCONNECTED;
-                pConn->pPartner = NULL;
-                
-                RelayLog("[SESSION] Session terminated, partner %s notified\r\n", partnerIdStr);
+                RelayLog("[SESSION] Partner %s returned to REGISTERED\r\n", partnerIdStr);
             }
             
+            /* Clear this client's references */
+            pConn->pPartner = NULL;
+            pConn->pSession = NULL;
             pConn->state = RELAY_STATE_DISCONNECTED;
+            
+            LeaveCriticalSection(&pServer->csConnections);
+            
+            /* Destroy the session (has its own locking) */
+            pSession = FindSessionByClientId(pServer, pConn->clientId);
+            if (pSession) {
+                DWORD sessionId = pSession->sessionId;
+                DestroySession(pServer, pSession);
+                RelayLog("[SESSION] Session %lu destroyed\r\n", sessionId);
+            }
+            
             return 1;  /* Signal disconnection */
         }
         
         case RELAY_MSG_PING: {
+            /* Client sent PING - respond with PONG and update activity */
             SendRelayPacket(pConn->socket, RELAY_MSG_PONG, NULL, 0);
             pConn->lastActivity = GetTickCount();
             return 0;
+        }
+        
+        case RELAY_MSG_PONG: {
+            /* Client sent PONG - just update activity timestamp */
+            pConn->lastActivity = GetTickCount();
+            return 0;
+        }
+        
+        case RELAY_MSG_UNPAIR: {
+            /* End pairing gracefully - this client disconnects, partner stays REGISTERED.
+             * Partner remains online and ready for a new connection. */
+            char idStr[20];
+            PRELAY_SESSION pSession;
+            PRELAY_CONNECTION pPartner;
+            FormatClientId(pConn->clientId, idStr);
+            RelayLog("[UNPAIR] Client %s ending session\r\n", idStr);
+            
+            /* Lock before accessing/modifying partner state */
+            EnterCriticalSection(&pServer->csConnections);
+            pPartner = pConn->pPartner;
+            
+            /* Notify partner and return them to REGISTERED */
+            if (pPartner) {
+                RELAY_PARTNER_DISCONNECTED notification;
+                char partnerIdStr[20];
+                FormatClientId(pPartner->clientId, partnerIdStr);
+                
+                notification.reason = RELAY_DISCONNECT_PARTNER_LEFT;
+                notification.partnerId = pConn->clientId;
+                SendRelayPacket(pPartner->socket, RELAY_MSG_PARTNER_DISCONNECTED,
+                               (const BYTE*)&notification, sizeof(notification));
+                
+                /* Partner returns to REGISTERED - stays connected waiting for new pair */
+                pPartner->pPartner = NULL;
+                pPartner->pSession = NULL;
+                pPartner->state = RELAY_STATE_REGISTERED;
+                pPartner->lastActivity = GetTickCount();
+                
+                RelayLog("[SESSION] Partner %s returned to REGISTERED\r\n", partnerIdStr);
+            }
+            
+            /* Clear this client's references before destroying session */
+            pConn->pPartner = NULL;
+            pConn->pSession = NULL;
+            /* CRITICAL FIX: Keep client REGISTERED instead of disconnecting!
+             * This allows them to immediately connect to another partner
+             * without having to re-register with the relay server. */
+            pConn->state = RELAY_STATE_REGISTERED;
+            pConn->lastActivity = GetTickCount();
+            
+            LeaveCriticalSection(&pServer->csConnections);
+            
+            /* Destroy the session completely (has its own locking) */
+            pSession = FindSessionByClientId(pServer, pConn->clientId);
+            if (pSession) {
+                DWORD sessionId = pSession->sessionId;
+                DestroySession(pServer, pSession);
+                RelayLog("[SESSION] Session %lu destroyed\r\n", sessionId);
+            }
+            
+            RelayLog("[SESSION] Client %s returned to REGISTERED (unpair)\r\n", idStr);
+            return 0;  /* Stay connected - keep processing messages */
         }
         
         default:
@@ -664,13 +1193,24 @@ static DWORD WINAPI ClientWorkerThread(LPVOID lpParam)
     /* Initialize last activity time for timeout tracking */
     pConn->lastActivity = GetTickCount();
     
-    /* Connection loop - proper TCP stream handling */
+    /* ========================================================================
+     * SESSION-BASED ARCHITECTURE - NO PINGS NEEDED!
+     * ========================================================================
+     * With session logic:
+     * - Sessions persist even when clients disconnect
+     * - Clients can rejoin anytime using session ID
+     * - TCP tells us when connections die (recv returns 0 or error)
+     * - No need to actively probe connections
+     * 
+     * This is simple and elegant - just wait for data or natural socket death.
+     * ======================================================================== */
+    
+    /* Connection loop - simple and clean */
     while (pConn->state != RELAY_STATE_DISCONNECTED && pServer->bRunning) {
         RELAY_HEADER header;
+        DWORD dataLength;
         DWORD totalPacketSize;
         int recvLen;
-        DWORD currentTime;
-        DWORD inactiveTime;
         
         /* Check for disconnect event (non-blocking) */
         if (WaitForSingleObject(pConn->hDisconnectEvent, 0) == WAIT_OBJECT_0) {
@@ -678,27 +1218,18 @@ static DWORD WINAPI ClientWorkerThread(LPVOID lpParam)
             break;
         }
         
-        /* Step 1: Receive the relay header (8 bytes) - wait up to 1 second */
-        recvLen = RecvExact(pConn->socket, (BYTE*)&header, sizeof(RELAY_HEADER), 1000);
+        /* Wait for data - 5 second timeout just to check disconnect event periodically */
+        recvLen = RecvExact(pConn->socket, (BYTE*)&header, sizeof(RELAY_HEADER), 5000);
         
         if (recvLen == 0) {
-            /* Timeout with no data - check for inactivity timeout */
-            currentTime = GetTickCount();
-            inactiveTime = currentTime - pConn->lastActivity;
-            
-            if (inactiveTime > CLIENT_INACTIVITY_TIMEOUT_MS) {
-                char idStr[20];
-                FormatClientId(pConn->clientId, idStr);
-                RelayLog("[TIMEOUT] Client %s inactive for %lu ms - disconnecting\r\n", 
-                        idStr, inactiveTime);
-                break;
-            }
+            /* Timeout with no data - that's fine, just loop and wait more.
+             * Session logic means we don't need to ping - client is free to be idle. */
             continue;
         }
         
         if (recvLen < 0) {
-            RelayLog("[ERROR] Socket error receiving header\r\n");
-            break;  /* Socket error */
+            /* Socket error - connection is dead, clean exit */
+            break;
         }
         
         if (recvLen < (int)sizeof(RELAY_HEADER)) {
@@ -706,37 +1237,39 @@ static DWORD WINAPI ClientWorkerThread(LPVOID lpParam)
             break;  /* Protocol error - incomplete header after timeout */
         }
         
-        /* Step 2: Validate header and calculate total data needed */
-        totalPacketSize = sizeof(RELAY_HEADER) + header.dataLength;
+        /* Copy header to buffer for later processing */
+        CopyMemory(buffer, &header, sizeof(RELAY_HEADER));
+        dataLength = header.dataLength;
+        totalPacketSize = sizeof(RELAY_HEADER) + dataLength;
         
-        if (header.dataLength > RELAY_BUFFER_SIZE - sizeof(RELAY_HEADER)) {
-            RelayLog("[ERROR] Invalid data length: %lu bytes (msgType=0x%02X)\r\n", 
-                    (unsigned long)header.dataLength, header.msgType);
+        /* Sanity check on data length */
+        if (dataLength > RELAY_BUFFER_SIZE - sizeof(RELAY_HEADER)) {
+            RelayLog("[ERROR] Invalid data length: %lu bytes\r\n", (unsigned long)dataLength);
             break;  /* Protocol error or corrupted stream */
         }
         
-        /* Step 3: Copy header to buffer */
-        CopyMemory(buffer, &header, sizeof(RELAY_HEADER));
-        
-        /* Step 4: Receive the data payload if any */
-        if (header.dataLength > 0) {
+        /* Step 2: Receive the data payload if any */
+        if (dataLength > 0) {
             /* Wait up to 30 seconds for large data transfers */
             recvLen = RecvExact(pConn->socket, buffer + sizeof(RELAY_HEADER), 
-                               header.dataLength, 30000);
+                               dataLength, 30000);
             
             if (recvLen < 0) {
                 RelayLog("[ERROR] Socket error receiving data\r\n");
                 break;  /* Socket error */
             }
             
-            if (recvLen < (int)header.dataLength) {
+            if (recvLen < (int)dataLength) {
                 RelayLog("[WARN] Incomplete data: got %d, expected %lu\r\n", 
-                        recvLen, (unsigned long)header.dataLength);
+                        recvLen, (unsigned long)dataLength);
                 break;  /* Protocol error - incomplete data after timeout */
             }
         }
         
-        /* Step 5: Process the complete message */
+        /* Update activity timestamp */
+        pConn->lastActivity = GetTickCount();
+        
+        /* Step 3: Process the message */
         result = ProcessRelayMessage(pServer, pConn, buffer, totalPacketSize);
         if (result != 0 && result != RD2K_SUCCESS) {
             /* result = 1 means graceful disconnect (RELAY_MSG_DISCONNECT)
@@ -745,9 +1278,11 @@ static DWORD WINAPI ClientWorkerThread(LPVOID lpParam)
         }
     }
     
-    /* Cleanup - IMPORTANT: Notify partner before disconnecting */
+    /* Cleanup - IMPORTANT: Notify partner and destroy session */
     {
         char idStr[20];
+        PRELAY_SESSION pSession;
+        PRELAY_CONNECTION pPartner;
         FormatClientId(pConn->clientId, idStr);
         
         /* Log proper disconnect message */
@@ -757,37 +1292,53 @@ static DWORD WINAPI ClientWorkerThread(LPVOID lpParam)
             RelayLog("[DISCONNECT] Unregistered client connection closed\r\n");
         }
         
-        /* If we have a partner, notify them that we disconnected */
-        if (pConn->pPartner && pConn->pPartner->socket != INVALID_SOCKET) {
+        /* Lock before accessing/modifying partner state */
+        EnterCriticalSection(&pServer->csConnections);
+        pPartner = pConn->pPartner;
+        
+        /* If we have a partner, notify them and return to REGISTERED */
+        if (pPartner && pPartner->socket != INVALID_SOCKET) {
             RELAY_PARTNER_DISCONNECTED notification;
             char partnerIdStr[20];
             
-            FormatClientId(pConn->pPartner->clientId, partnerIdStr);
+            FormatClientId(pPartner->clientId, partnerIdStr);
             
             notification.reason = RELAY_DISCONNECT_PARTNER_LEFT;
             notification.partnerId = pConn->clientId;
             
             /* Send notification to partner - don't wait for success */
-            SendRelayPacket(pConn->pPartner->socket, RELAY_MSG_PARTNER_DISCONNECTED,
+            SendRelayPacket(pPartner->socket, RELAY_MSG_PARTNER_DISCONNECTED,
                            (const BYTE*)&notification, sizeof(notification));
             
             RelayLog("[NOTIFY] Sent disconnect notification to partner %s\r\n", partnerIdStr);
             
-            /* Signal partner's worker thread to exit */
-            if (pConn->pPartner->hDisconnectEvent) {
-                SetEvent(pConn->pPartner->hDisconnectEvent);
-            }
+            /* Partner goes back to REGISTERED state with no session */
+            pPartner->pPartner = NULL;
+            pPartner->pSession = NULL;
+            pPartner->state = RELAY_STATE_REGISTERED;
+            pPartner->lastActivity = GetTickCount();
             
-            /* Clear the partner's reference to us and mark DISCONNECTED
-             * CRITICAL: Partner must be DISCONNECTED, not REGISTERED!
-             * This ensures their ID is cleaned up when they reconnect. */
-            pConn->pPartner->pPartner = NULL;
-            pConn->pPartner->state = RELAY_STATE_DISCONNECTED;
+            RelayLog("[SESSION] Partner %s returned to REGISTERED\r\n", partnerIdStr);
+        }
+        
+        /* Clear this client's references */
+        pConn->pPartner = NULL;
+        pConn->pSession = NULL;
+        
+        LeaveCriticalSection(&pServer->csConnections);
+        
+        /* Destroy the session (has its own locking) */
+        pSession = FindSessionByClientId(pServer, pConn->clientId);
+        if (pSession) {
+            DWORD sessionId = pSession->sessionId;
+            DestroySession(pServer, pSession);
+            RelayLog("[SESSION] Session %lu destroyed\r\n", sessionId);
         }
     }
     
     pConn->state = RELAY_STATE_DISCONNECTED;
     pConn->pPartner = NULL;
+    pConn->pSession = NULL;
     
     free(buffer);  /* Free heap buffer */
     
@@ -925,26 +1476,39 @@ PRELAY_SERVER Relay_Create(WORD port, const char* ipAddr)
     pServer->activeConnections = 0;
     pServer->bRunning = FALSE;
     
+    /* Initialize session management */
+    pServer->maxSessions = RELAY_MAX_SESSIONS;
+    pServer->activeSessions = 0;
+    pServer->nextSessionId = 0;
+    pServer->hSessionCleanupThread = NULL;
+    
     /* Allocate connection arrays */
     pServer->connectionSockets = (SOCKET*)calloc(RELAY_MAX_CONNECTIONS, sizeof(SOCKET));
     pServer->connections = (PRELAY_CONNECTION*)calloc(RELAY_MAX_CONNECTIONS, sizeof(PRELAY_CONNECTION*));
     
-    if (!pServer->connectionSockets || !pServer->connections) {
+    /* Allocate session array */
+    pServer->sessions = (PRELAY_SESSION*)calloc(RELAY_MAX_SESSIONS, sizeof(PRELAY_SESSION));
+    
+    if (!pServer->connectionSockets || !pServer->connections || !pServer->sessions) {
         if (pServer->connectionSockets) free(pServer->connectionSockets);
         if (pServer->connections) free(pServer->connections);
+        if (pServer->sessions) free(pServer->sessions);
         free(pServer);
         return NULL;
     }
     
-    /* Initialize critical section */
+    /* Initialize critical sections */
     InitializeCriticalSection(&pServer->csConnections);
+    InitializeCriticalSection(&pServer->csSessions);
     
     /* Create stop event */
     pServer->hStopEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
     if (!pServer->hStopEvent) {
         free(pServer->connectionSockets);
         free(pServer->connections);
+        free(pServer->sessions);
         DeleteCriticalSection(&pServer->csConnections);
+        DeleteCriticalSection(&pServer->csSessions);
         free(pServer);
         return NULL;
     }
@@ -955,7 +1519,9 @@ PRELAY_SERVER Relay_Create(WORD port, const char* ipAddr)
         CloseHandle(pServer->hStopEvent);
         free(pServer->connectionSockets);
         free(pServer->connections);
+        free(pServer->sessions);
         DeleteCriticalSection(&pServer->csConnections);
+        DeleteCriticalSection(&pServer->csSessions);
         free(pServer);
         return NULL;
     }
@@ -979,7 +1545,9 @@ PRELAY_SERVER Relay_Create(WORD port, const char* ipAddr)
         CloseHandle(pServer->hStopEvent);
         free(pServer->connectionSockets);
         free(pServer->connections);
+        free(pServer->sessions);
         DeleteCriticalSection(&pServer->csConnections);
+        DeleteCriticalSection(&pServer->csSessions);
         free(pServer);
         return NULL;
     }
@@ -991,7 +1559,9 @@ PRELAY_SERVER Relay_Create(WORD port, const char* ipAddr)
         CloseHandle(pServer->hStopEvent);
         free(pServer->connectionSockets);
         free(pServer->connections);
+        free(pServer->sessions);
         DeleteCriticalSection(&pServer->csConnections);
+        DeleteCriticalSection(&pServer->csSessions);
         free(pServer);
         return NULL;
     }
@@ -1016,6 +1586,15 @@ int Relay_Start(PRELAY_SERVER pServer)
     }
     
     pServer->hServerThread = hThread;
+    
+    /* Create session cleanup thread */
+    pServer->hSessionCleanupThread = CreateThread(NULL, 0, SessionCleanupThread, 
+                                                   (LPVOID)pServer, 0, &threadId);
+    if (!pServer->hSessionCleanupThread) {
+        RelayLog("[WARNING] Failed to create session cleanup thread\r\n");
+        /* Continue anyway - sessions will just pile up */
+    }
+    
     return RD2K_SUCCESS;
 }
 
@@ -1030,6 +1609,13 @@ void Relay_Stop(PRELAY_SERVER pServer)
     /* Signal stop event */
     if (pServer->hStopEvent) {
         SetEvent(pServer->hStopEvent);
+    }
+    
+    /* Wait for session cleanup thread */
+    if (pServer->hSessionCleanupThread) {
+        WaitForSingleObject(pServer->hSessionCleanupThread, 3000);
+        CloseHandle(pServer->hSessionCleanupThread);
+        pServer->hSessionCleanupThread = NULL;
     }
     
     /* Wait for server thread */
@@ -1057,6 +1643,14 @@ void Relay_Destroy(PRELAY_SERVER pServer)
     
     Relay_Stop(pServer);
     
+    /* Clean up all sessions */
+    for (i = 0; i < pServer->maxSessions; i++) {
+        if (pServer->sessions[i]) {
+            free(pServer->sessions[i]);
+            pServer->sessions[i] = NULL;
+        }
+    }
+    
     /* Clean up all connections */
     for (i = 0; i < pServer->maxConnections; i++) {
         if (pServer->connections[i]) {
@@ -1075,9 +1669,11 @@ void Relay_Destroy(PRELAY_SERVER pServer)
     }
     
     DeleteCriticalSection(&pServer->csConnections);
+    DeleteCriticalSection(&pServer->csSessions);
     
     if (pServer->connectionSockets) free(pServer->connectionSockets);
     if (pServer->connections) free(pServer->connections);
+    if (pServer->sessions) free(pServer->sessions);
     
     free(pServer);
 }
@@ -1291,12 +1887,21 @@ int Relay_RecvData(SOCKET relaySocket, BYTE *buffer, DWORD bufferSize, DWORD tim
     
     /* Handle non-DATA messages */
     if (header.msgType != RELAY_MSG_DATA) {
-        if (header.msgType == RELAY_MSG_DISCONNECT) {
-            return RD2K_ERR_DISCONNECTED;
-        }
+        /* Consume payload if present */
         if (header.dataLength > 0 && header.dataLength < bufferSize) {
             RecvExactRelay(relaySocket, buffer, header.dataLength, 1000);
         }
+        
+        if (header.msgType == RELAY_MSG_DISCONNECT) {
+            return RD2K_ERR_DISCONNECTED;
+        }
+        if (header.msgType == RELAY_MSG_PARTNER_DISCONNECTED) {
+            return RD2K_ERR_PARTNER_LEFT;  /* Critical: inform client their partner left! */
+        }
+        if (header.msgType == RELAY_MSG_PARTNER_CONNECTED) {
+            return 0;  /* Partner reconnected - caller can continue */
+        }
+        /* PONG or other control message - ignore */
         return 0;
     }
     
