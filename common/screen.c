@@ -54,49 +54,8 @@ PSCREEN_CAPTURE ScreenCapture_Create(void)
             pCapture->width, pCapture->height, pCapture->bitsPerPixel);
     ScreenLog(buf);
     
-    hdcScreen = GetDC(NULL);
-    if (!hdcScreen) {
-        ScreenLog("[CREATE] FAILED GetDC(NULL)\r\n");
-        free(pCapture);
-        return NULL;
-    }
-    
-    ScreenLog("[CREATE] Got screen DC\r\n");
-    
-    pCapture->hdcScreen = hdcScreen;
-    pCapture->hdcMemory = CreateCompatibleDC(hdcScreen);
-    if (!pCapture->hdcMemory) {
-        ScreenLog("[CREATE] FAILED CreateCompatibleDC\r\n");
-        ReleaseDC(NULL, hdcScreen);
-        free(pCapture);
-        return NULL;
-    }
-    
-    ScreenLog("[CREATE] Created compatible DC for memory\r\n");
-    
-    ZeroMemory(&pCapture->bmpInfo, sizeof(BITMAPINFO));
-    pCapture->bmpInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    pCapture->bmpInfo.bmiHeader.biWidth = pCapture->width;
-    pCapture->bmpInfo.bmiHeader.biHeight = -pCapture->height;
-    pCapture->bmpInfo.bmiHeader.biPlanes = 1;
-    pCapture->bmpInfo.bmiHeader.biBitCount = 24;
-    pCapture->bmpInfo.bmiHeader.biCompression = BI_RGB;
-    
-    pCapture->hBitmap = CreateDIBSection(
-        pCapture->hdcMemory, &pCapture->bmpInfo, DIB_RGB_COLORS,
-        (void**)&pCapture->pPixelData, NULL, 0);
-    
-    if (!pCapture->hBitmap) {
-        ScreenLog("[CREATE] FAILED CreateDIBSection\r\n");
-        DeleteDC(pCapture->hdcMemory);
-        ReleaseDC(NULL, hdcScreen);
-        free(pCapture);
-        return NULL;
-    }
-    
-    ScreenLog("[CREATE] Created DIB section\r\n");
-    
-    pCapture->hBitmapOld = (HBITMAP)SelectObject(pCapture->hdcMemory, pCapture->hBitmap);
+    /* DIB section will be created fresh on each frame capture */
+    ScreenLog("[CREATE] DIB creation deferred to frame capture\r\n");
     pCapture->pixelDataSize = ((pCapture->width * 3 + 3) & ~3) * pCapture->height;
     pCapture->pPrevFrame = (BYTE*)calloc(1, pCapture->pixelDataSize);
     pCapture->compressBufferSize = pCapture->pixelDataSize + (pCapture->pixelDataSize / 8) + 256;
@@ -121,18 +80,11 @@ void ScreenCapture_Destroy(PSCREEN_CAPTURE pCapture)
 {
     if (!pCapture) return;
     
+    /* Free comparison and compression buffers */
     SAFE_FREE(pCapture->pPrevFrame);
     SAFE_FREE(pCapture->pCompressBuffer);
     
-    if (pCapture->hdcMemory) {
-        if (pCapture->hBitmapOld) {
-            SelectObject(pCapture->hdcMemory, pCapture->hBitmapOld);
-        }
-        DeleteDC(pCapture->hdcMemory);
-    }
-    
-    if (pCapture->hBitmap) DeleteObject(pCapture->hBitmap);
-    if (pCapture->hdcScreen) ReleaseDC(NULL, pCapture->hdcScreen);
+    /* Device contexts and DIB are created/destroyed per-frame, not cached */
     
     free(pCapture);
 }
@@ -140,17 +92,18 @@ void ScreenCapture_Destroy(PSCREEN_CAPTURE pCapture)
 int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
 {
     HDC hdcScreen, hdcMemory;
-    HBITMAP hBitmapOld;
+    HBITMAP hBitmap, hBitmapOld;
+    BYTE *pPixelData;
     int result = RD2K_ERR_SCREEN;
     
-    if (!pCapture || !pCapture->pPixelData) {
-        ScreenLog("[CAPTURE] Invalid pCapture or pPixelData\r\n");
+    if (!pCapture) {
+        ScreenLog("[CAPTURE] Invalid pCapture\r\n");
         return RD2K_ERR_SCREEN;
     }
     
     ScreenLog("[CAPTURE] Starting screen capture\r\n");
     
-    /* Recreate device contexts on each capture to handle desktop switches */
+    /* Get fresh screen DC on each frame */
     hdcScreen = GetDC(NULL);
     if (!hdcScreen) {
         ScreenLog("[CAPTURE] FAILED GetDC(NULL)\r\n");
@@ -159,6 +112,7 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
     
     ScreenLog("[CAPTURE] Got screen DC\r\n");
     
+    /* Create fresh memory DC from current screen DC */
     hdcMemory = CreateCompatibleDC(hdcScreen);
     if (!hdcMemory) {
         ScreenLog("[CAPTURE] FAILED CreateCompatibleDC\r\n");
@@ -168,23 +122,47 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
     
     ScreenLog("[CAPTURE] Created memory DC\r\n");
     
-    /* Select the bitmap into the memory DC */
-    hBitmapOld = (HBITMAP)SelectObject(hdcMemory, pCapture->hBitmap);
-    if (!hBitmapOld) {
-        ScreenLog("[CAPTURE] FAILED SelectObject\r\n");
+    /* Create FRESH DIB section on each frame (not reusing) */
+    ZeroMemory(&pCapture->bmpInfo, sizeof(BITMAPINFO));
+    pCapture->bmpInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    pCapture->bmpInfo.bmiHeader.biWidth = pCapture->width;
+    pCapture->bmpInfo.bmiHeader.biHeight = -pCapture->height;
+    pCapture->bmpInfo.bmiHeader.biPlanes = 1;
+    pCapture->bmpInfo.bmiHeader.biBitCount = 24;
+    pCapture->bmpInfo.bmiHeader.biCompression = BI_RGB;
+    
+    hBitmap = CreateDIBSection(
+        hdcMemory, &pCapture->bmpInfo, DIB_RGB_COLORS,
+        (void**)&pPixelData, NULL, 0);
+    
+    if (!hBitmap || !pPixelData) {
+        ScreenLog("[CAPTURE] FAILED CreateDIBSection\r\n");
         DeleteDC(hdcMemory);
         ReleaseDC(NULL, hdcScreen);
         return RD2K_ERR_SCREEN;
     }
     
-    ScreenLog("[CAPTURE] Selected bitmap into DC\r\n");
+    ScreenLog("[CAPTURE] Created fresh DIB section\r\n");
+    
+    /* Select the fresh bitmap into the memory DC */
+    hBitmapOld = (HBITMAP)SelectObject(hdcMemory, hBitmap);
+    if (!hBitmapOld) {
+        ScreenLog("[CAPTURE] FAILED SelectObject on fresh DIB\r\n");
+        DeleteObject(hBitmap);
+        DeleteDC(hdcMemory);
+        ReleaseDC(NULL, hdcScreen);
+        return RD2K_ERR_SCREEN;
+    }
+    
+    ScreenLog("[CAPTURE] Selected fresh bitmap into DC\r\n");
     
     /* Perform the screen capture */
     if (!BitBlt(hdcMemory, 0, 0, 
                 pCapture->width, pCapture->height,
                 hdcScreen, 0, 0, SRCCOPY)) {
-        ScreenLog("[CAPTURE] FAILED BitBlt - access violation likely here\r\n");
+        ScreenLog("[CAPTURE] FAILED BitBlt\r\n");
         SelectObject(hdcMemory, hBitmapOld);
+        DeleteObject(hBitmap);
         DeleteDC(hdcMemory);
         ReleaseDC(NULL, hdcScreen);
         return RD2K_ERR_SCREEN;
@@ -192,8 +170,12 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
     
     ScreenLog("[CAPTURE] BitBlt successful\r\n");
     
+    /* Copy pixel data from fresh DIB to our persistent buffer */
+    pCapture->pPixelData = pPixelData;
+    
     /* Restore and cleanup */
     SelectObject(hdcMemory, hBitmapOld);
+    DeleteObject(hBitmap);
     DeleteDC(hdcMemory);
     ReleaseDC(NULL, hdcScreen);
     
