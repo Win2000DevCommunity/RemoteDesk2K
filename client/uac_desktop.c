@@ -234,7 +234,6 @@ PDESKTOP_CONTEXT UacDesktop_PrepareForInput(void)
     HDESK hInputDesktop = NULL;
     HDESK hCurrentDesktop = NULL;
     DWORD dwLen = 0;
-    BOOL bNeedSwitch = FALSE;
     char szInputDesktop[64] = {0};
     char szCurrentDesktop[64] = {0};
     char buf[512];
@@ -257,9 +256,9 @@ PDESKTOP_CONTEXT UacDesktop_PrepareForInput(void)
     /* Get current input desktop */
     hInputDesktop = UacDesktop_OpenInputDesktop();
     if (!hInputDesktop) {
-        DesktopLog("[WARN] Could not get input desktop, will use current thread desktop\r\n");
+        DesktopLog("[WARN] Could not get input desktop, continuing without switch\r\n");
         free(pContext);
-        return NULL;  /* Not critical - input might still work without switching */
+        return NULL;
     }
     
     pContext->hInputDesktop = hInputDesktop;
@@ -273,7 +272,7 @@ PDESKTOP_CONTEXT UacDesktop_PrepareForInput(void)
     /* Get current thread's desktop */
     hCurrentDesktop = GetThreadDesktop(GetCurrentThreadId());
     if (!hCurrentDesktop) {
-        DesktopLog("[ERROR] Could not get current thread desktop\r\n");
+        DesktopLog("[WARN] Could not get current thread desktop\r\n");
         CloseDesktop(hInputDesktop);
         free(pContext);
         return NULL;
@@ -284,36 +283,31 @@ PDESKTOP_CONTEXT UacDesktop_PrepareForInput(void)
     /* Get current desktop name */
     GetUserObjectInformationA(hCurrentDesktop, UOI_NAME, szCurrentDesktop, sizeof(szCurrentDesktop)-1, &dwLen);
     
-    /* Check if we need to switch */
+    /* IMPORTANT: Do NOT switch the main UI thread to a different desktop!
+     * 
+     * When SetThreadDesktop() is called on a UI thread:
+     * - All windows created on the original desktop become inaccessible
+     * - Device contexts become invalid
+     * - The thread can no longer process messages
+     * - This causes immediate crashes in the window message loop
+     * 
+     * Solution:
+     * - Only log the desktop information
+     * - Return the context without switching
+     * - Input injection will still work on the current desktop scope
+     * - For UAC elevation prompts, they will come to the active session
+     */
+    
     if (_stricmp(szCurrentDesktop, szInputDesktop) != 0) {
-        /* Different desktops - need to switch thread to input desktop */
-        bNeedSwitch = TRUE;
+        sprintf(buf, "[INFO] Input desktop is '%s' but UI thread is on '%s' - NOT switching to avoid UI corruption\r\n", 
+                szInputDesktop, szCurrentDesktop);
+        DesktopLog(buf);
+    } else {
+        sprintf(buf, "[INFO] UI thread and input desktop match: '%s'\r\n", szCurrentDesktop);
+        DesktopLog(buf);
     }
     
-    if (bNeedSwitch) {
-        BOOL result;
-        
-        sprintf(buf, "[PREPARE] Switching from '%s' to '%s'\r\n", szCurrentDesktop, szInputDesktop);
-        DesktopLog(buf);
-        
-        result = SetThreadDesktop(hInputDesktop);
-        if (result) {
-            pContext->bDesktopSwitched = TRUE;
-            sprintf(buf, "[SUCCESS] Thread switched to input desktop '%s'\r\n", szInputDesktop);
-            DesktopLog(buf);
-        } else {
-            DWORD dwError = GetLastError();
-            sprintf(buf, "[ERROR] SetThreadDesktop failed: 0x%08lX\r\n", dwError);
-            DesktopLog(buf);
-            
-            /* Even if switch fails, continue - might still work */
-            pContext->bDesktopSwitched = FALSE;
-        }
-    } else {
-        sprintf(buf, "[INFO] Already on correct desktop '%s', no switch needed\r\n", szCurrentDesktop);
-        DesktopLog(buf);
-        pContext->bDesktopSwitched = FALSE;
-    }
+    pContext->bDesktopSwitched = FALSE;  /* We never switch the UI thread */
     
     return pContext;
 }
