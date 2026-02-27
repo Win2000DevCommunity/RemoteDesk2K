@@ -3,6 +3,19 @@
  */
 
 #include "screen.h"
+#include <stdio.h>
+
+static void ScreenLog(const char *msg)
+{
+    FILE *f = fopen("rd2k_debug.log", "a");
+    if (f) {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        fprintf(f, "[%02d:%02d:%02d.%03d] [SCREEN] %s", 
+                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg);
+        fclose(f);
+    }
+}
 
 void ScreenCapture_GetDimensions(int *pWidth, int *pHeight)
 {
@@ -22,26 +35,44 @@ PSCREEN_CAPTURE ScreenCapture_Create(void)
 {
     PSCREEN_CAPTURE pCapture;
     HDC hdcScreen;
+    char buf[256];
+    
+    ScreenLog("[CREATE] Starting screen capture initialization\r\n");
     
     pCapture = (PSCREEN_CAPTURE)calloc(1, sizeof(SCREEN_CAPTURE));
-    if (!pCapture) return NULL;
+    if (!pCapture) {
+        ScreenLog("[CREATE] FAILED to allocate PSCREEN_CAPTURE\r\n");
+        return NULL;
+    }
+    
+    ScreenLog("[CREATE] Allocated pCapture structure\r\n");
     
     ScreenCapture_GetDimensions(&pCapture->width, &pCapture->height);
     pCapture->bitsPerPixel = ScreenCapture_GetColorDepth();
     
+    sprintf(buf, "[CREATE] Screen dimensions: %dx%d, BPP=%d\r\n", 
+            pCapture->width, pCapture->height, pCapture->bitsPerPixel);
+    ScreenLog(buf);
+    
     hdcScreen = GetDC(NULL);
     if (!hdcScreen) {
+        ScreenLog("[CREATE] FAILED GetDC(NULL)\r\n");
         free(pCapture);
         return NULL;
     }
     
+    ScreenLog("[CREATE] Got screen DC\r\n");
+    
     pCapture->hdcScreen = hdcScreen;
     pCapture->hdcMemory = CreateCompatibleDC(hdcScreen);
     if (!pCapture->hdcMemory) {
+        ScreenLog("[CREATE] FAILED CreateCompatibleDC\r\n");
         ReleaseDC(NULL, hdcScreen);
         free(pCapture);
         return NULL;
     }
+    
+    ScreenLog("[CREATE] Created compatible DC for memory\r\n");
     
     ZeroMemory(&pCapture->bmpInfo, sizeof(BITMAPINFO));
     pCapture->bmpInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -56,18 +87,33 @@ PSCREEN_CAPTURE ScreenCapture_Create(void)
         (void**)&pCapture->pPixelData, NULL, 0);
     
     if (!pCapture->hBitmap) {
+        ScreenLog("[CREATE] FAILED CreateDIBSection\r\n");
         DeleteDC(pCapture->hdcMemory);
         ReleaseDC(NULL, hdcScreen);
         free(pCapture);
         return NULL;
     }
     
+    ScreenLog("[CREATE] Created DIB section\r\n");
+    
     pCapture->hBitmapOld = (HBITMAP)SelectObject(pCapture->hdcMemory, pCapture->hBitmap);
     pCapture->pixelDataSize = ((pCapture->width * 3 + 3) & ~3) * pCapture->height;
     pCapture->pPrevFrame = (BYTE*)calloc(1, pCapture->pixelDataSize);
     pCapture->compressBufferSize = pCapture->pixelDataSize + (pCapture->pixelDataSize / 8) + 256;
-    pCapture->pCompressBuffer = (BYTE*)calloc(1, pCapture->compressBufferSize);  /* Zero to avoid garbage */
+    pCapture->pCompressBuffer = (BYTE*)calloc(1, pCapture->compressBufferSize);
     
+    if (!pCapture->pPrevFrame || !pCapture->pCompressBuffer) {
+        ScreenLog("[CREATE] FAILED to allocate frame/compress buffers\r\n");
+        if (pCapture->pPrevFrame) free(pCapture->pPrevFrame);
+        if (pCapture->pCompressBuffer) free(pCapture->pCompressBuffer);
+        DeleteDC(pCapture->hdcMemory);
+        ReleaseDC(NULL, hdcScreen);
+        DeleteObject(pCapture->hBitmap);
+        free(pCapture);
+        return NULL;
+    }
+    
+    ScreenLog("[CREATE] Screen capture initialization COMPLETE\r\n");
     return pCapture;
 }
 
@@ -98,39 +144,53 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
     int result = RD2K_ERR_SCREEN;
     
     if (!pCapture || !pCapture->pPixelData) {
+        ScreenLog("[CAPTURE] Invalid pCapture or pPixelData\r\n");
         return RD2K_ERR_SCREEN;
     }
     
+    ScreenLog("[CAPTURE] Starting screen capture\r\n");
+    
     /* Recreate device contexts on each capture to handle desktop switches */
-    /* This prevents crashes when thread switches between desktops */
     hdcScreen = GetDC(NULL);
     if (!hdcScreen) {
+        ScreenLog("[CAPTURE] FAILED GetDC(NULL)\r\n");
         return RD2K_ERR_SCREEN;
     }
+    
+    ScreenLog("[CAPTURE] Got screen DC\r\n");
     
     hdcMemory = CreateCompatibleDC(hdcScreen);
     if (!hdcMemory) {
+        ScreenLog("[CAPTURE] FAILED CreateCompatibleDC\r\n");
         ReleaseDC(NULL, hdcScreen);
         return RD2K_ERR_SCREEN;
     }
+    
+    ScreenLog("[CAPTURE] Created memory DC\r\n");
     
     /* Select the bitmap into the memory DC */
     hBitmapOld = (HBITMAP)SelectObject(hdcMemory, pCapture->hBitmap);
     if (!hBitmapOld) {
+        ScreenLog("[CAPTURE] FAILED SelectObject\r\n");
         DeleteDC(hdcMemory);
         ReleaseDC(NULL, hdcScreen);
         return RD2K_ERR_SCREEN;
     }
+    
+    ScreenLog("[CAPTURE] Selected bitmap into DC\r\n");
     
     /* Perform the screen capture */
     if (!BitBlt(hdcMemory, 0, 0, 
                 pCapture->width, pCapture->height,
                 hdcScreen, 0, 0, SRCCOPY)) {
+        ScreenLog("[CAPTURE] FAILED BitBlt - access violation likely here\r\n");
         SelectObject(hdcMemory, hBitmapOld);
         DeleteDC(hdcMemory);
         ReleaseDC(NULL, hdcScreen);
         return RD2K_ERR_SCREEN;
     }
+    
+    ScreenLog("[CAPTURE] BitBlt successful\r\n");
     
     /* Restore and cleanup */
     SelectObject(hdcMemory, hBitmapOld);
@@ -138,6 +198,7 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
     ReleaseDC(NULL, hdcScreen);
     
     GdiFlush();
+    ScreenLog("[CAPTURE] Screen capture COMPLETE\r\n");
     return RD2K_SUCCESS;
 }
 

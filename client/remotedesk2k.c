@@ -1904,33 +1904,48 @@ void StartServer(void)
 {
     if (g_bServerRunning) return;
     
+    DebugLog("[MAIN] StartServer: Creating network server\r\n");
+    
     g_pServerNet = Network_Create(RD2K_LISTEN_PORT);
     if (!g_pServerNet) {
+        DebugLog("[MAIN] StartServer: FAILED Network_Create\r\n");
         UpdateStatusBar("Failed to create server", FALSE);
         return;
     }
     
+    DebugLog("[MAIN] StartServer: Network created, starting listen\r\n");
+    
     if (Network_Listen(g_pServerNet) != RD2K_SUCCESS) {
+        DebugLog("[MAIN] StartServer: FAILED Network_Listen\r\n");
         Network_Destroy(g_pServerNet);
         g_pServerNet = NULL;
         UpdateStatusBar("Failed to start server", FALSE);
         return;
     }
     
+    DebugLog("[MAIN] StartServer: Creating screen capture\r\n");
+    
     g_pCapture = ScreenCapture_Create();
     if (!g_pCapture) {
+        DebugLog("[MAIN] StartServer: FAILED ScreenCapture_Create\r\n");
         Network_Destroy(g_pServerNet);
         g_pServerNet = NULL;
         UpdateStatusBar("Failed to init screen capture", FALSE);
         return;
     }
     
+    DebugLog("[MAIN] StartServer: Initializing input\r\n");
+    
     /* Initialize async input processing */
     Input_Initialize();
+    
+    DebugLog("[MAIN] StartServer: Setting timers and marking as running\r\n");
     
     g_bServerRunning = TRUE;
     SetTimer(g_hMainWnd, TIMER_LISTEN_CHECK, LISTEN_CHECK_INTERVAL, NULL);
     UpdateStatusBar("Ready to connect", TRUE);
+    
+    DebugLog("[MAIN] StartServer: COMPLETE - server is running\r\n");
 }
 
 /* Stop server */
@@ -2714,11 +2729,24 @@ BOOL CreateViewerWindow(void)
 {
     char title[128];
     int width, height;
+    char buf[256];
     
-    if (g_hViewerWnd) return TRUE;
+    DebugLog("[VIEWER_WND] CreateViewerWindow: Starting\r\n");
+    
+    if (g_hViewerWnd) {
+        DebugLog("[VIEWER_WND] CreateViewerWindow: Already exists\r\n");
+        return TRUE;
+    }
     
     /* Create bitmap for remote screen */
-    if (!CreateViewerBitmap()) return FALSE;
+    DebugLog("[VIEWER_WND] CreateViewerWindow: Creating viewer bitmap\r\n");
+    
+    if (!CreateViewerBitmap()) {
+        DebugLog("[VIEWER_WND] CreateViewerWindow: FAILED CreateViewerBitmap\r\n");
+        return FALSE;
+    }
+    
+    DebugLog("[VIEWER_WND] CreateViewerWindow: Viewer bitmap created\r\n");
     
     width = g_remoteScreen.width + GetSystemMetrics(SM_CXSIZEFRAME) * 2;
     height = g_remoteScreen.height + GetSystemMetrics(SM_CYSIZEFRAME) * 2 + 
@@ -2728,9 +2756,14 @@ BOOL CreateViewerWindow(void)
     if (width > GetSystemMetrics(SM_CXSCREEN)) width = GetSystemMetrics(SM_CXSCREEN);
     if (height > GetSystemMetrics(SM_CYSCREEN) - 50) height = GetSystemMetrics(SM_CYSCREEN) - 50;
     
+    sprintf(buf, "[VIEWER_WND] Window size: %dx%d\r\n", width, height);
+    DebugLog(buf);
+    
     /* Window title - show "Connected" instead of IP for security */
     sprintf(title, "RemoteDesk2K - Connected (%dx%d)", 
             g_remoteScreen.width, g_remoteScreen.height);
+    
+    DebugLog("[VIEWER_WND] CreateViewerWindow: Creating window\r\n");
     
     g_hViewerWnd = CreateWindowExA(
         WS_EX_ACCEPTFILES, VIEWER_WND_CLASS, title,
@@ -2739,9 +2772,12 @@ BOOL CreateViewerWindow(void)
         NULL, NULL, g_hInstance, NULL);
     
     if (!g_hViewerWnd) {
+        DebugLog("[VIEWER_WND] CreateViewerWindow: FAILED CreateWindowExA\r\n");
         DestroyViewerBitmap();
         return FALSE;
     }
+    
+    DebugLog("[VIEWER_WND] CreateViewerWindow: Window created\r\n");
     
     /* Capture the current active folder BEFORE showing viewer window.
        This is the folder where files will be saved when received. */
@@ -2780,15 +2816,35 @@ BOOL CreateViewerBitmap(void)
 {
     BITMAPINFO bmpInfo;
     HDC hdcScreen;
+    char buf[256];
     
-    if (g_remoteScreen.width == 0 || g_remoteScreen.height == 0) return FALSE;
+    DebugLog("[VIEWER] CreateViewerBitmap: Starting\r\n");
+    
+    if (g_remoteScreen.width == 0 || g_remoteScreen.height == 0) {
+        DebugLog("[VIEWER] CreateViewerBitmap: Invalid dimensions\r\n");
+        return FALSE;
+    }
+    
+    sprintf(buf, "[VIEWER] CreateViewerBitmap: dimensions %dx%d\r\n", 
+            g_remoteScreen.width, g_remoteScreen.height);
+    DebugLog(buf);
     
     hdcScreen = GetDC(NULL);
+    if (!hdcScreen) {
+        DebugLog("[VIEWER] CreateViewerBitmap: FAILED GetDC(NULL)\r\n");
+        return FALSE;
+    }
+    
+    DebugLog("[VIEWER] CreateViewerBitmap: Got screen DC\r\n");
+    
     g_hdcViewer = CreateCompatibleDC(hdcScreen);
     if (!g_hdcViewer) {
+        DebugLog("[VIEWER] CreateViewerBitmap: FAILED CreateCompatibleDC\r\n");
         ReleaseDC(NULL, hdcScreen);
         return FALSE;
     }
+    
+    DebugLog("[VIEWER] CreateViewerBitmap: Created compatible DC\r\n");
     
     ZeroMemory(&bmpInfo, sizeof(BITMAPINFO));
     bmpInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -2798,14 +2854,19 @@ BOOL CreateViewerBitmap(void)
     bmpInfo.bmiHeader.biBitCount = 24;
     bmpInfo.bmiHeader.biCompression = BI_RGB;
     
+    DebugLog("[VIEWER] CreateViewerBitmap: Creating DIB section\r\n");
+    
     g_hViewerBitmap = CreateDIBSection(g_hdcViewer, &bmpInfo, DIB_RGB_COLORS,
                                        (void**)&g_pViewerPixels, NULL, 0);
     if (!g_hViewerBitmap) {
+        DebugLog("[VIEWER] CreateViewerBitmap: FAILED CreateDIBSection\r\n");
         DeleteDC(g_hdcViewer);
         g_hdcViewer = NULL;
         ReleaseDC(NULL, hdcScreen);
         return FALSE;
     }
+    
+    DebugLog("[VIEWER] CreateViewerBitmap: DIB section created\r\n");
     
     g_hViewerBitmapOld = (HBITMAP)SelectObject(g_hdcViewer, g_hViewerBitmap);
     
@@ -2815,10 +2876,14 @@ BOOL CreateViewerBitmap(void)
         ZeroMemory(g_pViewerPixels, stride * g_remoteScreen.height);
     }
     
+    DebugLog("[VIEWER] CreateViewerBitmap: Allocated decompression buffer\r\n");
+    
     g_decompressBufferSize = g_remoteScreen.width * g_remoteScreen.height * 4;
-    g_pDecompressBuffer = (BYTE*)calloc(1, g_decompressBufferSize);  /* Use calloc to zero memory */
+    g_pDecompressBuffer = (BYTE*)calloc(1, g_decompressBufferSize);
     
     ReleaseDC(NULL, hdcScreen);
+    
+    DebugLog("[VIEWER] CreateViewerBitmap: COMPLETE\r\n");
     return TRUE;
 }
 
