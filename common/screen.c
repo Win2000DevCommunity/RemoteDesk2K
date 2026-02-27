@@ -56,6 +56,18 @@ PSCREEN_CAPTURE ScreenCapture_Create(void)
     
     /* DIB section will be created fresh on each frame capture */
     ScreenLog("[CREATE] DIB creation deferred to frame capture\r\n");
+    
+    /* Allocate persistent pixel buffer to copy data into from each frame's DIB */
+    pCapture->pPixelData = (BYTE*)calloc(1, pCapture->pixelDataSize);
+    if (!pCapture->pPixelData) {
+        ScreenLog("[CREATE] FAILED to allocate pPixelData buffer\r\n");
+        if (pCapture->pPrevFrame) free(pCapture->pPrevFrame);
+        if (pCapture->pCompressBuffer) free(pCapture->pCompressBuffer);
+        free(pCapture);
+        return NULL;
+    }
+    
+    ScreenLog("[CREATE] Allocated persistent pixel buffer\r\n");
     pCapture->pixelDataSize = ((pCapture->width * 3 + 3) & ~3) * pCapture->height;
     pCapture->pPrevFrame = (BYTE*)calloc(1, pCapture->pixelDataSize);
     pCapture->compressBufferSize = pCapture->pixelDataSize + (pCapture->pixelDataSize / 8) + 256;
@@ -80,9 +92,10 @@ void ScreenCapture_Destroy(PSCREEN_CAPTURE pCapture)
 {
     if (!pCapture) return;
     
-    /* Free comparison and compression buffers */
-    SAFE_FREE(pCapture->pPrevFrame);
-    SAFE_FREE(pCapture->pCompressBuffer);
+    /* Free all allocated buffers */
+    SAFE_FREE(pCapture->pPixelData);      /* Persistent pixel buffer */
+    SAFE_FREE(pCapture->pPrevFrame);       /* Previous frame for delta detection */
+    SAFE_FREE(pCapture->pCompressBuffer);  /* Compression output buffer */
     
     /* Device contexts and DIB are created/destroyed per-frame, not cached */
     
@@ -95,6 +108,7 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
     HBITMAP hBitmap, hBitmapOld;
     BYTE *pPixelData;
     int result = RD2K_ERR_SCREEN;
+    char buf[256];
     
     if (!pCapture) {
         ScreenLog("[CAPTURE] Invalid pCapture\r\n");
@@ -170,8 +184,16 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
     
     ScreenLog("[CAPTURE] BitBlt successful\r\n");
     
-    /* Copy pixel data from fresh DIB to our persistent buffer */
-    pCapture->pPixelData = pPixelData;
+    /* CRITICAL FIX: Copy pixel data from DIB to persistent buffer BEFORE cleanup
+     * The DIB memory (pPixelData) will be deleted along with hBitmap, so we MUST
+     * copy the data to pCapture->pPixelData (persistent malloc'd buffer) that was
+     * allocated in ScreenCapture_Create(). This buffer is used later in SendScreenUpdate. */
+    if (pPixelData && pCapture->pPixelData) {
+        memcpy(pCapture->pPixelData, pPixelData, pCapture->pixelDataSize);
+        ScreenLog("[CAPTURE] Copied pixel data to persistent buffer\r\n");
+    } else {
+        ScreenLog("[CAPTURE] WARNING: Failed to copy pixel data\r\n");
+    }
     
     /* Restore and cleanup */
     SelectObject(hdcMemory, hBitmapOld);

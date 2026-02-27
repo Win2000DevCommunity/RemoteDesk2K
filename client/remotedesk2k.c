@@ -2383,16 +2383,30 @@ void SendScreenUpdate(void)
     int numRects, i;
     int bytesPerPixel = 3;
     int stride;
+    char buf[256];
     
     if (!g_pCapture || !g_pServerNet || !g_bClientConnected) return;
     
-    if (ScreenCapture_CaptureScreen(g_pCapture) != RD2K_SUCCESS) return;
+    if (ScreenCapture_CaptureScreen(g_pCapture) != RD2K_SUCCESS) {
+        DebugLog("[SEND_SCREEN] ScreenCapture_CaptureScreen FAILED\r\n");
+        return;
+    }
+    
+    DebugLog("[SEND_SCREEN] Screen captured successfully\r\n");
     
     stride = ((g_pCapture->width * bytesPerPixel + 3) & ~3);
+    
+    sprintf(buf, "[SEND_SCREEN] About to call FindDirtyRects: pPrevFrame=%p pPixelData=%p w=%d h=%d\r\n",
+            (void*)g_pCapture->pPrevFrame, (void*)g_pCapture->pPixelData, 
+            g_pCapture->width, g_pCapture->height);
+    DebugLog(buf);
     
     numRects = FindDirtyRects(g_pCapture->pPrevFrame, g_pCapture->pPixelData,
                               g_pCapture->width, g_pCapture->height, bytesPerPixel,
                               dirtyRects, 2048);
+    
+    sprintf(buf, "[SEND_SCREEN] FindDirtyRects returned %d rectangles\r\n", numRects);
+    DebugLog(buf);
     
     for (i = 0; i < numRects; i++) {
         RD2K_RECT rectHeader;
