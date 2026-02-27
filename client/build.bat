@@ -42,7 +42,7 @@ REM       relay.c is for RELAY SERVER only (built by build_relay.bat)
 REM       uac_desktop.c provides UAC/secure desktop input injection support
 echo Compiling source files...
 "%CL_PATH%" /nologo /O2 /W3 /D_WIN32_WINNT=0x0500 /DWINVER=0x0500 /D_WIN32_IE=0x0500 ^
-   /I".\common" /I"%DDK_PATH%\inc\crt" /I"%DDK_PATH%\inc\w2k" /I"%SDK_PATH%\Include" ^
+   /I"..\common" /I"%DDK_PATH%\inc\crt" /I"%DDK_PATH%\inc\w2k" /I"%SDK_PATH%\Include" ^
    /c ..\common\screen.c ..\common\network.c input.c remotedesk2k.c nogs.c server_config_tab.c clipboard.c filetransfer.c progress.c ..\common\crypto.c relay_client.c session_manager.c uac_desktop.c
 if errorlevel 1 goto :error
 
