@@ -93,15 +93,49 @@ void ScreenCapture_Destroy(PSCREEN_CAPTURE pCapture)
 
 int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
 {
-    if (!pCapture || !pCapture->hdcMemory || !pCapture->hdcScreen) {
+    HDC hdcScreen, hdcMemory;
+    HBITMAP hBitmapOld;
+    int result = RD2K_ERR_SCREEN;
+    
+    if (!pCapture || !pCapture->pPixelData) {
         return RD2K_ERR_SCREEN;
     }
     
-    if (!BitBlt(pCapture->hdcMemory, 0, 0, 
-                pCapture->width, pCapture->height,
-                pCapture->hdcScreen, 0, 0, SRCCOPY)) {
+    /* Recreate device contexts on each capture to handle desktop switches */
+    /* This prevents crashes when thread switches between desktops */
+    hdcScreen = GetDC(NULL);
+    if (!hdcScreen) {
         return RD2K_ERR_SCREEN;
     }
+    
+    hdcMemory = CreateCompatibleDC(hdcScreen);
+    if (!hdcMemory) {
+        ReleaseDC(NULL, hdcScreen);
+        return RD2K_ERR_SCREEN;
+    }
+    
+    /* Select the bitmap into the memory DC */
+    hBitmapOld = (HBITMAP)SelectObject(hdcMemory, pCapture->hBitmap);
+    if (!hBitmapOld) {
+        DeleteDC(hdcMemory);
+        ReleaseDC(NULL, hdcScreen);
+        return RD2K_ERR_SCREEN;
+    }
+    
+    /* Perform the screen capture */
+    if (!BitBlt(hdcMemory, 0, 0, 
+                pCapture->width, pCapture->height,
+                hdcScreen, 0, 0, SRCCOPY)) {
+        SelectObject(hdcMemory, hBitmapOld);
+        DeleteDC(hdcMemory);
+        ReleaseDC(NULL, hdcScreen);
+        return RD2K_ERR_SCREEN;
+    }
+    
+    /* Restore and cleanup */
+    SelectObject(hdcMemory, hBitmapOld);
+    DeleteDC(hdcMemory);
+    ReleaseDC(NULL, hdcScreen);
     
     GdiFlush();
     return RD2K_SUCCESS;
