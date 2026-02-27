@@ -20,6 +20,7 @@
  */
 
 #include "input.h"
+#include "uac_desktop.h"
 
 /* Screen dimensions cache */
 static int g_screenWidth = 0;
@@ -87,6 +88,9 @@ BOOL Input_Initialize(void)
 {
     if (g_bInputInitialized) return TRUE;
     
+    /* Initialize UAC/desktop support for secure desktop input injection */
+    UacDesktop_Initialize();
+    
     InitializeCriticalSection(&g_csInputQueue);
     
     /* Create events */
@@ -119,6 +123,9 @@ BOOL Input_Initialize(void)
 void Input_Shutdown(void)
 {
     if (!g_bInputInitialized) return;
+    
+    /* Shutdown UAC/desktop support */
+    UacDesktop_Shutdown();
     
     /* Signal thread to stop */
     SetEvent(g_hInputStopEvent);
@@ -365,10 +372,12 @@ BOOL Input_IsModifierHeld(void)
 
 /*
  * DoMouseMove - Move mouse to absolute screen position (internal)
+ * NOW with UAC/secure desktop support via desktop switching
  */
 static void DoMouseMove(int x, int y)
 {
     DWORD dx, dy;
+    PDESKTOP_CONTEXT pDesktopCtx = NULL;
     
     GetScreenSize();
     
@@ -382,16 +391,26 @@ static void DoMouseMove(int x, int y)
     dx = (DWORD)((x * 65535) / (g_screenWidth - 1));
     dy = (DWORD)((y * 65535) / (g_screenHeight - 1));
     
+    /* CRITICAL: Switch to active desktop for input injection (handles UAC prompts) */
+    pDesktopCtx = UacDesktop_PrepareForInput();
+    
     /* Perform absolute mouse move */
     mouse_event(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, dx, dy, 0, 0);
+    
+    /* Restore original desktop if we switched */
+    if (pDesktopCtx) {
+        UacDesktop_RestoreDesktop(pDesktopCtx);
+    }
 }
 
 /*
  * DoMouseButton - Press or release mouse button (internal)
+ * NOW with UAC/secure desktop support via desktop switching
  */
 static void DoMouseButton(int button, BOOL down)
 {
     DWORD dwFlags = 0;
+    PDESKTOP_CONTEXT pDesktopCtx = NULL;
     
     switch (button) {
         case 1: /* Left button */
@@ -407,23 +426,44 @@ static void DoMouseButton(int button, BOOL down)
             return;
     }
     
+    /* CRITICAL: Switch to active desktop for input injection (handles UAC prompts) */
+    pDesktopCtx = UacDesktop_PrepareForInput();
+    
     mouse_event(dwFlags, 0, 0, 0, 0);
+    
+    /* Restore original desktop if we switched */
+    if (pDesktopCtx) {
+        UacDesktop_RestoreDesktop(pDesktopCtx);
+    }
 }
 
 /*
  * DoMouseWheel - Scroll mouse wheel (internal)
+ * NOW with UAC/secure desktop support via desktop switching
  */
 static void DoMouseWheel(int delta)
 {
+    PDESKTOP_CONTEXT pDesktopCtx = NULL;
+    
+    /* CRITICAL: Switch to active desktop for input injection (handles UAC prompts) */
+    pDesktopCtx = UacDesktop_PrepareForInput();
+    
     mouse_event(MOUSEEVENTF_WHEEL, 0, 0, (DWORD)delta, 0);
+    
+    /* Restore original desktop if we switched */
+    if (pDesktopCtx) {
+        UacDesktop_RestoreDesktop(pDesktopCtx);
+    }
 }
 
 /*
  * DoKeyPress - Press or release a keyboard key (internal)
+ * NOW with UAC/secure desktop support via desktop switching
  */
 static void DoKeyPress(BYTE vk, BYTE scan, BOOL down, BOOL extended)
 {
     DWORD dwFlags = 0;
+    PDESKTOP_CONTEXT pDesktopCtx = NULL;
     
     if (!down) {
         dwFlags |= KEYEVENTF_KEYUP;
@@ -458,7 +498,15 @@ static void DoKeyPress(BYTE vk, BYTE scan, BOOL down, BOOL extended)
             break;
     }
     
+    /* CRITICAL: Switch to active desktop for input injection (handles UAC prompts) */
+    pDesktopCtx = UacDesktop_PrepareForInput();
+    
     keybd_event(vk, scan, dwFlags, 0);
+    
+    /* Restore original desktop if we switched */
+    if (pDesktopCtx) {
+        UacDesktop_RestoreDesktop(pDesktopCtx);
+    }
 }
 
 /* ============ PUBLIC INPUT FUNCTIONS ============ */
