@@ -2414,14 +2414,31 @@ void SendScreenUpdate(void)
         DWORD rectDataSize, compressedSize;
         int x, y, w, h, j;
         
+        sprintf(buf, "[SEND_SCREEN] Processing rectangle %d/%d\r\n", i+1, numRects);
+        DebugLog(buf);
+        
         x = dirtyRects[i].left;
         y = dirtyRects[i].top;
         w = dirtyRects[i].right - dirtyRects[i].left;
         h = dirtyRects[i].bottom - dirtyRects[i].top;
         
+        sprintf(buf, "[SEND_SCREEN] Rect %d: pos=(%d,%d) size=%dx%d\r\n", i, x, y, w, h);
+        DebugLog(buf);
+        
         rectDataSize = w * h * bytesPerPixel;
+        
+        sprintf(buf, "[SEND_SCREEN] Allocating temp buffer: %d bytes\r\n", rectDataSize);
+        DebugLog(buf);
+        
         pTempBuffer = (BYTE*)malloc(rectDataSize);
-        if (!pTempBuffer) continue;
+        if (!pTempBuffer) {
+            sprintf(buf, "[SEND_SCREEN] FAILED to allocate temp buffer for rect %d\r\n", i);
+            DebugLog(buf);
+            continue;
+        }
+        
+        sprintf(buf, "[SEND_SCREEN] Copying pixels from screen buffer\r\n");
+        DebugLog(buf);
         
         for (j = 0; j < h; j++) {
             memcpy(pTempBuffer + j * w * bytesPerPixel,
@@ -2429,9 +2446,15 @@ void SendScreenUpdate(void)
                    w * bytesPerPixel);
         }
         
+        sprintf(buf, "[SEND_SCREEN] Starting RLE compression on %d bytes\r\n", rectDataSize);
+        DebugLog(buf);
+        
         compressedSize = CompressRLE(pTempBuffer, rectDataSize,
                                      g_pCapture->pCompressBuffer,
                                      g_pCapture->compressBufferSize);
+        
+        sprintf(buf, "[SEND_SCREEN] Compression complete: %d -> %d bytes\r\n", rectDataSize, compressedSize);
+        DebugLog(buf);
         
         rectHeader.x = (WORD)x;
         rectHeader.y = (WORD)y;
@@ -2441,18 +2464,45 @@ void SendScreenUpdate(void)
         rectHeader.reserved = 0;
         rectHeader.dataSize = compressedSize;
         
+        sprintf(buf, "[SEND_SCREEN] Creating packet header - offset check: total=%d hdr=%d\r\n",
+                (int)(sizeof(rectHeader) + compressedSize), (int)sizeof(rectHeader));
+        DebugLog(buf);
+        
+        sprintf(buf, "[SEND_SCREEN] Copying header to sendBuffer\r\n");
+        DebugLog(buf);
+        
         memcpy(g_pServerNet->sendBuffer, &rectHeader, sizeof(rectHeader));
+        
+        sprintf(buf, "[SEND_SCREEN] Copying compressed data to sendBuffer\r\n");
+        DebugLog(buf);
+        
         memcpy(g_pServerNet->sendBuffer + sizeof(rectHeader),
                g_pCapture->pCompressBuffer, compressedSize);
+        
+        sprintf(buf, "[SEND_SCREEN] About to send network packet: %d total bytes\r\n",
+                (int)(sizeof(rectHeader) + compressedSize));
+        DebugLog(buf);
         
         Network_SendPacket(g_pServerNet, MSG_SCREEN_UPDATE,
                           g_pServerNet->sendBuffer,
                           sizeof(rectHeader) + compressedSize);
         
+        DebugLog("[SEND_SCREEN] Network packet sent successfully\r\n");
+        
+        sprintf(buf, "[SEND_SCREEN] Sent rect %d, freeing temp buffer\r\n", i);
+        DebugLog(buf);
+        
         free(pTempBuffer);
+        
+        sprintf(buf, "[SEND_SCREEN] Freed temp buffer for rect %d\r\n", i);
+        DebugLog(buf);
     }
     
+    DebugLog("[SEND_SCREEN] All rectangles sent, updating previous frame\r\n");
+    
     memcpy(g_pCapture->pPrevFrame, g_pCapture->pPixelData, g_pCapture->pixelDataSize);
+    
+    DebugLog("[SEND_SCREEN] SendScreenUpdate COMPLETE\r\n");
 }
 
 /* Handle mouse event from client - uses modular input system */
