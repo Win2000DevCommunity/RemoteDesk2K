@@ -57,29 +57,31 @@ PSCREEN_CAPTURE ScreenCapture_Create(void)
     /* DIB section will be created fresh on each frame capture */
     ScreenLog("[CREATE] DIB creation deferred to frame capture\r\n");
     
+    /* CRITICAL: Calculate pixelDataSize BEFORE allocating buffers that use it! */
+    pCapture->pixelDataSize = ((pCapture->width * 3 + 3) & ~3) * pCapture->height;
+    
+    sprintf(buf, "[CREATE] Calculated pixelDataSize = %d bytes\r\n", pCapture->pixelDataSize);
+    ScreenLog(buf);
+    
     /* Allocate persistent pixel buffer to copy data into from each frame's DIB */
     pCapture->pPixelData = (BYTE*)calloc(1, pCapture->pixelDataSize);
     if (!pCapture->pPixelData) {
         ScreenLog("[CREATE] FAILED to allocate pPixelData buffer\r\n");
-        if (pCapture->pPrevFrame) free(pCapture->pPrevFrame);
-        if (pCapture->pCompressBuffer) free(pCapture->pCompressBuffer);
         free(pCapture);
         return NULL;
     }
     
     ScreenLog("[CREATE] Allocated persistent pixel buffer\r\n");
-    pCapture->pixelDataSize = ((pCapture->width * 3 + 3) & ~3) * pCapture->height;
+    
     pCapture->pPrevFrame = (BYTE*)calloc(1, pCapture->pixelDataSize);
     pCapture->compressBufferSize = pCapture->pixelDataSize + (pCapture->pixelDataSize / 8) + 256;
     pCapture->pCompressBuffer = (BYTE*)calloc(1, pCapture->compressBufferSize);
     
     if (!pCapture->pPrevFrame || !pCapture->pCompressBuffer) {
         ScreenLog("[CREATE] FAILED to allocate frame/compress buffers\r\n");
+        if (pCapture->pPixelData) free(pCapture->pPixelData);
         if (pCapture->pPrevFrame) free(pCapture->pPrevFrame);
         if (pCapture->pCompressBuffer) free(pCapture->pCompressBuffer);
-        DeleteDC(pCapture->hdcMemory);
-        ReleaseDC(NULL, hdcScreen);
-        DeleteObject(pCapture->hBitmap);
         free(pCapture);
         return NULL;
     }
@@ -188,11 +190,22 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
      * The DIB memory (pPixelData) will be deleted along with hBitmap, so we MUST
      * copy the data to pCapture->pPixelData (persistent malloc'd buffer) that was
      * allocated in ScreenCapture_Create(). This buffer is used later in SendScreenUpdate. */
-    if (pPixelData && pCapture->pPixelData) {
+    {
+        char buf[256];
+        sprintf(buf, "[CAPTURE] About to copy: src=%p dst=%p size=%d\r\n",
+                (void*)pPixelData, (void*)pCapture->pPixelData, pCapture->pixelDataSize);
+        ScreenLog(buf);
+    }
+    
+    if (!pPixelData) {
+        ScreenLog("[CAPTURE] ERROR: pPixelData is NULL!\r\n");
+    } else if (!pCapture->pPixelData) {
+        ScreenLog("[CAPTURE] ERROR: pCapture->pPixelData is NULL!\r\n");
+    } else if (pCapture->pixelDataSize == 0) {
+        ScreenLog("[CAPTURE] ERROR: pixelDataSize is 0!\r\n");
+    } else {
         memcpy(pCapture->pPixelData, pPixelData, pCapture->pixelDataSize);
         ScreenLog("[CAPTURE] Copied pixel data to persistent buffer\r\n");
-    } else {
-        ScreenLog("[CAPTURE] WARNING: Failed to copy pixel data\r\n");
     }
     
     /* Restore and cleanup */
