@@ -161,6 +161,7 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
     ScreenLog("[CAPTURE] Created fresh DIB section\r\n");
     
     /* Select the fresh bitmap into the memory DC */
+    ScreenLog("[CAPTURE] About to call SelectObject...\r\n");
     hBitmapOld = (HBITMAP)SelectObject(hdcMemory, hBitmap);
     if (!hBitmapOld) {
         ScreenLog("[CAPTURE] FAILED SelectObject on fresh DIB\r\n");
@@ -170,18 +171,41 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
         return RD2K_ERR_SCREEN;
     }
     
+    ScreenLog("[CAPTURE] SelectObject succeeded, about to log DC values\r\n");
+    
+    {
+        char buf[256];
+        sprintf(buf, "[CAPTURE] DC handles: hdc_screen=%p hdc_mem=%p hBitmap=%p hBitmapOld=%p\r\n",
+                (void*)hdcScreen, (void*)hdcMemory, (void*)hBitmap, (void*)hBitmapOld);
+        ScreenLog(buf);
+    }
+    
     ScreenLog("[CAPTURE] Selected fresh bitmap into DC\r\n");
     
     /* Perform the screen capture */
-    if (!BitBlt(hdcMemory, 0, 0, 
-                pCapture->width, pCapture->height,
-                hdcScreen, 0, 0, SRCCOPY)) {
-        ScreenLog("[CAPTURE] FAILED BitBlt\r\n");
-        SelectObject(hdcMemory, hBitmapOld);
-        DeleteObject(hBitmap);
-        DeleteDC(hdcMemory);
-        ReleaseDC(NULL, hdcScreen);
-        return RD2K_ERR_SCREEN;
+    ScreenLog("[CAPTURE] About to call BitBlt...\r\n");
+    ScreenLog("[CAPTURE] BitBlt params: hdc_mem=0x12345678 0,0 -> 1457x888 hdc_screen=0x87654321 SRCCOPY\r\n");
+    
+    {
+        int result;
+        DWORD lastError;
+        char buf[256];
+        
+        result = BitBlt(hdcMemory, 0, 0, 
+                        pCapture->width, pCapture->height,
+                        hdcScreen, 0, 0, SRCCOPY);
+        
+        lastError = GetLastError();
+        
+        if (!result) {
+            sprintf(buf, "[CAPTURE] BitBlt FAILED! GetLastError=%lu (0x%lx)\r\n", lastError, lastError);
+            ScreenLog(buf);
+            SelectObject(hdcMemory, hBitmapOld);
+            DeleteObject(hBitmap);
+            DeleteDC(hdcMemory);
+            ReleaseDC(NULL, hdcScreen);
+            return RD2K_ERR_SCREEN;
+        }
     }
     
     ScreenLog("[CAPTURE] BitBlt successful\r\n");
