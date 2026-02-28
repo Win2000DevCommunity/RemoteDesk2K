@@ -2266,10 +2266,28 @@ void ProcessServerNetwork(void)
     
     /* Handle connected client */
     if (g_bClientConnected && g_pServerNet->socket != INVALID_SOCKET) {
+        int loopCount = 0;
+        char dbgBuf2[256];
+        
+        DebugLog("[PSN] Checking for connected client packets...\r\n");
+        
         while (Network_DataAvailable(g_pServerNet)) {
+            loopCount++;
+            sprintf(dbgBuf2, "[PSN] Packet loop iteration %d - calling Network_RecvPacket\r\n", loopCount);
+            DebugLog(dbgBuf2);
+            
+            if (loopCount > 500) {
+                sprintf(dbgBuf2, "[PSN] ERROR: Packet loop safety limit exceeded! Breaking to prevent hang.\r\n");
+                DebugLog(dbgBuf2);
+                break;
+            }
+            
             result = Network_RecvPacket(g_pServerNet, &header,
                                        g_pServerNet->recvBuffer,
                                        g_pServerNet->recvBufferSize);
+            
+            sprintf(dbgBuf2, "[PSN] Network_RecvPacket returned: result=%d, msgType=%d\r\n", result, result == RD2K_SUCCESS ? header.msgType : -1);
+            DebugLog(dbgBuf2);
             
             if (result != RD2K_SUCCESS) {
                 sprintf(dbgBuf, "[PSN] Network_RecvPacket ERROR: result=%d\n", result);
@@ -2403,6 +2421,9 @@ void ProcessServerNetwork(void)
                     return;
             }
         }
+        
+        sprintf(dbgBuf2, "[PSN] Packet loop complete: processed %d packets\r\n", loopCount);
+        DebugLog(dbgBuf2);
     }
 }
 

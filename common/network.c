@@ -498,6 +498,7 @@ BOOL Network_DataAvailable(PRD2K_NETWORK pNet)
     fd_set readSet;
     struct timeval timeout;
     SOCKET sock;
+    int selectResult;
     
     if (!pNet) return FALSE;
     
@@ -513,7 +514,9 @@ BOOL Network_DataAvailable(PRD2K_NETWORK pNet)
     FD_ZERO(&readSet);
     FD_SET(sock, &readSet);
     timeout.tv_sec = 0;
-    timeout.tv_usec = 1000;
+    timeout.tv_usec = 0;  /* CRITICAL FIX: Use 0 timeout for truly non-blocking check */
     
-    return (select(0, &readSet, NULL, NULL, &timeout) > 0);
+    selectResult = select(0, &readSet, NULL, NULL, &timeout);
+    
+    return (selectResult > 0);
 }
