@@ -2500,7 +2500,22 @@ void SendScreenUpdate(void)
     
     DebugLog("[SEND_SCREEN] All rectangles sent, updating previous frame\r\n");
     
-    memcpy(g_pCapture->pPrevFrame, g_pCapture->pPixelData, g_pCapture->pixelDataSize);
+    sprintf(buf, "[SEND_SCREEN] About to memcpy pPrevFrame: dst=%p src=%p size=%d\r\n",
+            (void*)g_pCapture->pPrevFrame, (void*)g_pCapture->pPixelData, 
+            g_pCapture->pixelDataSize);
+    DebugLog(buf);
+    
+    if (!g_pCapture->pPrevFrame || !g_pCapture->pPixelData) {
+        DebugLog("[SEND_SCREEN] ERROR: Null pointer before final memcpy!\r\n");
+    } else if (g_pCapture->pixelDataSize <= 0) {
+        sprintf(buf, "[SEND_SCREEN] ERROR: Invalid size %d before final memcpy!\r\n", 
+                g_pCapture->pixelDataSize);
+        DebugLog(buf);
+    } else {
+        DebugLog("[SEND_SCREEN] Performing big memcpy...\r\n");
+        memcpy(g_pCapture->pPrevFrame, g_pCapture->pPixelData, g_pCapture->pixelDataSize);
+        DebugLog("[SEND_SCREEN] Big memcpy COMPLETE!\r\n");
+    }
     
     DebugLog("[SEND_SCREEN] SendScreenUpdate COMPLETE\r\n");
 }

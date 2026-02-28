@@ -277,23 +277,39 @@ int FindDirtyRects(const BYTE *pOldFrame, const BYTE *pNewFrame,
     int blockSize = 32;
     int stride = ((width * bytesPerPixel + 3) & ~3);
     int bx, by;
+    char buf[256];
     
-    if (!pOldFrame || !pNewFrame || !pRects || maxRects <= 0) return 0;
+    sprintf(buf, "[FINDDIRTY] ENTER: old=%p new=%p w=%d h=%d bpp=%d max=%d\r\n", 
+            (void*)pOldFrame, (void*)pNewFrame, width, height, bytesPerPixel, maxRects);
+    ScreenLog(buf);
+    
+    if (!pOldFrame || !pNewFrame || !pRects || maxRects <= 0) {
+        ScreenLog("[FINDDIRTY] EARLY EXIT: null pointer or invalid maxRects\r\n");
+        return 0;
+    }
+    
+    sprintf(buf, "[FINDDIRTY] Starting scan loop: stride=%d blockSize=%d\r\n", stride, blockSize);
+    ScreenLog(buf);
     
     for (by = 0; by < height && numRects < maxRects; by += blockSize) {
         for (bx = 0; bx < width && numRects < maxRects; bx += blockSize) {
             int blockW = (bx + blockSize < width) ? blockSize : (width - bx);
             int blockH = (by + blockSize < height) ? blockSize : (height - by);
             int dirty = 0, y;
+            int offset;
             
             for (y = 0; y < blockH && !dirty; y++) {
-                int offset = (by + y) * stride + bx * bytesPerPixel;
+                offset = (by + y) * stride + bx * bytesPerPixel;
                 if (memcmp(pOldFrame + offset, pNewFrame + offset, blockW * bytesPerPixel) != 0) {
                     dirty = 1;
                 }
             }
             
             if (dirty) {
+                sprintf(buf, "[FINDDIRTY] Found dirty block at (%d,%d) size %dx%d - rect %d\r\n", 
+                        bx, by, blockW, blockH, numRects);
+                ScreenLog(buf);
+                
                 pRects[numRects].left = bx;
                 pRects[numRects].top = by;
                 pRects[numRects].right = bx + blockW;
@@ -302,6 +318,9 @@ int FindDirtyRects(const BYTE *pOldFrame, const BYTE *pNewFrame,
             }
         }
     }
+    
+    sprintf(buf, "[FINDDIRTY] COMPLETE: found %d rectangles\r\n", numRects);
+    ScreenLog(buf);
     
     return numRects;
 }
