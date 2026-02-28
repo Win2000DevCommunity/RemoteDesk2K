@@ -1756,13 +1756,14 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 case TIMER_NETWORK:
                 {
                     static int timerDebugCounter = 0;
+                    char timerDbg[256];
+                    
                     timerDebugCounter++;
-                    /* Only log occasionally to avoid spam */
-                    if (timerDebugCounter % 100 == 1 && !g_bClientConnected && g_bServerRunning) {
-                        char timerDbg[256];
-                        sprintf(timerDbg, "[TIMER_NETWORK] Waiting state: srv=%d relay=%d sock=%d connecting=%d pNet=%p\n",
-                                g_bServerRunning, g_bConnectedToRelay, 
-                                g_relaySocket != INVALID_SOCKET, g_bConnecting, (void*)g_pServerNet);
+                    
+                    /* Log entry */
+                    if (timerDebugCounter % 100 == 1) {
+                        sprintf(timerDbg, "[TIMER_NETWORK #%d] ENTER: srv=%d relay=%d connecting=%d\r\n",
+                                timerDebugCounter, g_bServerRunning, g_bConnectedToRelay, g_bConnecting);
                         DebugLog(timerDbg);
                     }
                     
@@ -1770,21 +1771,50 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                      * 1. Client is connected (active session), OR
                      * 2. Connected to relay but waiting for viewer (to receive new PARTNER_CONNECTED) */
                     if (g_bClientConnected) {
+                        DebugLog("[TIMER_NETWORK] Calling ProcessServerNetwork (g_bClientConnected)\r\n");
                         ProcessServerNetwork();
+                        DebugLog("[TIMER_NETWORK] ProcessServerNetwork returned\r\n");
                     } else if (g_bServerRunning && g_bConnectedToRelay && 
                                g_relaySocket != INVALID_SOCKET && !g_bConnecting) {
                         /* Waiting for incoming relay connection after viewer left */
+                        DebugLog("[TIMER_NETWORK] Calling ProcessServerNetwork (relay waiting)\r\n");
                         ProcessServerNetwork();
+                        DebugLog("[TIMER_NETWORK] ProcessServerNetwork returned\r\n");
                     }
                     if (g_bClientConnected2) {
+                        DebugLog("[TIMER_NETWORK] Calling ProcessClientNetwork\r\n");
                         ProcessClientNetwork();
+                        DebugLog("[TIMER_NETWORK] ProcessClientNetwork returned\r\n");
+                    }
+                    
+                    if (timerDebugCounter % 100 == 1) {
+                        DebugLog("[TIMER_NETWORK] EXIT\r\n");
                     }
                     break;
                 }
                 
                 case TIMER_SCREEN:
                     if (g_bClientConnected) {
+                        char buf[256];
+                        sprintf(buf, "[TIMER_SCREEN] START: g_pCapture=%p g_pServerNet=%p\r\n", 
+                                (void*)g_pCapture, (void*)g_pServerNet);
+                        DebugLog(buf);
+                        
+                        DebugLog("[TIMER_SCREEN] Calling SendScreenUpdate...\r\n");
                         SendScreenUpdate();
+                        DebugLog("[TIMER_SCREEN] SendScreenUpdate returned - checking pointers...\r\n");
+                        
+                        /* Validate pointers still valid after SendScreenUpdate */
+                        if (g_pCapture && g_pServerNet) {
+                            sprintf(buf, "[TIMER_SCREEN] SAFE: pointers valid. g_pCapture=%p g_pServerNet=%p\r\n",
+                                    (void*)g_pCapture, (void*)g_pServerNet);
+                            DebugLog(buf);
+                        } else {
+                            sprintf(buf, "[TIMER_SCREEN] ERROR: Pointers corrupted! g_pCapture=%p g_pServerNet=%p\r\n",
+                                    (void*)g_pCapture, (void*)g_pServerNet);
+                            DebugLog(buf);
+                        }
+                        DebugLog("[TIMER_SCREEN] END\r\n");
                     }
                     break;
                 
@@ -2385,7 +2415,18 @@ void SendScreenUpdate(void)
     int stride;
     char buf[256];
     
-    if (!g_pCapture || !g_pServerNet || !g_bClientConnected) return;
+    DebugLog("[SENDSCREENUPDATE] ============ ENTER ============\r\n");
+    
+    if (!g_pCapture || !g_pServerNet || !g_bClientConnected) {
+        DebugLog("[SENDSCREENUPDATE] Early exit - checking: g_pCapture=");
+        DebugLog(g_pCapture ? "OK" : "NULL");
+        DebugLog(" g_pServerNet=");
+        DebugLog(g_pServerNet ? "OK" : "NULL");
+        DebugLog(" g_bClientConnected=");
+        DebugLog(g_bClientConnected ? "true" : "false");
+        DebugLog("\r\n");
+        return;
+    }
     
     if (ScreenCapture_CaptureScreen(g_pCapture) != RD2K_SUCCESS) {
         DebugLog("[SEND_SCREEN] ScreenCapture_CaptureScreen FAILED\r\n");
@@ -2517,7 +2558,7 @@ void SendScreenUpdate(void)
         DebugLog("[SEND_SCREEN] Big memcpy COMPLETE!\r\n");
     }
     
-    DebugLog("[SEND_SCREEN] SendScreenUpdate COMPLETE\r\n");
+    DebugLog("[SENDSCREENUPDATE] ============ EXIT ============\r\n");
 }
 
 /* Handle mouse event from client - uses modular input system */
