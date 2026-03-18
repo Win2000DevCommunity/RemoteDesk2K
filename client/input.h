@@ -97,4 +97,27 @@ BOOL Input_Initialize(void);
  */
 void Input_Shutdown(void);
 
+/*
+ * Switch input thread to Winlogon desktop
+ * Call this after Desktop_SwitchToWinlogon succeeds.
+ * The input thread will impersonate and SetThreadDesktop on its next iteration.
+ * hDesktop: Winlogon desktop handle (from DESKTOP_CONTEXT)
+ * hToken:   SYSTEM impersonation token (from DESKTOP_CONTEXT)
+ */
+void Input_SetWinlogonDesktop(HDESK hDesktop, HANDLE hToken);
+
+/*
+ * Switch input thread back to Default desktop
+ * Call this after Desktop_RestoreHome.
+ */
+void Input_ClearWinlogonDesktop(void);
+
+/*
+ * Drain all pending input events and inject them directly.
+ * Call from a thread that is ALREADY on the target desktop
+ * (e.g. the Winlogon capture worker thread).
+ * Returns number of events injected.
+ */
+int Input_DrainQueueDirect(void);
+
 #endif /* _RD2K_INPUT_H_ */

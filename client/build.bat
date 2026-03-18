@@ -3,6 +3,9 @@ REM ============================================================
 REM RemoteDesk2K Build Script
 REM Remote Desktop Application for Windows 2000
 REM Uses DDK compiler (Windows 2000 compatible)
+REM
+REM Usage:  build          (release - no debug logs)
+REM         build debug    (debug - with file/OutputDebugString logging)
 REM ============================================================
 
 setlocal
@@ -32,6 +35,13 @@ if not exist "%CL_PATH%" (
 echo ============================================================
 echo Building RemoteDesk2K - Remote Desktop for Windows 2000
 echo Using DDK compiler: %CL_PATH%
+
+REM Check for debug mode
+set DEBUG_FLAG=
+set BUILD_MODE=RELEASE
+if /I "%1"=="debug" set DEBUG_FLAG=/DRD2K_DEBUG
+if /I "%1"=="debug" set BUILD_MODE=DEBUG
+echo Mode: %BUILD_MODE%
 echo ============================================================
 echo.
 
@@ -39,21 +49,33 @@ REM Compile all source files
 REM DDK compiler doesn't have /GS flag (older compiler)
 REM NOTE: relay_client.c is for CLIENT connecting TO relay server
 REM       relay.c is for RELAY SERVER only (built by build_relay.bat)
-REM       uac_desktop.c provides UAC/secure desktop input injection support
+REM       desktop.c provides professional UltraVNC desktop enumeration and UAC/Winlogon handling
+REM       screen_capture_ddraw.c provides DirectDraw fast screen capture for Windows 2000 SP1+
 echo Compiling source files...
-"%CL_PATH%" /nologo /O2 /W3 /D_WIN32_WINNT=0x0500 /DWINVER=0x0500 /D_WIN32_IE=0x0500 ^
+"%CL_PATH%" /nologo /O2 /W3 /D_WIN32_WINNT=0x0500 /DWINVER=0x0500 /D_WIN32_IE=0x0500 %DEBUG_FLAG% ^
    /I"..\common" /I"%DDK_PATH%\inc\crt" /I"%DDK_PATH%\inc\w2k" /I"%SDK_PATH%\Include" ^
-   /c ..\common\screen.c ..\common\network.c input.c remotedesk2k.c nogs.c server_config_tab.c clipboard.c filetransfer.c progress.c ..\common\crypto.c relay_client.c session_manager.c uac_desktop.c
+   /c ..\common\screen.c ..\common\desktop.c ..\common\network.c input.c remotedesk2k.c nogs.c server_config_tab.c clipboard.c filetransfer.c progress.c ..\common\crypto.c relay_client.c session_manager.c screen_capture_ddraw.c
 if errorlevel 1 goto :error
 
 REM Link all objects
 echo Linking RemoteDesk2K.exe...
 "%LINK_PATH%" /nologo /subsystem:windows ^
      /LIBPATH:"%SDK_PATH%\Lib" /LIBPATH:"%DDK_PATH%\lib\crt\i386" /LIBPATH:"%DDK_PATH%\lib\w2k\i386" ^
-     screen.obj network.obj input.obj remotedesk2k.obj nogs.obj server_config_tab.obj clipboard.obj filetransfer.obj progress.obj crypto.obj relay_client.obj session_manager.obj uac_desktop.obj ^
+     screen.obj desktop.obj network.obj input.obj remotedesk2k.obj nogs.obj server_config_tab.obj clipboard.obj filetransfer.obj progress.obj crypto.obj relay_client.obj session_manager.obj screen_capture_ddraw.obj ^
      kernel32.lib user32.lib gdi32.lib ws2_32.lib comctl32.lib ^
-     comdlg32.lib shell32.lib advapi32.lib ole32.lib oleaut32.lib ^
+     comdlg32.lib shell32.lib advapi32.lib ole32.lib oleaut32.lib ddraw.lib wtsapi32.lib ^
      /out:RemoteDesk2K.exe
 if errorlevel 1 goto :error
 
-echo Linking relay.exe (GUI relay server)...
+echo.
+echo ============================================================
+echo BUILD SUCCESSFUL - RemoteDesk2K.exe
+echo ============================================================
+goto :eof
+
+:error
+echo.
+echo ============================================================
+echo BUILD FAILED
+echo ============================================================
+exit /b 1

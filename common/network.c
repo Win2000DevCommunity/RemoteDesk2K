@@ -496,6 +496,7 @@ int Network_RecvPacket(PRD2K_NETWORK pNet, RD2K_HEADER *pHeader, BYTE *data, DWO
 BOOL Network_DataAvailable(PRD2K_NETWORK pNet)
 {
     fd_set readSet;
+    fd_set exceptSet;  /* NEW: Check for socket errors */
     struct timeval timeout;
     SOCKET sock;
     int selectResult;
@@ -512,11 +513,20 @@ BOOL Network_DataAvailable(PRD2K_NETWORK pNet)
     }
     
     FD_ZERO(&readSet);
+    FD_ZERO(&exceptSet);  /* NEW: Initialize exception set */
     FD_SET(sock, &readSet);
+    FD_SET(sock, &exceptSet);  /* NEW: Monitor for socket errors */
+    
     timeout.tv_sec = 0;
-    timeout.tv_usec = 0;  /* CRITICAL FIX: Use 0 timeout for truly non-blocking check */
+    timeout.tv_usec = 100;  /* 100 microseconds - balanced non-blocking timeout */
     
-    selectResult = select(0, &readSet, NULL, NULL, &timeout);
+    selectResult = select(0, &readSet, NULL, &exceptSet, &timeout);  /* MODIFIED: Added exceptSet */
     
-    return (selectResult > 0);
+    /* NEW: Check for socket errors - return FALSE to avoid infinite loop on error socket */
+    if (selectResult > 0 && FD_ISSET(sock, &exceptSet)) {
+        /* Socket has an error condition - disconnect it */
+        return FALSE;
+    }
+    
+    return (selectResult > 0 && FD_ISSET(sock, &readSet));  /* MODIFIED: Explicitly check readSet */
 }

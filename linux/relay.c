@@ -355,7 +355,18 @@ static BOOL SessionClientRejoined(RELAY_SERVER *pServer, RELAY_SESSION *pSession
     pthread_mutex_lock(&pServer->sessionMutex);
     
     if (pSession->state == SESSION_STATE_PARTIAL || pSession->state == SESSION_STATE_ACTIVE) {
-        if (pSession->clientId1 == pClient->clientId && pSession->pClient1 == NULL) {
+        /* Find which slot this client should fill */
+        if (pSession->clientId1 == pClient->clientId) {
+            /* Client1 slot - check if we need to replace old connection */
+            if (pSession->pClient1 != NULL && pSession->pClient1 != pClient) {
+                /* Old connection still in slot - kick it and replace */
+                RELAY_CONNECTION *pOld = pSession->pClient1;
+                pOld->pSession = NULL;
+                pOld->pPartner = NULL;
+                pOld->state = RELAY_STATE_DISCONNECTED;
+                pOld->shouldStop = 1;
+                RelayLog("[SESSION] Replacing stale connection in slot 1\n");
+            }
             pSession->pClient1 = pClient;
             pSession->client1DisconnectTime = 0;
             pClient->pSession = pSession;
@@ -364,7 +375,17 @@ static BOOL SessionClientRejoined(RELAY_SERVER *pServer, RELAY_SESSION *pSession
                 pSession->pClient2->pPartner = pClient;
             }
             success = TRUE;
-        } else if (pSession->clientId2 == pClient->clientId && pSession->pClient2 == NULL) {
+        } else if (pSession->clientId2 == pClient->clientId) {
+            /* Client2 slot - check if we need to replace old connection */
+            if (pSession->pClient2 != NULL && pSession->pClient2 != pClient) {
+                /* Old connection still in slot - kick it and replace */
+                RELAY_CONNECTION *pOld = pSession->pClient2;
+                pOld->pSession = NULL;
+                pOld->pPartner = NULL;
+                pOld->state = RELAY_STATE_DISCONNECTED;
+                pOld->shouldStop = 1;
+                RelayLog("[SESSION] Replacing stale connection in slot 2\n");
+            }
             pSession->pClient2 = pClient;
             pSession->client2DisconnectTime = 0;
             pClient->pSession = pSession;
@@ -672,8 +693,22 @@ static RELAY_CONNECTION* AddConnection(RELAY_SERVER *pServer, SOCKET sock)
 static void RemoveConnection(RELAY_SERVER *pServer, RELAY_CONNECTION *pConn)
 {
     DWORD i;
+    RELAY_SESSION *pSession;
     
     if (!pServer || !pConn) return;
+    
+    /* Clear partner's references if exists */
+    if (pConn->pPartner) {
+        pConn->pPartner->pSession = NULL;
+        pConn->pPartner->pPartner = NULL;
+    }
+    
+    /* Destroy session */
+    pSession = FindSessionByClientId(pServer, pConn->clientId);
+    if (pSession) {
+        DestroySession(pServer, pSession);
+    }
+    pConn->pSession = NULL;
     
     pthread_mutex_lock(&pServer->connMutex);
     
@@ -1299,7 +1334,7 @@ RELAY_SERVER* Relay_Create(WORD port, const char* ipAddr)
     }
     
     /* Initialize session management */
-    pServer->sessions = (SESSION*)calloc(RELAY_MAX_SESSIONS, sizeof(SESSION));
+    pServer->sessions = (RELAY_SESSION**)calloc(RELAY_MAX_SESSIONS, sizeof(RELAY_SESSION*));
     if (!pServer->sessions) {
         free(pServer->connections);
         free(pServer);
@@ -1417,6 +1452,14 @@ void Relay_Destroy(RELAY_SERVER *pServer)
     
     /* Wait a bit for worker threads to finish */
     usleep(500000);
+    
+    /* Clean up all sessions */
+    for (i = 0; i < pServer->maxSessions; i++) {
+        if (pServer->sessions[i]) {
+            free(pServer->sessions[i]);
+            pServer->sessions[i] = NULL;
+        }
+    }
     
     for (i = 0; i < pServer->maxConnections; i++) {
         if (pServer->connections[i])

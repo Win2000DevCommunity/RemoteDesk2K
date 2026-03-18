@@ -33,6 +33,7 @@
 /* Debug logging to file - simple helper */
 static void DebugLog(const char *msg)
 {
+#ifdef RD2K_DEBUG
     FILE *f = fopen("rd2k_debug.log", "a");
     if (f) {
         SYSTEMTIME st;
@@ -41,6 +42,9 @@ static void DebugLog(const char *msg)
                 st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg);
         fclose(f);
     }
+#else
+    (void)msg;
+#endif
 }
 
 /* Client config file */
@@ -205,9 +209,10 @@ static char             g_customPassword[32] = {0};
 static BOOL             g_useCustomPassword = FALSE;
 
 /* Server State (being controlled) */
-static PRD2K_NETWORK    g_pServerNet = NULL;
-static PSCREEN_CAPTURE  g_pCapture = NULL;
-static BOOL             g_bServerRunning = FALSE;
+PRD2K_NETWORK    g_pServerNet = NULL;
+PSCREEN_CAPTURE  g_pCapture = NULL;
+CRITICAL_SECTION g_csCaptureProtection;  /* Protects g_pCapture from concurrent access */
+BOOL             g_bServerRunning = FALSE;
 static BOOL             g_bClientConnected = FALSE;
 
 /* Client State (controlling) */
@@ -387,7 +392,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     MSG msg;
     INITCOMMONCONTROLSEX icc;
     
+    /* VERY EARLY LOGGING */
+#ifdef RD2K_DEBUG
+    OutputDebugStringA("[MAIN] ===== WinMain ENTRY =====\r\n");
+#endif
+    
     g_hInstance = hInstance;
+#ifdef RD2K_DEBUG
+    OutputDebugStringA("[MAIN] g_hInstance initialized\r\n");
+#endif
+    
+#ifdef RD2K_DEBUG
+    OutputDebugStringA("[MAIN] Running in GUI mode - starting server\r\n");
+#endif
     
     /* Check for single instance */
     g_hMutex = CreateMutexA(NULL, TRUE, CLIENT_MUTEX_NAME);
@@ -408,6 +425,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     
     /* Initialize relay critical section for thread safety */
     InitializeCriticalSection(&g_csRelay);
+    
+    /* Initialize capture protection critical section */
+    InitializeCriticalSection(&g_csCaptureProtection);
     
     /* Initialize session manager for centralized connection state */
     Session_Initialize();
@@ -508,6 +528,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     }
     
     /* Cleanup */
+#ifdef RD2K_DEBUG
+    OutputDebugStringA("[MAIN] Cleaning up - stopping network server\n");
+#endif
+    
     StopServer();
     DisconnectFromPartner();
     Session_Shutdown();  /* Cleanup session manager */
@@ -1430,7 +1454,9 @@ void OnSessionStateChanged(SESSION_STATE oldState, SESSION_STATE newState)
     char debugMsg[256];
     sprintf(debugMsg, "[UI] State change: %s -> %s\n",
             Session_StateToString(oldState), Session_StateToString(newState));
+#ifdef RD2K_DEBUG
     OutputDebugStringA(debugMsg);
+#endif
     
     /* Handle transitions based on new state */
     switch (newState) {
@@ -1509,7 +1535,9 @@ void OnSessionError(DISCONNECT_REASON reason, const char *message)
     char debugMsg[256];
     sprintf(debugMsg, "[UI] Session error: %s - %s\n",
             Session_ReasonToString(reason), message);
+#ifdef RD2K_DEBUG
     OutputDebugStringA(debugMsg);
+#endif
     
     /* Show message box for significant errors */
     switch (reason) {
@@ -1566,7 +1594,9 @@ void OnSessionPartnerChanged(BOOL connected, DWORD partnerId, SESSION_ROLE role)
             partnerId,
             role == SESSION_ROLE_SERVER ? "SERVER" : 
             role == SESSION_ROLE_CLIENT ? "CLIENT" : "NONE");
+#ifdef RD2K_DEBUG
     OutputDebugStringA(debugMsg);
+#endif
 }
 
 /* Update status bar */
@@ -2048,8 +2078,12 @@ void ProcessServerNetwork(void)
         
         int messageCount = 0;  /* C89: declare at block start */
         
+        /* Disable verbose logging for performance - enable DEBUG_NETWORK_VERBOSE only if needed */
+        /* #define DEBUG_NETWORK_VERBOSE to enable */
+        #ifdef DEBUG_NETWORK_VERBOSE
         sprintf(dbgBuf, "[PSN] Checking relay socket for incoming data (g_bClientConnected=%d)\n", g_bClientConnected);
         DebugLog(dbgBuf);
+        #endif
         
         /* Loop to process all pending messages (e.g., PARTNER_CONNECTED then handshake).
          * Without loop, if both arrive together, we'd only process PARTNER_CONNECTED
@@ -2268,8 +2302,12 @@ void ProcessServerNetwork(void)
     if (g_bClientConnected && g_pServerNet->socket != INVALID_SOCKET) {
         int loopCount = 0;
         char dbgBuf2[256];
+        DWORD loopStartTick;
+        DWORD loopElapsedMs;
         
         DebugLog("[PSN] Checking for connected client packets...\r\n");
+        
+        loopStartTick = GetTickCount();
         
         while (Network_DataAvailable(g_pServerNet)) {
             loopCount++;
@@ -2278,6 +2316,14 @@ void ProcessServerNetwork(void)
             
             if (loopCount > 500) {
                 sprintf(dbgBuf2, "[PSN] ERROR: Packet loop safety limit exceeded! Breaking to prevent hang.\r\n");
+                DebugLog(dbgBuf2);
+                break;
+            }
+            
+            /* CRITICAL: Add time limit - if loop takes >500ms, something is wrong on socket */
+            loopElapsedMs = GetTickCount() - loopStartTick;
+            if (loopElapsedMs > 500) {  /* 500ms timeout */
+                sprintf(dbgBuf2, "[PSN] WARNING: Packet loop time exceeded %lu ms. Possible socket hang. Breaking.\r\n", loopElapsedMs);
                 DebugLog(dbgBuf2);
                 break;
             }
@@ -2432,7 +2478,7 @@ void SendScreenUpdate(void)
 {
     RECT dirtyRects[2048];  /* Increased for full screen support */
     int numRects, i;
-    int bytesPerPixel = 3;
+    int bytesPerPixel;      /* Calculated from actual screen depth */
     int stride;
     char buf[256];
     
@@ -2449,9 +2495,30 @@ void SendScreenUpdate(void)
         return;
     }
     
-    if (ScreenCapture_CaptureScreen(g_pCapture) != RD2K_SUCCESS) {
-        DebugLog("[SEND_SCREEN] ScreenCapture_CaptureScreen FAILED\r\n");
-        return;
+    /* Calculate bytesPerPixel from actual screen depth instead of hardcoding! */
+    bytesPerPixel = g_pCapture->bitsPerPixel / 8;
+    if (bytesPerPixel <= 0) bytesPerPixel = 3;  /* Safety default */
+    
+    sprintf(buf, "[SENDSCREENUPDATE] Using actual color depth: %d BPP = %d bytes/pixel\r\n",
+            g_pCapture->bitsPerPixel, bytesPerPixel);
+    DebugLog(buf);
+    
+    /* CRITICAL: DirectDraw and GDI capture provide reliable frame acquisition
+     * even on UAC-protected and secure desktops. Single-session architecture
+     * is stable and reliable for current requirements. */
+    
+    /* THREAD-SAFE CAPTURE: Protect g_pCapture with critical section
+     * The IPC handler thread will call SafeReadCaptureState() to read this data
+     * while we're updating it here in the main thread. */
+    EnterCriticalSection(&g_csCaptureProtection);
+    __try {
+        if (ScreenCapture_CaptureScreen(g_pCapture) != RD2K_SUCCESS) {
+            DebugLog("[SEND_SCREEN] ScreenCapture_CaptureScreen FAILED\r\n");
+            return;
+        }
+    }
+    __finally {
+        LeaveCriticalSection(&g_csCaptureProtection);
     }
     
     DebugLog("[SEND_SCREEN] Screen captured successfully\r\n");
@@ -2755,8 +2822,24 @@ void ProcessClientNetwork(void)
 {
     RD2K_HEADER header;
     int result;
+    static DWORD lastLogged = 0;
+    char logBuf[256];
     
-    if (!g_pClientNet || !g_bClientConnected2) return;
+    if (!g_pClientNet || !g_bClientConnected2) {
+        if (!g_pClientNet) {
+            /* CRITICAL: This is a SAFE operation in SERVER mode.
+             * When someone controls YOU, you don't have g_pClientNet.
+             * This is normal and expected - just return. */
+            if (g_bClientConnected && GetTickCount() - lastLogged > 5000) {
+                DebugLog("[PCLIENT] INFO: g_pClientNet is NULL (SERVER mode - this is OK)\r\n");
+                lastLogged = GetTickCount();
+            }
+        }
+        if (!g_bClientConnected2 && g_bClientConnected) {
+            DebugLog("[PCLIENT] Note: g_bClientConnected2 FALSE but g_bClientConnected TRUE - still initializing?\r\n");
+        }
+        return;
+    }
     
     while (Network_DataAvailable(g_pClientNet)) {
         result = Network_RecvPacket(g_pClientNet, &header,
@@ -2764,6 +2847,9 @@ void ProcessClientNetwork(void)
                                    g_pClientNet->recvBufferSize);
         
         if (result != RD2K_SUCCESS) {
+            sprintf(logBuf, "[PCLIENT] Network_RecvPacket FAILED with result=%d\r\n", result);
+            DebugLog(logBuf);
+            
             /* Check if this is a relay mode connection */
             if (g_pClientNet && g_pClientNet->bRelayMode) {
                 /* RD2K_ERR_NO_DATA = relay PING/PONG received instead of app data.
@@ -2788,9 +2874,15 @@ void ProcessClientNetwork(void)
             return;
         }
         
+        sprintf(logBuf, "[PCLIENT] Received msg=%u dataLen=%u recvBufAddr=%p\r\n", 
+                header.msgType, header.dataLength, (void*)g_pClientNet->recvBuffer);
+        DebugLog(logBuf);
+        
         switch (header.msgType) {
             case MSG_SCREEN_UPDATE:
+                DebugLog("[PCLIENT] >>> Calling HandleScreenUpdate\r\n");
                 HandleScreenUpdate(g_pClientNet->recvBuffer, header.dataLength);
+                DebugLog("[PCLIENT] <<< HandleScreenUpdate returned\r\n");
                 break;
             
             case MSG_CLIPBOARD_TEXT:
@@ -2959,72 +3051,104 @@ BOOL CreateViewerBitmap(void)
     HDC hdcScreen;
     char buf[256];
     
-    DebugLog("[VIEWER] CreateViewerBitmap: Starting\r\n");
+    DebugLog("[VIEWER] ===== CreateViewerBitmap: STARTING =====\r\n");
     
     if (g_remoteScreen.width == 0 || g_remoteScreen.height == 0) {
-        DebugLog("[VIEWER] CreateViewerBitmap: Invalid dimensions\r\n");
+        DebugLog("[VIEWER] ERROR: Invalid dimensions (width=0 or height=0)\r\n");
         return FALSE;
     }
     
-    sprintf(buf, "[VIEWER] CreateViewerBitmap: dimensions %dx%d\r\n", 
-            g_remoteScreen.width, g_remoteScreen.height);
+    sprintf(buf, "[VIEWER] Screen size: %ux%u BPP=%d compression=%u\r\n", 
+            g_remoteScreen.width, g_remoteScreen.height, 
+            g_remoteScreen.bitsPerPixel, g_remoteScreen.compression);
     DebugLog(buf);
     
     hdcScreen = GetDC(NULL);
     if (!hdcScreen) {
-        DebugLog("[VIEWER] CreateViewerBitmap: FAILED GetDC(NULL)\r\n");
+        DebugLog("[VIEWER] ERROR: GetDC(NULL) failed\r\n");
         return FALSE;
     }
     
-    DebugLog("[VIEWER] CreateViewerBitmap: Got screen DC\r\n");
+    DebugLog("[VIEWER] Got screen DC\r\n");
     
     g_hdcViewer = CreateCompatibleDC(hdcScreen);
     if (!g_hdcViewer) {
-        DebugLog("[VIEWER] CreateViewerBitmap: FAILED CreateCompatibleDC\r\n");
+        DebugLog("[VIEWER] ERROR: CreateCompatibleDC failed\r\n");
         ReleaseDC(NULL, hdcScreen);
         return FALSE;
     }
     
-    DebugLog("[VIEWER] CreateViewerBitmap: Created compatible DC\r\n");
+    sprintf(buf, "[VIEWER] Created compatible DC: %p\r\n", (void*)g_hdcViewer);
+    DebugLog(buf);
     
     ZeroMemory(&bmpInfo, sizeof(BITMAPINFO));
     bmpInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bmpInfo.bmiHeader.biWidth = g_remoteScreen.width;
-    bmpInfo.bmiHeader.biHeight = -g_remoteScreen.height;
+    bmpInfo.bmiHeader.biHeight = -g_remoteScreen.height;  /* Negative = top-down */
     bmpInfo.bmiHeader.biPlanes = 1;
     bmpInfo.bmiHeader.biBitCount = 24;
     bmpInfo.bmiHeader.biCompression = BI_RGB;
     
-    DebugLog("[VIEWER] CreateViewerBitmap: Creating DIB section\r\n");
+    sprintf(buf, "[VIEWER] BITMAPINFO: w=%ld h=%ld planes=%u bitCount=%u compression=%lu\r\n", 
+            bmpInfo.bmiHeader.biWidth, bmpInfo.bmiHeader.biHeight,
+            bmpInfo.bmiHeader.biPlanes, bmpInfo.bmiHeader.biBitCount,
+            bmpInfo.bmiHeader.biCompression);
+    DebugLog(buf);
+    
+    DebugLog("[VIEWER] Creating DIB section...\r\n");
     
     g_hViewerBitmap = CreateDIBSection(g_hdcViewer, &bmpInfo, DIB_RGB_COLORS,
                                        (void**)&g_pViewerPixels, NULL, 0);
     if (!g_hViewerBitmap) {
-        DebugLog("[VIEWER] CreateViewerBitmap: FAILED CreateDIBSection\r\n");
+        DebugLog("[VIEWER] ERROR: CreateDIBSection failed\r\n");
         DeleteDC(g_hdcViewer);
         g_hdcViewer = NULL;
         ReleaseDC(NULL, hdcScreen);
         return FALSE;
     }
     
-    DebugLog("[VIEWER] CreateViewerBitmap: DIB section created\r\n");
+    sprintf(buf, "[VIEWER] DIB section created: hbm=%p pixels=%p\r\n", 
+            (void*)g_hViewerBitmap, (void*)g_pViewerPixels);
+    DebugLog(buf);
     
     g_hViewerBitmapOld = (HBITMAP)SelectObject(g_hdcViewer, g_hViewerBitmap);
+    sprintf(buf, "[VIEWER] SelectObject returned old handle: %p\r\n", (void*)g_hViewerBitmapOld);
+    DebugLog(buf);
     
     /* Clear to black */
     {
         int stride = ((g_remoteScreen.width * 3 + 3) & ~3);
-        ZeroMemory(g_pViewerPixels, stride * g_remoteScreen.height);
+        int totalBytes = stride * g_remoteScreen.height;
+        sprintf(buf, "[VIEWER] Clearing pixels: stride=%d totalBytes=%d\r\n", stride, totalBytes);
+        DebugLog(buf);
+        ZeroMemory(g_pViewerPixels, totalBytes);
+        DebugLog("[VIEWER] Pixels cleared to black\r\n");
     }
     
-    DebugLog("[VIEWER] CreateViewerBitmap: Allocated decompression buffer\r\n");
+    sprintf(buf, "[VIEWER] Allocating decompression buffer: %u bytes\r\n", 
+            g_remoteScreen.width * g_remoteScreen.height * 4);
+    DebugLog(buf);
     
     g_decompressBufferSize = g_remoteScreen.width * g_remoteScreen.height * 4;
     g_pDecompressBuffer = (BYTE*)calloc(1, g_decompressBufferSize);
     
+    if (!g_pDecompressBuffer) {
+        DebugLog("[VIEWER] ERROR: calloc failed for decompression buffer\r\n");
+        DeleteObject(g_hViewerBitmap);
+        g_hViewerBitmap = NULL;
+        DeleteDC(g_hdcViewer);
+        g_hdcViewer = NULL;
+        ReleaseDC(NULL, hdcScreen);
+        return FALSE;
+    }
+    
+    sprintf(buf, "[VIEWER] Decompression buffer allocated: %p size=%u\r\n", 
+            (void*)g_pDecompressBuffer, g_decompressBufferSize);
+    DebugLog(buf);
+    
     ReleaseDC(NULL, hdcScreen);
     
-    DebugLog("[VIEWER] CreateViewerBitmap: COMPLETE\r\n");
+    DebugLog("[VIEWER] ===== CreateViewerBitmap: COMPLETE SUCCESS =====\r\n");
     return TRUE;
 }
 
@@ -3058,9 +3182,33 @@ void HandleScreenUpdate(const BYTE *data, DWORD dataLength)
     BYTE *pSrcPixels;
     int dstStride, x, y, w, h, row;
     DWORD expectedSize;
+    char logBuf[512];
     
-    if (!data || dataLength < sizeof(RD2K_RECT)) return;
-    if (!g_pViewerPixels || !g_pDecompressBuffer) return;
+    DebugLog("[HSU] ===== ENTER HandleScreenUpdate =====\r\n");
+    sprintf(logBuf, "[HSU] data=%p dataLength=%u\r\n", (void*)data, dataLength);
+    DebugLog(logBuf);
+    
+    if (!data) {
+        DebugLog("[HSU] ERROR: data is NULL\r\n");
+        return;
+    }
+    
+    if (dataLength < sizeof(RD2K_RECT)) {
+        sprintf(logBuf, "[HSU] ERROR: dataLength=%u smaller than RD2K_RECT=%u\r\n", 
+                dataLength, (unsigned)sizeof(RD2K_RECT));
+        DebugLog(logBuf);
+        return;
+    }
+    
+    if (!g_pViewerPixels) {
+        DebugLog("[HSU] ERROR: g_pViewerPixels is NULL\r\n");
+        return;
+    }
+    
+    if (!g_pDecompressBuffer) {
+        DebugLog("[HSU] ERROR: g_pDecompressBuffer is NULL\r\n");
+        return;
+    }
     
     pRect = (RD2K_RECT*)data;
     
@@ -3070,15 +3218,38 @@ void HandleScreenUpdate(const BYTE *data, DWORD dataLength)
     w = pRect->width;
     h = pRect->height;
     
+    sprintf(logBuf, "[HSU] Rect: x=%d y=%d w=%d h=%d encoding=%u dataSize=%u\r\n", 
+            x, y, w, h, pRect->encoding, pRect->dataSize);
+    DebugLog(logBuf);
+    
     /* Basic validation */
-    if (w <= 0 || h <= 0 || w > 4096 || h > 4096) return;
-    if (x < 0 || y < 0) return;
-    if (x >= (int)g_remoteScreen.width || y >= (int)g_remoteScreen.height) return;
+    if (w <= 0 || h <= 0 || w > 4096 || h > 4096) {
+        sprintf(logBuf, "[HSU] ERROR: Invalid dimensions w=%d h=%d\r\n", w, h);
+        DebugLog(logBuf);
+        return;
+    }
+    if (x < 0 || y < 0) {
+        sprintf(logBuf, "[HSU] ERROR: Negative coordinates x=%d y=%d\r\n", x, y);
+        DebugLog(logBuf);
+        return;
+    }
+    if (x >= (int)g_remoteScreen.width || y >= (int)g_remoteScreen.height) {
+        sprintf(logBuf, "[HSU] ERROR: Out of bounds x=%d y=%d screenW=%u screenH=%u\r\n", 
+                x, y, g_remoteScreen.width, g_remoteScreen.height);
+        DebugLog(logBuf);
+        return;
+    }
     
     /* Clamp to screen bounds */
     if (x + w > (int)g_remoteScreen.width) w = (int)g_remoteScreen.width - x;
     if (y + h > (int)g_remoteScreen.height) h = (int)g_remoteScreen.height - y;
-    if (w <= 0 || h <= 0) return;
+    if (w <= 0 || h <= 0) {
+        DebugLog("[HSU] ERROR: Clamped to zero dimensions\r\n");
+        return;
+    }
+    
+    sprintf(logBuf, "[HSU] After clamp: x=%d y=%d w=%d h=%d\r\n", x, y, w, h);
+    DebugLog(logBuf);
     
     /* Calculate expected decompressed size */
     expectedSize = (DWORD)(w * h * 3);
@@ -3088,37 +3259,88 @@ void HandleScreenUpdate(const BYTE *data, DWORD dataLength)
         BYTE *pCompressed = (BYTE*)(data + sizeof(RD2K_RECT));
         DWORD decompSize;
         
-        if (pRect->dataSize == 0 || pRect->dataSize > dataLength - sizeof(RD2K_RECT)) return;
+        sprintf(logBuf, "[HSU] RLE: compressed=%u expected_decomp=%u\r\n", 
+                pRect->dataSize, expectedSize);
+        DebugLog(logBuf);
+        
+        if (pRect->dataSize == 0 || pRect->dataSize > dataLength - sizeof(RD2K_RECT)) {
+            sprintf(logBuf, "[HSU] RLE ERROR: Invalid compressed size dataSize=%u dataLen=%u\r\n", 
+                    pRect->dataSize, dataLength);
+            DebugLog(logBuf);
+            return;
+        }
         
         /* Clear decompress buffer to black before decompression to avoid artifacts
          * from partial decompression or corrupted data */
+        DebugLog("[HSU] Clearing decompression buffer...\r\n");
         ZeroMemory(g_pDecompressBuffer, expectedSize);
         
+        DebugLog("[HSU] Calling DecompressRLE...\r\n");
         decompSize = DecompressRLE(pCompressed, pRect->dataSize,
                                    g_pDecompressBuffer, g_decompressBufferSize);
         
-        if (decompSize < expectedSize) return;
+        sprintf(logBuf, "[HSU] DecompressRLE returned decompSize=%u (expected=%u)\r\n", 
+                decompSize, expectedSize);
+        DebugLog(logBuf);
+        
+        if (decompSize < expectedSize) {
+            sprintf(logBuf, "[HSU] DECOMPRESS ERROR: Got %u bytes, expected at least %u\r\n", 
+                    decompSize, expectedSize);
+            DebugLog(logBuf);
+            return;
+        }
         pSrcPixels = g_pDecompressBuffer;
     } else {
         /* Raw data */
-        if (dataLength < sizeof(RD2K_RECT) + expectedSize) return;
+        sprintf(logBuf, "[HSU] Raw data: checking if dataLength(%u) >= sizeof(RD2K_RECT)(%u) + expectedSize(%u)\r\n", 
+                dataLength, (unsigned)sizeof(RD2K_RECT), expectedSize);
+        DebugLog(logBuf);
+        
+        if (dataLength < sizeof(RD2K_RECT) + expectedSize) {
+            sprintf(logBuf, "[HSU] RAW ERROR: dataLength=%u < needed=%u\r\n", 
+                    dataLength, sizeof(RD2K_RECT) + expectedSize);
+            DebugLog(logBuf);
+            return;
+        }
         pSrcPixels = (BYTE*)(data + sizeof(RD2K_RECT));
     }
     
     /* Calculate destination stride (DWORD aligned) */
     dstStride = ((g_remoteScreen.width * 3 + 3) & ~3);
     
+    sprintf(logBuf, "[HSU] Starting pixel copy: dstStride=%d pSrcPixels=%p g_pViewerPixels=%p\r\n", 
+            dstStride, (void*)pSrcPixels, (void*)g_pViewerPixels);
+    DebugLog(logBuf);
+    
     /* Copy row by row to viewer bitmap */
     for (row = 0; row < h; row++) {
         BYTE *pDst = g_pViewerPixels + ((y + row) * dstStride) + (x * 3);
         BYTE *pSrc = pSrcPixels + (row * w * 3);
+        
+        if (row == 0 || row == h - 1) {
+            sprintf(logBuf, "[HSU] Row %d: pDst=%p pSrc=%p size=%d\r\n", 
+                    row, (void*)pDst, (void*)pSrc, w * 3);
+            DebugLog(logBuf);
+        }
+        
         memcpy(pDst, pSrc, w * 3);
     }
     
+    sprintf(logBuf, "[HSU] All %d rows copied successfully\r\n", h);
+    DebugLog(logBuf);
+    
     /* Request repaint */
-    if (g_hViewerWnd && IsWindow(g_hViewerWnd)) {
+    if (!g_hViewerWnd) {
+        DebugLog("[HSU] ERROR: g_hViewerWnd is NULL, cannot invalidate rect\r\n");
+    } else if (!IsWindow(g_hViewerWnd)) {
+        DebugLog("[HSU] ERROR: g_hViewerWnd is not a valid window\r\n");
+    } else {
+        DebugLog("[HSU] Calling InvalidateRect...\r\n");
         InvalidateRect(g_hViewerWnd, NULL, FALSE);
+        DebugLog("[HSU] InvalidateRect done\r\n");
     }
+    
+    DebugLog("[HSU] ===== EXIT HandleScreenUpdate =====\r\n");
 }
 
 /* Toggle fullscreen */
@@ -3401,29 +3623,72 @@ LRESULT CALLBACK ViewerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         case WM_PAINT:
         {
             PAINTSTRUCT ps;
-            HDC hdc = BeginPaint(hwnd, &ps);
+            HDC hdc;
+            char logBuf[256];
+            BOOL bltResult;
+            RECT rcClient;
             
-            if (g_hdcViewer && g_bClientConnected2) {
-                RECT rcClient;
-                GetClientRect(hwnd, &rcClient);
-                
-                if (g_displayMode == DISPLAY_STRETCH) {
-                    /* Use HALFTONE mode for high-quality smooth scaling
-                     * This does proper bilinear interpolation instead of
-                     * nearest-neighbor (COLORONCOLOR) which looks pixelated.
-                     * SetBrushOrgEx is required after SetStretchBltMode(HALFTONE). */
-                    SetStretchBltMode(hdc, HALFTONE);
-                    SetBrushOrgEx(hdc, 0, 0, NULL);
-                    StretchBlt(hdc, 0, 0, rcClient.right, rcClient.bottom,
-                              g_hdcViewer, 0, 0, g_remoteScreen.width, g_remoteScreen.height,
-                              SRCCOPY);
-                } else {
-                    BitBlt(hdc, 0, 0, g_remoteScreen.width, g_remoteScreen.height,
-                          g_hdcViewer, 0, 0, SRCCOPY);
-                }
+            DebugLog("[PAINT] WM_PAINT received\r\n");
+            
+            hdc = BeginPaint(hwnd, &ps);
+            
+            sprintf(logBuf, "[PAINT] BeginPaint: hdc=%p ps.rcPaint=(%d,%d,%d,%d)\r\n", 
+                    (void*)hdc, ps.rcPaint.left, ps.rcPaint.top, ps.rcPaint.right, ps.rcPaint.bottom);
+            DebugLog(logBuf);
+            
+            if (!hdc) {
+                DebugLog("[PAINT] ERROR: BeginPaint returned NULL hdc\r\n");
+                EndPaint(hwnd, &ps);
+                return 0;
             }
             
+            if (!g_hdcViewer) {
+                DebugLog("[PAINT] ERROR: g_hdcViewer is NULL\r\n");
+                EndPaint(hwnd, &ps);
+                return 0;
+            }
+            
+            if (!g_bClientConnected2) {
+                DebugLog("[PAINT] Not connected to client, skipping draw\r\n");
+                EndPaint(hwnd, &ps);
+                return 0;
+            }
+            
+            GetClientRect(hwnd, &rcClient);
+            
+            sprintf(logBuf, "[PAINT] Client rect: (%d,%d,%d,%d) w=%d h=%d\r\n", 
+                    rcClient.left, rcClient.top, rcClient.right, rcClient.bottom,
+                    rcClient.right - rcClient.left, rcClient.bottom - rcClient.top);
+            DebugLog(logBuf);
+            
+            sprintf(logBuf, "[PAINT] Remote screen: %u x %u, displayMode=%d\r\n", 
+                    g_remoteScreen.width, g_remoteScreen.height, g_displayMode);
+            DebugLog(logBuf);
+            
+            if (g_displayMode == DISPLAY_STRETCH) {
+                DebugLog("[PAINT] Using StretchBlt mode\r\n");
+                /* Use HALFTONE mode for high-quality smooth scaling
+                 * This does proper bilinear interpolation instead of
+                 * nearest-neighbor (COLORONCOLOR) which looks pixelated.
+                 * SetBrushOrgEx is required after SetStretchBltMode(HALFTONE). */
+                SetStretchBltMode(hdc, HALFTONE);
+                SetBrushOrgEx(hdc, 0, 0, NULL);
+                
+                DebugLog("[PAINT] Calling StretchBlt...\r\n");
+                bltResult = StretchBlt(hdc, 0, 0, rcClient.right, rcClient.bottom,
+                          g_hdcViewer, 0, 0, g_remoteScreen.width, g_remoteScreen.height,
+                          SRCCOPY);
+                DebugLog(bltResult ? "[PAINT] StretchBlt SUCCESS\r\n" : "[PAINT] StretchBlt FAILED\r\n");
+            } else {
+                DebugLog("[PAINT] Using 1:1 BitBlt mode\r\n");
+                bltResult = BitBlt(hdc, 0, 0, g_remoteScreen.width, g_remoteScreen.height,
+                          g_hdcViewer, 0, 0, SRCCOPY);
+                DebugLog(bltResult ? "[PAINT] BitBlt SUCCESS\r\n" : "[PAINT] BitBlt FAILED\r\n");
+            }
+            
+            DebugLog("[PAINT] Calling EndPaint...\r\n");
             EndPaint(hwnd, &ps);
+            DebugLog("[PAINT] WM_PAINT complete\r\n");
             return 0;
         }
         

@@ -50,7 +50,9 @@ typedef int         SOCKET;
 #define RD2K_ERR_RECV           (-4)
 #define RD2K_ERR_MEMORY         (-5)
 #define RD2K_ERR_TIMEOUT        (-6)
-#define RD2K_ERR_SERVER_LOST    (-7)
+#define RD2K_ERR_SERVER_LOST    (-12)
+#define RD2K_ERR_DISCONNECTED   (-10)
+#define RD2K_ERR_PARTNER_LEFT   (-11)
 
 /* Relay configuration */
 #define RELAY_DEFAULT_PORT          5000
@@ -68,6 +70,7 @@ typedef int         SOCKET;
 #define RELAY_MSG_PING              0x55
 #define RELAY_MSG_PONG              0x56
 #define RELAY_MSG_PARTNER_DISCONNECTED 0x57
+#define RELAY_MSG_PARTNER_CONNECTED    0x59
 #define RELAY_MSG_UNPAIR            0x5A
 
 /* Relay states */
@@ -123,6 +126,11 @@ typedef struct {
     DWORD   reason;
     DWORD   partnerId;
 } RELAY_PARTNER_DISCONNECTED;
+
+typedef struct {
+    DWORD   partnerId;
+    DWORD   reserved;
+} RELAY_PARTNER_CONNECTED;
 
 #pragma pack(pop)
 

@@ -480,6 +480,9 @@ int main(int argc, char *argv[])
     /* Set up relay logging */
     Relay_SetLogCallback(RelayLogCallback);
     
+    /* Initialize crypto */
+    Crypto_Init(NULL);
+    
     /* Create relay server */
     {
         char msg[128];
@@ -604,6 +607,8 @@ int main(int argc, char *argv[])
         Relay_Destroy(g_pServer);
         g_pServer = NULL;
     }
+    
+    Crypto_Cleanup();
     
     WSACleanup();
     

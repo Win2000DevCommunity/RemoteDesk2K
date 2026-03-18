@@ -12,7 +12,7 @@
 #include "common.h"
 
 /* Relay server configuration */
-#define RELAY_DEFAULT_PORT          5900
+#define RELAY_DEFAULT_PORT          5000
 #define RELAY_MAX_CONNECTIONS       1024
 #define RELAY_CONNECTION_TIMEOUT    300000  /* 5 minutes in milliseconds */
 #define RELAY_BUFFER_SIZE           (512 * 1024)  /* 512 KB per connection - must handle large screen updates */

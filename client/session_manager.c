@@ -15,6 +15,7 @@
 
 /* Debug logging to file */
 static void SMDebugLog(const char *msg) {
+#ifdef RD2K_DEBUG
     FILE *f = fopen("rd2k_debug.log", "a");
     if (f) {
         SYSTEMTIME st;
@@ -23,6 +24,9 @@ static void SMDebugLog(const char *msg) {
                 st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg);
         fclose(f);
     }
+#else
+    (void)msg;
+#endif
 }
 
 /* ============================================================================
@@ -81,7 +85,9 @@ static void LogTransition(const char *event, SESSION_STATE from, SESSION_STATE t
     char buf[256];
     sprintf(buf, "[SESSION] %s: %s -> %s\n", 
             event, Session_StateToString(from), Session_StateToString(to));
+#ifdef RD2K_DEBUG
     OutputDebugStringA(buf);
+#endif
 }
 
 /*

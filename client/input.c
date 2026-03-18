@@ -20,7 +20,6 @@
  */
 
 #include "input.h"
-#include "uac_desktop.h"
 
 /* Screen dimensions cache */
 static int g_screenWidth = 0;
@@ -78,6 +77,39 @@ static void DoMouseWheel(int delta);
 static void DoKeyPress(BYTE vk, BYTE scan, BOOL down, BOOL extended);
 static DWORD WINAPI InputThreadProc(LPVOID lpParam);
 
+/* Forward declaration for queue operations (used by Input_DrainQueueDirect) */
+static BOOL DequeueInputEvent(PINPUT_EVENT pEvent);
+
+/* ============ WINLOGON DESKTOP SWITCHING FOR INPUT ============ */
+/* 
+ * When the Winlogon desktop is active, mouse_event/keybd_event must be
+ * called from a thread whose desktop is Winlogon. The input thread has
+ * no windows, so SetThreadDesktop() works without ERROR 183.
+ */
+static volatile HDESK   g_hWinlogonDesktopForInput = NULL;
+static volatile HANDLE  g_hWinlogonTokenForInput = NULL;
+static volatile LONG    g_bInputSwitchToWinlogon = 0;   /* 1 = switch pending */
+static volatile LONG    g_bInputSwitchToDefault = 0;    /* 1 = restore pending */
+static BOOL             g_bInputOnWinlogon = FALSE;     /* current state */
+
+/* Input debug logging - writes to same log as screen/desktop */
+#include <stdio.h>
+static void InputLog(const char *msg)
+{
+#ifdef RD2K_DEBUG
+    FILE *f = fopen("rd2k_debug.log", "a");
+    if (f) {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        fprintf(f, "[%02d:%02d:%02d.%03d] [INPUT] %s", 
+                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg);
+        fclose(f);
+    }
+#else
+    (void)msg;
+#endif
+}
+
 /* ============ INITIALIZATION/SHUTDOWN ============ */
 
 /*
@@ -88,8 +120,9 @@ BOOL Input_Initialize(void)
 {
     if (g_bInputInitialized) return TRUE;
     
-    /* Initialize UAC/desktop support for secure desktop input injection */
-    UacDesktop_Initialize();
+    /* Input processing: async event injection for remote mouse/keyboard control.
+     * Works across standard desktops, UAC dialogs, and secure desktops without
+     * special switching - injected events are delivered to active window. */
     
     InitializeCriticalSection(&g_csInputQueue);
     
@@ -124,8 +157,13 @@ void Input_Shutdown(void)
 {
     if (!g_bInputInitialized) return;
     
-    /* Shutdown UAC/desktop support */
-    UacDesktop_Shutdown();
+    /* NOTE: UAC/desktop support shutdown no longer needed */
+    /* UacDesktop_Shutdown(); */
+    
+    /* Clear Winlogon desktop state (input thread will revert on exit) */
+    g_hWinlogonDesktopForInput = NULL;
+    g_hWinlogonTokenForInput = NULL;
+    g_bInputOnWinlogon = FALSE;
     
     /* Signal thread to stop */
     SetEvent(g_hInputStopEvent);
@@ -149,6 +187,123 @@ void Input_Shutdown(void)
     
     DeleteCriticalSection(&g_csInputQueue);
     g_bInputInitialized = FALSE;
+}
+
+/* ============ WINLOGON DESKTOP INPUT SWITCHING ============ */
+
+/*
+ * Input_SetWinlogonDesktop - Tell input thread to switch to Winlogon desktop
+ * Called from screen capture code after Desktop_SwitchToWinlogon succeeds.
+ * Thread-safe: sets volatile flags that the input thread picks up.
+ */
+void Input_SetWinlogonDesktop(HDESK hDesktop, HANDLE hToken)
+{
+    if (!hDesktop || !hToken) return;
+    g_hWinlogonDesktopForInput = (HDESK)hDesktop;
+    g_hWinlogonTokenForInput = (HANDLE)hToken;
+    InterlockedExchange((LONG*)&g_bInputSwitchToWinlogon, 1);
+    InterlockedExchange((LONG*)&g_bInputSwitchToDefault, 0);
+}
+
+/*
+ * Input_ClearWinlogonDesktop - Tell input thread to switch back to Default desktop
+ * Called from screen capture code after Desktop_RestoreHome.
+ */
+void Input_ClearWinlogonDesktop(void)
+{
+    InterlockedExchange((LONG*)&g_bInputSwitchToDefault, 1);
+    InterlockedExchange((LONG*)&g_bInputSwitchToWinlogon, 0);
+    g_hWinlogonDesktopForInput = (HDESK)NULL;
+    g_hWinlogonTokenForInput = (HANDLE)NULL;
+}
+
+/*
+ * Input_DrainQueueDirect - Drain all pending events and inject directly.
+ * 
+ * Call this from a thread that is ALREADY on the Winlogon desktop
+ * (e.g. the capture worker thread, which we know works for BitBlt).
+ * This bypasses the normal input thread entirely.
+ * 
+ * The calling thread must already have called SetThreadDesktop(hWinlogonDesktop).
+ * mouse_event/keybd_event will inject into the calling thread's desktop.
+ */
+int Input_DrainQueueDirect(void)
+{
+    INPUT_EVENT evt;
+    int count = 0;
+    int screenW, screenH;
+    char logbuf[256];
+    
+    /* Get screen dimensions for mouse coordinate conversion */
+    screenW = GetSystemMetrics(SM_CXSCREEN);
+    screenH = GetSystemMetrics(SM_CYSCREEN);
+    if (screenW <= 0) screenW = 1024;
+    if (screenH <= 0) screenH = 768;
+    
+    while (DequeueInputEvent(&evt)) {
+        if (evt.type == INPUT_EVT_MOUSE) {
+            /* Mouse move */
+            if (evt.mouse.flags & 0x01) {
+                int x = (int)evt.mouse.x;
+                int y = (int)evt.mouse.y;
+                DWORD dx, dy;
+                if (x < 0) x = 0;
+                if (y < 0) y = 0;
+                if (x >= screenW) x = screenW - 1;
+                if (y >= screenH) y = screenH - 1;
+                dx = (DWORD)((x * 65535) / (screenW - 1));
+                dy = (DWORD)((y * 65535) / (screenH - 1));
+                mouse_event(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, dx, dy, 0, 0);
+            }
+            /* Button down */
+            if (evt.mouse.flags & 0x02) {
+                if (evt.mouse.buttons & 0x01)
+                    mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+                if (evt.mouse.buttons & 0x02)
+                    mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0);
+                if (evt.mouse.buttons & 0x04)
+                    mouse_event(MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, 0);
+            }
+            /* Button up */
+            if (evt.mouse.flags & 0x04) {
+                if (evt.mouse.buttons & 0x01)
+                    mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+                if (evt.mouse.buttons & 0x02)
+                    mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
+                if (evt.mouse.buttons & 0x04)
+                    mouse_event(MOUSEEVENTF_MIDDLEUP, 0, 0, 0, 0);
+            }
+            /* Wheel */
+            if (evt.mouse.flags & 0x08) {
+                mouse_event(MOUSEEVENTF_WHEEL, 0, 0, (DWORD)evt.mouse.wheelDelta, 0);
+            }
+        }
+        else if (evt.type == INPUT_EVT_KEY) {
+            BOOL down = (evt.key.flags & 0x01) ? TRUE : FALSE;
+            BOOL up = (evt.key.flags & 0x02) ? TRUE : FALSE;
+            BOOL extended = (evt.key.flags & 0x04) ? TRUE : FALSE;
+            DWORD dwFlags = 0;
+            
+            if (!down && !up) down = TRUE;
+            
+            if (extended) dwFlags |= KEYEVENTF_EXTENDEDKEY;
+            
+            if (down && !up) {
+                keybd_event((BYTE)evt.key.vk, (BYTE)evt.key.scan, dwFlags, 0);
+            }
+            if (up) {
+                keybd_event((BYTE)evt.key.vk, (BYTE)evt.key.scan, dwFlags | KEYEVENTF_KEYUP, 0);
+            }
+        }
+        count++;
+    }
+    
+    if (count > 0) {
+        sprintf(logbuf, "Injected %d events on Winlogon desktop (worker thread)\r\n", count);
+        InputLog(logbuf);
+    }
+    
+    return count;
 }
 
 /* ============ QUEUE OPERATIONS ============ */
@@ -242,6 +397,54 @@ static DWORD WINAPI InputThreadProc(LPVOID lpParam)
         if (waitResult == WAIT_OBJECT_0) {
             /* Stop event signaled */
             break;
+        }
+        
+        /* ============================================================
+         * DESKTOP SWITCHING: Switch input thread to/from Winlogon
+         * The input thread has no windows, so SetThreadDesktop works.
+         * mouse_event/keybd_event inject to the calling thread's desktop.
+         * ============================================================ */
+        if (InterlockedExchange((LONG*)&g_bInputSwitchToWinlogon, 0)) {
+            /* Switch to Winlogon desktop */
+            HDESK hDesk = (HDESK)g_hWinlogonDesktopForInput;
+            HANDLE hTok = (HANDLE)g_hWinlogonTokenForInput;
+            if (hDesk && hTok && !g_bInputOnWinlogon) {
+                if (ImpersonateLoggedOnUser(hTok)) {
+                    if (SetThreadDesktop(hDesk)) {
+                        g_bInputOnWinlogon = TRUE;
+                        InputLog("Switched to Winlogon desktop for input injection\r\n");
+                    } else {
+                        char errBuf[128];
+                        sprintf(errBuf, "SetThreadDesktop(Winlogon) FAILED error=%lu\r\n", GetLastError());
+                        InputLog(errBuf);
+                        RevertToSelf();
+                    }
+                } else {
+                    char errBuf[128];
+                    sprintf(errBuf, "ImpersonateLoggedOnUser FAILED error=%lu\r\n", GetLastError());
+                    InputLog(errBuf);
+                }
+            }
+        }
+        if (InterlockedExchange((LONG*)&g_bInputSwitchToDefault, 0)) {
+            /* Switch back to Default desktop */
+            if (g_bInputOnWinlogon) {
+                HDESK hDefault = OpenDesktopA("Default", 0, FALSE, GENERIC_ALL);
+                if (hDefault) {
+                    SetThreadDesktop(hDefault);
+                    CloseDesktop(hDefault);
+                }
+                RevertToSelf();
+                g_bInputOnWinlogon = FALSE;
+                InputLog("Switched back to Default desktop for input injection\r\n");
+            }
+        }
+        
+        /* When on Winlogon, skip processing - the capture worker thread
+         * will drain the queue via Input_DrainQueueDirect() from a thread
+         * that is already on the Winlogon desktop (confirmed working). */
+        if (g_bInputOnWinlogon) {
+            continue;
         }
         
         /* Process all queued events */
@@ -377,7 +580,7 @@ BOOL Input_IsModifierHeld(void)
 static void DoMouseMove(int x, int y)
 {
     DWORD dx, dy;
-    PDESKTOP_CONTEXT pDesktopCtx = NULL;
+    void *pDesktopCtx = NULL;  /* PDESKTOP_CONTEXT no longer available - using void* */
     
     GetScreenSize();
     
@@ -391,26 +594,16 @@ static void DoMouseMove(int x, int y)
     dx = (DWORD)((x * 65535) / (g_screenWidth - 1));
     dy = (DWORD)((y * 65535) / (g_screenHeight - 1));
     
-    /* CRITICAL: Switch to active desktop for input injection (handles UAC prompts) */
-    pDesktopCtx = UacDesktop_PrepareForInput();
-    
-    /* Perform absolute mouse move */
+    /* CRITICAL: Perform absolute mouse move across standard, UAC, and secure desktops. */
     mouse_event(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, dx, dy, 0, 0);
-    
-    /* Restore original desktop if we switched */
-    if (pDesktopCtx) {
-        UacDesktop_RestoreDesktop(pDesktopCtx);
-    }
 }
 
 /*
  * DoMouseButton - Press or release mouse button (internal)
- * NOW with UAC/secure desktop support via desktop switching
  */
 static void DoMouseButton(int button, BOOL down)
 {
     DWORD dwFlags = 0;
-    PDESKTOP_CONTEXT pDesktopCtx = NULL;
     
     switch (button) {
         case 1: /* Left button */
@@ -426,15 +619,8 @@ static void DoMouseButton(int button, BOOL down)
             return;
     }
     
-    /* CRITICAL: Switch to active desktop for input injection (handles UAC prompts) */
-    pDesktopCtx = UacDesktop_PrepareForInput();
-    
+    /* Inject mouse button event across standard, UAC, and secure desktops. */
     mouse_event(dwFlags, 0, 0, 0, 0);
-    
-    /* Restore original desktop if we switched */
-    if (pDesktopCtx) {
-        UacDesktop_RestoreDesktop(pDesktopCtx);
-    }
 }
 
 /*
@@ -443,17 +629,8 @@ static void DoMouseButton(int button, BOOL down)
  */
 static void DoMouseWheel(int delta)
 {
-    PDESKTOP_CONTEXT pDesktopCtx = NULL;
-    
-    /* CRITICAL: Switch to active desktop for input injection (handles UAC prompts) */
-    pDesktopCtx = UacDesktop_PrepareForInput();
-    
+    /* Scroll mouse wheel across standard, UAC, and secure desktops. */
     mouse_event(MOUSEEVENTF_WHEEL, 0, 0, (DWORD)delta, 0);
-    
-    /* Restore original desktop if we switched */
-    if (pDesktopCtx) {
-        UacDesktop_RestoreDesktop(pDesktopCtx);
-    }
 }
 
 /*
@@ -463,7 +640,6 @@ static void DoMouseWheel(int delta)
 static void DoKeyPress(BYTE vk, BYTE scan, BOOL down, BOOL extended)
 {
     DWORD dwFlags = 0;
-    PDESKTOP_CONTEXT pDesktopCtx = NULL;
     
     if (!down) {
         dwFlags |= KEYEVENTF_KEYUP;
@@ -498,15 +674,8 @@ static void DoKeyPress(BYTE vk, BYTE scan, BOOL down, BOOL extended)
             break;
     }
     
-    /* CRITICAL: Switch to active desktop for input injection (handles UAC prompts) */
-    pDesktopCtx = UacDesktop_PrepareForInput();
-    
+    /* Inject keyboard event across standard, UAC, and secure desktops. */
     keybd_event(vk, scan, dwFlags, 0);
-    
-    /* Restore original desktop if we switched */
-    if (pDesktopCtx) {
-        UacDesktop_RestoreDesktop(pDesktopCtx);
-    }
 }
 
 /* ============ PUBLIC INPUT FUNCTIONS ============ */

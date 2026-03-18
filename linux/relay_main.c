@@ -661,8 +661,10 @@ int main(int argc, char *argv[])
         usleep(100000);  /* 100ms */
     }
     
-    /* Shutdown */
+    /* Shutdown - clear log callback first to prevent race with detached threads */
     LogCallback("[INFO] Shutting down relay server...\n");
+    
+    Relay_SetLogCallback(NULL);
     
     Relay_Destroy(g_pServer);
     g_pServer = NULL;

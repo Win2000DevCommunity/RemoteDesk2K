@@ -5,15 +5,83 @@
 #include "screen.h"
 #include <stdio.h>
 
+/* Declared in client/input.c - switch input thread to/from Winlogon desktop */
+extern void Input_SetWinlogonDesktop(HDESK hDesktop, HANDLE hToken);
+extern void Input_ClearWinlogonDesktop(void);
+/* Drain pending input events from worker thread already on Winlogon desktop */
+extern int Input_DrainQueueDirect(void);
+
+/* PROFESSIONAL FIX (v5.4): Three-tier logging system
+ * Currently set to DEBUG (all logs). For production, set to WARNING or ERROR */
+#define SCREEN_LOG_ERROR    1
+#define SCREEN_LOG_WARNING  2
+#define SCREEN_LOG_DEBUG    3
+
+static int g_ScreenLogLevel = SCREEN_LOG_DEBUG;  /* Production: change to SCREEN_LOG_WARNING */
+
 static void ScreenLog(const char *msg)
 {
-    FILE *f = fopen("rd2k_debug.log", "a");
-    if (f) {
-        SYSTEMTIME st;
-        GetLocalTime(&st);
-        fprintf(f, "[%02d:%02d:%02d.%03d] [SCREEN] %s", 
-                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg);
-        fclose(f);
+#ifdef RD2K_DEBUG
+    /* Log at DEBUG level for backward compatibility with existing calls */
+    if (g_ScreenLogLevel >= SCREEN_LOG_DEBUG) {
+        FILE *f = fopen("rd2k_debug.log", "a");
+        if (f) {
+            SYSTEMTIME st;
+            GetLocalTime(&st);
+            fprintf(f, "[%02d:%02d:%02d.%03d] [SCREEN] %s", 
+                    st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg);
+            fclose(f);
+        }
+    }
+#else
+    (void)msg;
+#endif
+}
+
+/* ERROR-level logging for critical issues only */
+static void ScreenLogError(const char *msg)
+{
+#ifdef RD2K_DEBUG
+    if (g_ScreenLogLevel >= SCREEN_LOG_ERROR) {
+        FILE *f = fopen("rd2k_debug.log", "a");
+        if (f) {
+            SYSTEMTIME st;
+            GetLocalTime(&st);
+            fprintf(f, "[%02d:%02d:%02d.%03d] [SCREEN] [ERROR] %s", 
+                    st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg);
+            fclose(f);
+        }
+    }
+#else
+    (void)msg;
+#endif
+}
+
+/* ============================================================================
+ * HELPER: Draw message on black screen
+ * ============================================================================ */
+
+static void ScreenCapture_DrawMessageOnBlack(BYTE *pPixelData, int width, int height, 
+                                             int bytesPerPixel, const char *szMessage)
+{
+    int x, y;
+    
+    if (!pPixelData || !szMessage) return;
+    
+    /* Fill entire screen with black */
+    memset(pPixelData, 0x00, width * height * bytesPerPixel);
+    
+    /* Simple message: draw by filling a rectangle with white pixels in upper-left */
+    if (bytesPerPixel >= 3) {
+        /* Draw white text box (RGB 255,255,255) */
+        for (y = 10; y < 100 && y < height; y++) {
+            for (x = 10; x < 300 && x < width; x++) {
+                int offset = (y * width + x) * bytesPerPixel;
+                pPixelData[offset + 0] = 255;      /* B */
+                pPixelData[offset + 1] = 255;      /* G */
+                pPixelData[offset + 2] = 255;      /* R */
+            }
+        }
     }
 }
 
@@ -29,6 +97,275 @@ int ScreenCapture_GetColorDepth(void)
     int depth = GetDeviceCaps(hdc, BITSPIXEL) * GetDeviceCaps(hdc, PLANES);
     ReleaseDC(NULL, hdc);
     return depth;
+}
+
+/* ============================================================================
+ * WORKER THREAD CAPTURE: For Winlogon desktop when main thread can't switch
+ * 
+ * SetThreadDesktop fails with ERROR_ALREADY_EXISTS (183) when the calling
+ * thread has windows/hooks. Solution: spawn a clean worker thread with NO 
+ * windows that calls SetThreadDesktop(hWinlogonDesktop), then GetDC(NULL) 
+ * returns the Winlogon desktop's DC. The worker does the full BitBlt capture
+ * and writes pixels into the caller's buffer.
+ * ============================================================================ */
+
+typedef struct _WINLOGON_CAPTURE_PARAMS {
+    HDESK   hDesktop;       /* Winlogon desktop handle */
+    HANDLE  hToken;         /* Impersonation token (NULL if not needed) */
+    int     width;          /* Screen width */
+    int     height;         /* Screen height */
+    int     bitsPerPixel;   /* Color depth */
+    BYTE   *pPixelData;     /* Output: caller's pixel buffer */
+    DWORD   pixelDataSize;  /* Size of pixel buffer */
+    int     result;         /* Output: 0=success, -1=failure */
+    char    szError[256];   /* Output: error description */
+} WINLOGON_CAPTURE_PARAMS;
+
+static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
+{
+    WINLOGON_CAPTURE_PARAMS *pParams = (WINLOGON_CAPTURE_PARAMS *)lpParam;
+    HDC hdcScreen = NULL;
+    HDC hdcMemory = NULL;
+    HBITMAP hBitmap = NULL;
+    HBITMAP hBitmapOld = NULL;
+    BITMAPINFO bmpInfo;
+    BYTE *pBits = NULL;
+    DWORD dwErr;
+    
+    pParams->result = -1;
+    pParams->szError[0] = '\0';
+    
+    /* Impersonate if we have a token (needed for desktop access) */
+    if (pParams->hToken) {
+        if (!ImpersonateLoggedOnUser(pParams->hToken)) {
+            sprintf(pParams->szError, "Worker: ImpersonateLoggedOnUser failed: %lu", GetLastError());
+            return 1;
+        }
+    }
+    
+    /* THIS IS THE KEY: clean thread with NO windows can switch desktop */
+    if (!SetThreadDesktop(pParams->hDesktop)) {
+        dwErr = GetLastError();
+        sprintf(pParams->szError, "Worker: SetThreadDesktop failed: %lu", dwErr);
+        if (pParams->hToken) RevertToSelf();
+        return 1;
+    }
+    
+    /* NOW GetDC(NULL) returns the Winlogon desktop's DC! */
+    hdcScreen = GetDC(NULL);
+    if (!hdcScreen) {
+        sprintf(pParams->szError, "Worker: GetDC(NULL) failed: %lu", GetLastError());
+        if (pParams->hToken) RevertToSelf();
+        return 1;
+    }
+    
+    hdcMemory = CreateCompatibleDC(hdcScreen);
+    if (!hdcMemory) {
+        sprintf(pParams->szError, "Worker: CreateCompatibleDC failed");
+        ReleaseDC(NULL, hdcScreen);
+        if (pParams->hToken) RevertToSelf();
+        return 1;
+    }
+    
+    /* Create DIB section */
+    ZeroMemory(&bmpInfo, sizeof(BITMAPINFO));
+    bmpInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmpInfo.bmiHeader.biWidth = pParams->width;
+    bmpInfo.bmiHeader.biHeight = -pParams->height;  /* top-down */
+    bmpInfo.bmiHeader.biPlanes = 1;
+    bmpInfo.bmiHeader.biBitCount = (WORD)pParams->bitsPerPixel;
+    bmpInfo.bmiHeader.biCompression = BI_RGB;
+    
+    hBitmap = CreateDIBSection(hdcMemory, &bmpInfo, DIB_RGB_COLORS,
+                               (void**)&pBits, NULL, 0);
+    if (!hBitmap || !pBits) {
+        sprintf(pParams->szError, "Worker: CreateDIBSection failed");
+        DeleteDC(hdcMemory);
+        ReleaseDC(NULL, hdcScreen);
+        if (pParams->hToken) RevertToSelf();
+        return 1;
+    }
+    
+    hBitmapOld = (HBITMAP)SelectObject(hdcMemory, hBitmap);
+    
+    /* BitBlt from Winlogon desktop to our DIB */
+    if (!BitBlt(hdcMemory, 0, 0, pParams->width, pParams->height,
+                hdcScreen, 0, 0, SRCCOPY)) {
+        sprintf(pParams->szError, "Worker: BitBlt failed: %lu", GetLastError());
+        SelectObject(hdcMemory, hBitmapOld);
+        DeleteObject(hBitmap);
+        DeleteDC(hdcMemory);
+        ReleaseDC(NULL, hdcScreen);
+        if (pParams->hToken) RevertToSelf();
+        return 1;
+    }
+    
+    /* Copy pixels to caller's buffer */
+    {
+        DWORD dwRowBytes = (DWORD)pParams->width * (pParams->bitsPerPixel / 8);
+        DWORD dwTotalBytes = dwRowBytes * (DWORD)pParams->height;
+        if (dwTotalBytes > pParams->pixelDataSize) {
+            dwTotalBytes = pParams->pixelDataSize;
+        }
+        memcpy(pParams->pPixelData, pBits, dwTotalBytes);
+    }
+    
+    /* CRITICAL: Inject any pending input events while we're on the Winlogon desktop.
+     * mouse_event/keybd_event must be called from a thread that is ON the Winlogon
+     * desktop. The normal input thread's SetThreadDesktop approach doesn't work
+     * (process-level security check), but THIS worker thread's context does work
+     * (same context that just did BitBlt successfully). */
+    Input_DrainQueueDirect();
+    
+    /* Cleanup */
+    SelectObject(hdcMemory, hBitmapOld);
+    DeleteObject(hBitmap);
+    DeleteDC(hdcMemory);
+    ReleaseDC(NULL, hdcScreen);
+    
+    if (pParams->hToken) RevertToSelf();
+    
+    pParams->result = 0;  /* SUCCESS */
+    return 0;
+}
+
+/* Capture the Winlogon desktop using a worker thread.
+ * Returns 0 on success, -1 on failure. */
+static int ScreenCapture_CaptureWinlogonWorker(PSCREEN_CAPTURE pCapture)
+{
+    WINLOGON_CAPTURE_PARAMS params;
+    HANDLE hThread;
+    DWORD dwWait;
+    char logbuf[512];
+    
+    if (!pCapture || !pCapture->pDesktopContext || 
+        !pCapture->pDesktopContext->hWinlogonDesktop) {
+        ScreenLog("[CAPTURE] Worker: No Winlogon desktop handle\r\n");
+        return -1;
+    }
+    
+    ZeroMemory(&params, sizeof(params));
+    params.hDesktop = pCapture->pDesktopContext->hWinlogonDesktop;
+    params.hToken = pCapture->pDesktopContext->hImpersonationToken;
+    params.width = pCapture->width;
+    params.height = pCapture->height;
+    params.bitsPerPixel = pCapture->bitsPerPixel;
+    params.pPixelData = pCapture->pPixelData;
+    params.pixelDataSize = pCapture->pixelDataSize;
+    params.result = -1;
+    
+    hThread = CreateThread(NULL, 0, WinlogonCaptureThread, &params, 0, NULL);
+    if (!hThread) {
+        sprintf(logbuf, "[CAPTURE] Worker: CreateThread failed: %lu\r\n", GetLastError());
+        ScreenLog(logbuf);
+        return -1;
+    }
+    
+    /* Wait up to 5 seconds for capture to complete */
+    dwWait = WaitForSingleObject(hThread, 5000);
+    if (dwWait != WAIT_OBJECT_0) {
+        ScreenLog("[CAPTURE] Worker: Thread timed out\r\n");
+        TerminateThread(hThread, 1);
+        CloseHandle(hThread);
+        return -1;
+    }
+    
+    CloseHandle(hThread);
+    
+    if (params.result != 0) {
+        sprintf(logbuf, "[CAPTURE] Worker FAILED: %s\r\n", params.szError);
+        ScreenLog(logbuf);
+        return -1;
+    }
+    
+    ScreenLog("[CAPTURE] Worker: Winlogon desktop captured successfully!\r\n");
+    return 0;
+}
+
+
+
+
+
+BOOL ScreenCapture_SyncDisplayMode(PSCREEN_CAPTURE pCapture)
+{
+    const DDRAW_SCREEN_INFO *pDisplayInfo;
+    int newWidth, newHeight;
+    char buf[256];
+    
+    if (!pCapture || !pCapture->pDDrawContext) {
+        return FALSE;
+    }
+    
+    /* Get DirectDraw's display mode - this is the TRUE framebuffer size! */
+    pDisplayInfo = DDraw_GetScreenInfo((DDRAW_CONTEXT *)pCapture->pDDrawContext);
+    if (!pDisplayInfo) {
+        ScreenLog("[SYNC_DISPLAY] ERROR: DDraw_GetScreenInfo returned NULL\r\n");
+        return FALSE;
+    }
+    
+    newWidth = pDisplayInfo->dwWidth;
+    newHeight = pDisplayInfo->dwHeight;
+    
+    sprintf(buf, "[SYNC_DISPLAY] DirectDraw reports: %dx%d (current: %dx%d)\r\n",
+            newWidth, newHeight, pCapture->width, pCapture->height);
+    ScreenLog(buf);
+    
+    /* If dimensions match, nothing to do */
+    if (newWidth == pCapture->width && newHeight == pCapture->height) {
+        ScreenLog("[SYNC_DISPLAY] Dimensions match - no reallocation needed\r\n");
+        return TRUE;
+    }
+    
+    /* Dimensions mismatch - need to reallocate buffers to match DirectDraw's TRUE size */
+    {
+        int bytesPerPixel = pCapture->bitsPerPixel / 8;
+        DWORD newPixelDataSize, newCompressBufferSize;
+        BYTE *pNewPixelData, *pNewPrevFrame, *pNewCompressBuffer;
+        
+        if (bytesPerPixel <= 0) bytesPerPixel = 3;
+        
+        /* Calculate new buffer sizes based on DirectDraw dimensions */
+        newPixelDataSize = ((newWidth * bytesPerPixel + 3) & ~3) * newHeight;
+        newCompressBufferSize = newPixelDataSize + (newPixelDataSize / 8) + 256;
+        
+        sprintf(buf, "[SYNC_DISPLAY] Reallocating: old=%d bytes, new=%d bytes\r\n",
+                pCapture->pixelDataSize, newPixelDataSize);
+        ScreenLog(buf);
+        
+        /* Allocate new buffers (recursive pattern - allocate all before freeing old) */
+        pNewPixelData = (BYTE*)calloc(1, newPixelDataSize);
+        pNewPrevFrame = (BYTE*)calloc(1, newPixelDataSize);
+        pNewCompressBuffer = (BYTE*)calloc(1, newCompressBufferSize);
+        
+        if (!pNewPixelData || !pNewPrevFrame || !pNewCompressBuffer) {
+            ScreenLog("[SYNC_DISPLAY] ERROR: Failed to allocate new buffers\r\n");
+            /* Recursive cleanup - free what we allocated before returning */
+            if (pNewPixelData) free(pNewPixelData);
+            if (pNewPrevFrame) free(pNewPrevFrame);
+            if (pNewCompressBuffer) free(pNewCompressBuffer);
+            return FALSE;
+        }
+        
+        /* Recursive cleanup pattern: free old buffers after successful allocation */
+        SAFE_FREE(pCapture->pPixelData);
+        SAFE_FREE(pCapture->pPrevFrame);
+        SAFE_FREE(pCapture->pCompressBuffer);
+        
+        /* Update structure with new buffers and dimensions */
+        pCapture->pPixelData = pNewPixelData;
+        pCapture->pPrevFrame = pNewPrevFrame;
+        pCapture->pCompressBuffer = pNewCompressBuffer;
+        pCapture->width = newWidth;
+        pCapture->height = newHeight;
+        pCapture->pixelDataSize = newPixelDataSize;
+        pCapture->compressBufferSize = newCompressBufferSize;
+        
+        sprintf(buf, "[SYNC_DISPLAY] Reallocation COMPLETE: now %dx%d @ %d bytes/pixel\r\n",
+                pCapture->width, pCapture->height, bytesPerPixel);
+        ScreenLog(buf);
+        
+        return TRUE;
+    }
 }
 
 PSCREEN_CAPTURE ScreenCapture_Create(void)
@@ -47,6 +384,14 @@ PSCREEN_CAPTURE ScreenCapture_Create(void)
     
     ScreenLog("[CREATE] Allocated pCapture structure\r\n");
     
+    /* Initialize desktop context for UAC/Winlogon detection */
+    pCapture->pDesktopContext = Desktop_Init();
+    if (!pCapture->pDesktopContext) {
+        ScreenLog("[CREATE] WARNING: Desktop context initialization failed\r\n");
+    } else {
+        ScreenLog("[CREATE] Desktop context initialized for desktop switch detection\r\n");
+    }
+    
     ScreenCapture_GetDimensions(&pCapture->width, &pCapture->height);
     pCapture->bitsPerPixel = ScreenCapture_GetColorDepth();
     
@@ -57,10 +402,15 @@ PSCREEN_CAPTURE ScreenCapture_Create(void)
     /* DIB section will be created fresh on each frame capture */
     ScreenLog("[CREATE] DIB creation deferred to frame capture\r\n");
     
-    /* CRITICAL: Calculate pixelDataSize BEFORE allocating buffers that use it! */
-    pCapture->pixelDataSize = ((pCapture->width * 3 + 3) & ~3) * pCapture->height;
+    /* CRITICAL: Calculate pixelDataSize based on ACTUAL bits per pixel! */
+    {
+        int bytesPerPixel = pCapture->bitsPerPixel / 8;
+        if (bytesPerPixel <= 0) bytesPerPixel = 3;  /* Default to 24-bit if detection fails */
+        pCapture->pixelDataSize = ((pCapture->width * bytesPerPixel + 3) & ~3) * pCapture->height;
+    }
     
-    sprintf(buf, "[CREATE] Calculated pixelDataSize = %d bytes\r\n", pCapture->pixelDataSize);
+    sprintf(buf, "[CREATE] Calculated pixelDataSize = %d bytes (BPP=%d bytes/pixel)\r\n", 
+            pCapture->pixelDataSize, pCapture->bitsPerPixel / 8);
     ScreenLog(buf);
     
     /* Allocate persistent pixel buffer to copy data into from each frame's DIB */
@@ -73,17 +423,58 @@ PSCREEN_CAPTURE ScreenCapture_Create(void)
     
     ScreenLog("[CREATE] Allocated persistent pixel buffer\r\n");
     
-    pCapture->pPrevFrame = (BYTE*)calloc(1, pCapture->pixelDataSize);
+    /* CRITICAL FIX: Initialize pPrevFrame to 0xFF (white) NOT 0x00 (black)!
+     * If initialized to 0x00, first frame from Winlogon/UAC (also black) 
+     * will compare equal and FindDirtyRects returns 0 rectangles.
+     * Initialize to 0xFF ensures first frame is ALWAYS detected as dirty.
+     * Subsequent frames use real delta detection. */
+    pCapture->pPrevFrame = (BYTE*)malloc(pCapture->pixelDataSize);
+    if (!pCapture->pPrevFrame) {
+        ScreenLog("[CREATE] FAILED to allocate pPrevFrame\r\n");
+        free(pCapture->pPixelData);
+        free(pCapture);
+        return NULL;
+    }
+    /* Initialize pPrevFrame to 0xFF (white) to force first frame detection */
+    memset(pCapture->pPrevFrame, 0xFF, pCapture->pixelDataSize);
+    
     pCapture->compressBufferSize = pCapture->pixelDataSize + (pCapture->pixelDataSize / 8) + 256;
     pCapture->pCompressBuffer = (BYTE*)calloc(1, pCapture->compressBufferSize);
     
-    if (!pCapture->pPrevFrame || !pCapture->pCompressBuffer) {
-        ScreenLog("[CREATE] FAILED to allocate frame/compress buffers\r\n");
+    if (!pCapture->pCompressBuffer) {
+        ScreenLog("[CREATE] FAILED to allocate compress buffer\r\n");
         if (pCapture->pPixelData) free(pCapture->pPixelData);
         if (pCapture->pPrevFrame) free(pCapture->pPrevFrame);
         if (pCapture->pCompressBuffer) free(pCapture->pCompressBuffer);
         free(pCapture);
         return NULL;
+    }
+    
+    /* Initialize DirectDraw GPU acceleration if available */
+    pCapture->pDDrawContext = DDraw_CreateContext();
+    if (pCapture->pDDrawContext) {
+        DDRAW_STATUS status = DDraw_Initialize((DDRAW_CONTEXT *)pCapture->pDDrawContext);
+        if (status == DDRAW_STATUS_SUCCESS) {
+            pCapture->bUseDDraw = TRUE;
+            ScreenLog("[CREATE] DirectDraw GPU acceleration ENABLED\r\n");
+            
+            /* CRITICAL: DirectDraw outputs 24-bit BGR (after BGRA->BGR conversion) */
+            if (pCapture->bitsPerPixel == 32) {
+                ScreenLog("[CREATE] Adjusting bit depth: 32-bit -> 24-bit (DirectDraw outputs 24-bit BGR)\r\n");
+                pCapture->bitsPerPixel = 24;  /* DirectDraw output is 24-bit BGR */
+            }
+            
+            /* CRITICAL: Sync display dimensions from DirectDraw (the SDK authoritative source!)
+             * DirectDraw reports the true framebuffer size, not the Windows WORKAREA */
+            if (!ScreenCapture_SyncDisplayMode(pCapture)) {
+                ScreenLog("[CREATE] WARNING: Failed to sync display mode from DirectDraw\r\n");
+                /* Don't fail - continue with current dimensions */
+            }
+        } else {
+            pCapture->bDDrawFailed = TRUE;
+            DDraw_DestroyContext(&pCapture->pDDrawContext);
+            pCapture->pDDrawContext = NULL;
+        }
     }
     
     ScreenLog("[CREATE] Screen capture initialization COMPLETE\r\n");
@@ -94,7 +485,19 @@ void ScreenCapture_Destroy(PSCREEN_CAPTURE pCapture)
 {
     if (!pCapture) return;
     
-    /* Free all allocated buffers */
+    /* Shutdown desktop context FIRST (restores home desktop) */
+    if (pCapture->pDesktopContext) {
+        Desktop_Shutdown(pCapture->pDesktopContext);
+        pCapture->pDesktopContext = NULL;
+    }
+    
+    /* Cleanup DirectDraw context */
+    if (pCapture->pDDrawContext) {
+        DDraw_Cleanup((DDRAW_CONTEXT *)pCapture->pDDrawContext);
+        DDraw_DestroyContext(&pCapture->pDDrawContext);
+    }
+    
+    /* Free all allocated buffers (recursive cleanup pattern) */
     SAFE_FREE(pCapture->pPixelData);      /* Persistent pixel buffer */
     SAFE_FREE(pCapture->pPrevFrame);       /* Previous frame for delta detection */
     SAFE_FREE(pCapture->pCompressBuffer);  /* Compression output buffer */
@@ -111,6 +514,18 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
     BYTE *pPixelData;
     int result = RD2K_ERR_SCREEN;
     char buf[256];
+    DDRAW_STATUS ddStatus;
+    DWORD dwBytesWritten;
+    DESKTOP_STATE eDesktopState;
+    BOOL bForceGDI = FALSE;  /* TRUE = skip DirectDraw, use GDI only (Winlogon) */
+    
+    /* Debounce: prevent flickering between Winlogon and Normal desktop.
+     * Without logging I/O delays, detection can flip NORMAL for a single frame
+     * during transient OS states, causing token/desktop cleanup and re-acquisition.
+     * Require NORMAL to persist for at least 2 seconds before actually switching back. */
+    static DWORD dwLastWinlogonTime = 0;
+    static int nConsecutiveNormal = 0;
+    #define WINLOGON_DEBOUNCE_MS 2000
     
     if (!pCapture) {
         ScreenLog("[CAPTURE] Invalid pCapture\r\n");
@@ -119,10 +534,196 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
     
     ScreenLog("[CAPTURE] Starting screen capture\r\n");
     
-    /* Get fresh screen DC on each frame */
+    /* ========================================================================
+     * CRITICAL: Detect desktop switches (UAC, Winlogon) BEFORE capture
+     * UltraVNC/TigerVNC pattern: switch thread to input desktop for capture
+     * ======================================================================== */
+    
+    if (pCapture->pDesktopContext) {
+        eDesktopState = Desktop_DetectState(pCapture->pDesktopContext);
+        
+        if (eDesktopState == DESKTOP_STATE_WINLOGON) {
+            /* ============================================================
+             * WINLOGON DETECTED - Switch thread to Winlogon desktop
+             * 
+             * UltraVNC pattern:
+             * 1. OpenDesktop("Winlogon") with minimal flags
+             * 2. SetThreadDesktop() to switch capture thread
+             * 3. GetDC(NULL) now returns the Winlogon desktop DC
+             * 4. Capture via GDI BitBlt (DirectDraw CANNOT work here)
+             * 5. Restore home desktop after capture
+             * ============================================================ */
+            bForceGDI = TRUE;  /* DirectDraw fails on Winlogon (0x80000006) */
+            dwLastWinlogonTime = GetTickCount();  /* Reset debounce timer */
+            nConsecutiveNormal = 0;               /* Reset normal counter */
+            
+            if (!pCapture->pDesktopContext->bOnWinlogonDesktop) {
+                BOOL bSwitched;
+                ScreenLog("[CAPTURE] Winlogon detected - switching to Winlogon desktop\r\n");
+                bSwitched = Desktop_SwitchToWinlogon(pCapture->pDesktopContext);
+                if (!bSwitched) {
+                    /* First attempt failed - OS desktop transition may still be settling.
+                     * Retry once after a brief delay. In debug builds, the hundreds of
+                     * DebugLog file I/O calls inside SwitchToWinlogon provide ~200ms of
+                     * implicit delay. In release builds, we need this explicit retry. */
+                    Sleep(250);
+                    bSwitched = Desktop_SwitchToWinlogon(pCapture->pDesktopContext);
+                }
+                if (bSwitched) {
+                    ScreenLog("[CAPTURE] Successfully switched to Winlogon desktop for capture\r\n");
+                    /* Also switch input thread to Winlogon desktop for mouse/keyboard */
+                    if (pCapture->pDesktopContext->hWinlogonDesktop &&
+                        pCapture->pDesktopContext->hImpersonationToken) {
+                        Input_SetWinlogonDesktop(
+                            pCapture->pDesktopContext->hWinlogonDesktop,
+                            pCapture->pDesktopContext->hImpersonationToken);
+                        ScreenLog("[CAPTURE] Input thread switching to Winlogon desktop\r\n");
+                    }
+                } else {
+                    ScreenLog("[CAPTURE] WARNING: Could not switch to Winlogon desktop\r\n");
+                    /* Continue anyway - GDI will capture whatever desktop we're on */
+                }
+            } else {
+                ScreenLog("[CAPTURE] Already on Winlogon desktop, capturing via GDI\r\n");
+                /* Ensure input thread is also on Winlogon (idempotent - safe to call repeatedly) */
+                if (pCapture->pDesktopContext->hWinlogonDesktop &&
+                    pCapture->pDesktopContext->hImpersonationToken) {
+                    Input_SetWinlogonDesktop(
+                        pCapture->pDesktopContext->hWinlogonDesktop,
+                        pCapture->pDesktopContext->hImpersonationToken);
+                }
+            }
+        } else if (eDesktopState == DESKTOP_STATE_NORMAL) {
+            /* Back to normal desktop - restore if we were on Winlogon */
+            if (pCapture->pDesktopContext->bOnWinlogonDesktop) {
+                /* DEBOUNCE: Don't immediately leave Winlogon mode on a single NORMAL detection.
+                 * Without logging I/O delays, detection can transiently read NORMAL during
+                 * OS state transitions, causing unnecessary token/desktop teardown+reacquire.
+                 * Require NORMAL to persist for WINLOGON_DEBOUNCE_MS before switching back. */
+                DWORD dwNow = GetTickCount();
+                DWORD dwElapsed = dwNow - dwLastWinlogonTime;
+                nConsecutiveNormal++;
+                
+                if (dwElapsed < WINLOGON_DEBOUNCE_MS) {
+                    /* Still within debounce window - stay on Winlogon desktop */
+                    ScreenLog("[CAPTURE] NORMAL detected but within debounce window - staying on Winlogon\r\n");
+                    bForceGDI = TRUE;  /* Still need GDI path for Winlogon capture */
+                } else {
+                    /* Debounce expired - actually switch back to normal */
+                    ScreenLog("[CAPTURE] Desktop returned to normal - restoring home desktop\r\n");
+                    nConsecutiveNormal = 0;
+                    Desktop_RestoreHome(pCapture->pDesktopContext);
+                    pCapture->pDesktopContext->bOnWinlogonDesktop = FALSE;
+                    /* Switch input thread back to Default desktop */
+                    Input_ClearWinlogonDesktop();
+                    ScreenLog("[CAPTURE] Input thread switching back to Default desktop\r\n");
+                    /* Close the Winlogon desktop handle */
+                    if (pCapture->pDesktopContext->hWinlogonDesktop) {
+                        CloseDesktop(pCapture->pDesktopContext->hWinlogonDesktop);
+                        pCapture->pDesktopContext->hWinlogonDesktop = NULL;
+                    }
+                    /* Force DirectDraw re-init since old surfaces are invalid after desktop switch */
+                    pCapture->bDDrawFailed = TRUE;
+                    /* CRITICAL: Reset capture mode to initial state - it may have fallen
+                     * to DISABLED during Winlogon. Without this reset, all future captures
+                     * stay in DISABLED mode even after returning to normal desktop. */
+                    pCapture->pDesktopContext->eCaptureMode = CAPTURE_MODE_TOKEN_HIJACKING;
+                    pCapture->pDesktopContext->dwCaptureFailures = 0;
+                    ScreenLog("[CAPTURE] Home desktop restored, capture mode reset, DirectDraw will re-init\r\n");
+                }
+            }
+        } else if (eDesktopState == DESKTOP_STATE_UAC_ACTIVE) {
+            bForceGDI = TRUE;  /* DirectDraw also fails on UAC desktop */
+            ScreenLog("[CAPTURE] UAC desktop detected - forcing GDI capture\r\n");
+        }
+    }
+    
+    /* ATTEMPT 1: Try DirectDraw GPU-accelerated capture (skip on Winlogon/UAC) */
+    /* FIX (v6.1): If DDraw previously failed, attempt recovery every frame
+     * instead of permanently disabling it. DDraw failure may be transient
+     * (e.g., desktop switch, surface lost, temporary lock failure). */
+    if (!bForceGDI && pCapture->bUseDDraw && pCapture->pDDrawContext && pCapture->bDDrawFailed) {
+        DDRAW_STATUS recoverStatus = DDraw_ValidateAndRecover((DDRAW_CONTEXT *)pCapture->pDDrawContext);
+        if (recoverStatus == DDRAW_STATUS_SUCCESS || recoverStatus == DDRAW_STATUS_RECOVERED) {
+            ScreenLog("[CAPTURE] DirectDraw recovered from previous failure\r\n");
+            pCapture->bDDrawFailed = FALSE;
+        }
+    }
+    
+    if (!bForceGDI && pCapture->bUseDDraw && pCapture->pDDrawContext && !pCapture->bDDrawFailed) {
+        ScreenLog("[CAPTURE] Attempting DirectDraw GPU capture...\r\n");
+        
+        /* CRITICAL FIX (v5.9): Resync display dimensions before DirectDraw capture
+         * Monitor resolution may have changed since initialization, or DirectDraw 
+         * may report different size depending on fullscreen vs windowed mode.
+         * Must recheck and reallocate buffers if size changed.
+         * This prevents "Target buffer too small" errors. */
+        if (!ScreenCapture_SyncDisplayMode(pCapture)) {
+            ScreenLog("[CAPTURE] WARNING: Failed to sync display mode (continuing with current buffer size)\r\n");
+            /* Don't fail - continue and let DirectDraw check bounds */
+        }
+        
+        ddStatus = DDraw_CopyFrameBuffer(
+            (DDRAW_CONTEXT *)pCapture->pDDrawContext,
+            pCapture->pPixelData,
+            pCapture->pixelDataSize,
+            &dwBytesWritten
+        );
+        
+        if (ddStatus == DDRAW_STATUS_SUCCESS) {
+            sprintf(buf, "[CAPTURE] DirectDraw GPU capture SUCCESS - %lu bytes\r\n", dwBytesWritten);
+            ScreenLog(buf);
+            return RD2K_SUCCESS;
+        } else {
+            sprintf(buf, "[CAPTURE] DirectDraw capture failed (0x%08lx), attempting fallback to next mode\r\n", ddStatus);
+            ScreenLog(buf);
+            pCapture->bDDrawFailed = TRUE;
+            /* Try fallback to next capture mode */
+            if (pCapture->pDesktopContext) {
+                if (Desktop_TryNextCaptureMode(pCapture->pDesktopContext)) {
+                    ScreenLog("[CAPTURE] Fallback initiated for DirectDraw failure\r\n");
+                } else {
+                    ScreenLog("[CAPTURE] Warning: No fallback available for DirectDraw failure\r\n");
+                }
+            }
+        }
+    }
+    
+    ScreenLog("[CAPTURE] Using GDI fallback capture path\r\n");
+    
+    /* ========================================================================
+     * WINLOGON WORKER THREAD CAPTURE
+     * When we have the Winlogon desktop handle but SetThreadDesktop failed
+     * (error 183 - thread has windows), use a clean worker thread that CAN
+     * switch to the Winlogon desktop and capture from there.
+     * ======================================================================== */
+    if (pCapture->pDesktopContext && 
+        pCapture->pDesktopContext->bOnWinlogonDesktop &&
+        pCapture->pDesktopContext->hWinlogonDesktop) {
+        ScreenLog("[CAPTURE] Winlogon desktop active - using worker thread capture\r\n");
+        
+        if (ScreenCapture_CaptureWinlogonWorker(pCapture) == 0) {
+            ScreenLog("[CAPTURE] Worker thread Winlogon capture SUCCESS\r\n");
+            return RD2K_SUCCESS;
+        }
+        
+        ScreenLog("[CAPTURE] Worker thread capture failed - falling through to normal GDI\r\n");
+    }
+    
+    /* Normal GDI capture path (fallback if DirectDraw fails) */
     hdcScreen = GetDC(NULL);
     if (!hdcScreen) {
-        ScreenLog("[CAPTURE] FAILED GetDC(NULL)\r\n");
+        ScreenLog("[CAPTURE] FAILED GetDC(NULL) - attempting fallback\r\n");
+        /* Trigger capture mode fallback */
+        if (pCapture->pDesktopContext) {
+            if (Desktop_TryNextCaptureMode(pCapture->pDesktopContext)) {
+                ScreenLog("[CAPTURE] Fallback initiated for GetDC failure\r\n");
+                /* Recursively try capture again with new mode */
+                return ScreenCapture_CaptureScreen(pCapture);
+            } else {
+                ScreenLog("[CAPTURE] All fallback modes exhausted due to GetDC failure\r\n");
+            }
+        }
         return RD2K_ERR_SCREEN;
     }
     
@@ -131,8 +732,18 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
     /* Create fresh memory DC from current screen DC */
     hdcMemory = CreateCompatibleDC(hdcScreen);
     if (!hdcMemory) {
-        ScreenLog("[CAPTURE] FAILED CreateCompatibleDC\r\n");
+        ScreenLog("[CAPTURE] FAILED CreateCompatibleDC - attempting fallback\r\n");
         ReleaseDC(NULL, hdcScreen);
+        /* Trigger capture mode fallback */
+        if (pCapture->pDesktopContext) {
+            if (Desktop_TryNextCaptureMode(pCapture->pDesktopContext)) {
+                ScreenLog("[CAPTURE] Fallback initiated for CreateCompatibleDC failure\r\n");
+                /* Recursively try capture again with new mode */
+                return ScreenCapture_CaptureScreen(pCapture);
+            } else {
+                ScreenLog("[CAPTURE] All fallback modes exhausted due to CreateCompatibleDC failure\r\n");
+            }
+        }
         return RD2K_ERR_SCREEN;
     }
     
@@ -144,7 +755,7 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
     pCapture->bmpInfo.bmiHeader.biWidth = pCapture->width;
     pCapture->bmpInfo.bmiHeader.biHeight = -pCapture->height;
     pCapture->bmpInfo.bmiHeader.biPlanes = 1;
-    pCapture->bmpInfo.bmiHeader.biBitCount = 24;
+    pCapture->bmpInfo.bmiHeader.biBitCount = (WORD)pCapture->bitsPerPixel;  /* Use actual screen depth! */
     pCapture->bmpInfo.bmiHeader.biCompression = BI_RGB;
     
     hBitmap = CreateDIBSection(
@@ -152,9 +763,19 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
         (void**)&pPixelData, NULL, 0);
     
     if (!hBitmap || !pPixelData) {
-        ScreenLog("[CAPTURE] FAILED CreateDIBSection\r\n");
+        ScreenLog("[CAPTURE] FAILED CreateDIBSection - attempting fallback\r\n");
         DeleteDC(hdcMemory);
         ReleaseDC(NULL, hdcScreen);
+        /* Trigger capture mode fallback */
+        if (pCapture->pDesktopContext) {
+            if (Desktop_TryNextCaptureMode(pCapture->pDesktopContext)) {
+                ScreenLog("[CAPTURE] Fallback initiated for CreateDIBSection failure\r\n");
+                /* Recursively try capture again with new mode */
+                return ScreenCapture_CaptureScreen(pCapture);
+            } else {
+                ScreenLog("[CAPTURE] All fallback modes exhausted due to CreateDIBSection failure\r\n");
+            }
+        }
         return RD2K_ERR_SCREEN;
     }
     
@@ -200,6 +821,27 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
         if (!result) {
             sprintf(buf, "[CAPTURE] BitBlt FAILED! GetLastError=%lu (0x%lx)\r\n", lastError, lastError);
             ScreenLog(buf);
+            
+            /* ERROR 6 = INVALID_HANDLE: Desktop switched (UAC appeared)! 
+             * When UAC prompt appears, Windows switches to Secure Desktop
+             * All old DC handles become invalid. We must reinitialize next frame. 
+             * Also trigger fallback to next capture mode if available */
+            if (lastError == 6) {  /* ERROR_INVALID_HANDLE */
+                ScreenLog("[CAPTURE] ERROR 6 = Desktop switched (INVALID_HANDLE)!\r\n");
+                /* Only cascade fallback if NOT already handling Winlogon/UAC
+                 * When bForceGDI is set, we already know we're on a secure desktop
+                 * and this error is expected if the switch didn't work */
+                if (!bForceGDI && pCapture->pDesktopContext) {
+                    if (Desktop_TryNextCaptureMode(pCapture->pDesktopContext)) {
+                        ScreenLog("[CAPTURE] Fallback to next capture mode initiated\r\n");
+                    } else {
+                        ScreenLog("[CAPTURE] All capture mode fallbacks exhausted\r\n");
+                    }
+                }
+                /* Force reinitialization next frame by disabling reuse */
+                pCapture->bDDrawFailed = TRUE;
+            }
+            
             SelectObject(hdcMemory, hBitmapOld);
             DeleteObject(hBitmap);
             DeleteDC(hdcMemory);
@@ -216,6 +858,20 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
      * allocated in ScreenCapture_Create(). This buffer is used later in SendScreenUpdate. */
     {
         char buf[256];
+        int expectedSize;
+        int bytesPerPixel = (pCapture->bitsPerPixel + 7) / 8;  /* Convert bits to bytes */
+        
+        /* Validate pixelDataSize against calculated expected size */
+        expectedSize = pCapture->width * pCapture->height * bytesPerPixel;
+        
+        if (pCapture->pixelDataSize != expectedSize) {
+            sprintf(buf, "[CAPTURE] ERROR: pixelDataSize mismatch! stored=%d expected=%d (w=%d h=%d bpp=%d)\r\n",
+                    pCapture->pixelDataSize, expectedSize, pCapture->width, pCapture->height, pCapture->bitsPerPixel);
+            ScreenLog(buf);
+            /* Use the correct expected size instead of corrupted value */
+            pCapture->pixelDataSize = expectedSize;
+        }
+        
         sprintf(buf, "[CAPTURE] About to copy: src=%p dst=%p size=%d\r\n",
                 (void*)pPixelData, (void*)pCapture->pPixelData, pCapture->pixelDataSize);
         ScreenLog(buf);
@@ -227,6 +883,16 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
         ScreenLog("[CAPTURE] ERROR: pCapture->pPixelData is NULL!\r\n");
     } else if (pCapture->pixelDataSize == 0) {
         ScreenLog("[CAPTURE] ERROR: pixelDataSize is 0!\r\n");
+    } else if (pCapture->pixelDataSize > (pCapture->width * pCapture->height * 8)) {
+        /* Sanity check: size shouldn't be more than 8 bytes per pixel */
+        char buf[256];
+        int bytesPerPixel = (pCapture->bitsPerPixel + 7) / 8;
+        int expectedSize = pCapture->width * pCapture->height * bytesPerPixel;
+        sprintf(buf, "[CAPTURE] ERROR: pixelDataSize %d is unreasonable! Clamping to expected %d\r\n",
+                pCapture->pixelDataSize, expectedSize);
+        ScreenLog(buf);
+        pCapture->pixelDataSize = expectedSize;
+        memcpy(pCapture->pPixelData, pPixelData, pCapture->pixelDataSize);
     } else {
         memcpy(pCapture->pPixelData, pPixelData, pCapture->pixelDataSize);
         ScreenLog("[CAPTURE] Copied pixel data to persistent buffer\r\n");
