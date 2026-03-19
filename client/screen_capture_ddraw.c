@@ -817,15 +817,17 @@ DDRAW_STATUS WINAPI DDraw_CopyFrameBuffer(DDRAW_CONTEXT *pContext,
         return status;
     }
     
-    /* Calculate expected FRAME OUTPUT size (not input!)
+    /* Calculate expected FRAME OUTPUT size (DWORD-aligned rows as Windows bitmaps require)
      * CRITICAL: DirectDraw gives 32-bit BGRA, but we output 24-bit BGR
-     * So we MUST check against output size, not input pitch size */
+     * Output rows MUST be DWORD-aligned to match DIB/FindDirtyRects/viewer stride */
     if (pContext->screenInfo.dwBitCount == 32) {
-        /* Will convert 32-bit to 24-bit: output = width * 3 * height */
-        dwExpectedSize = pContext->screenInfo.dwWidth * 3 * pContext->screenInfo.dwHeight;
+        /* Will convert 32-bit to 24-bit: output uses DWORD-aligned 24-bit rows */
+        DWORD dwAlignedStride = ((pContext->screenInfo.dwWidth * 3 + 3) & ~3);
+        dwExpectedSize = dwAlignedStride * pContext->screenInfo.dwHeight;
     } else {
-        /* Fixed bit depth: output = width * (bitcount/8) * height */
-        dwExpectedSize = pContext->screenInfo.dwWidth * (pContext->screenInfo.dwBitCount / 8) * pContext->screenInfo.dwHeight;
+        /* Fixed bit depth: output uses DWORD-aligned rows */
+        DWORD dwAlignedStride = ((pContext->screenInfo.dwWidth * (pContext->screenInfo.dwBitCount / 8) + 3) & ~3);
+        dwExpectedSize = dwAlignedStride * pContext->screenInfo.dwHeight;
     }
     
     if (dwTargetSize < dwExpectedSize) {
@@ -849,16 +851,44 @@ DDRAW_STATUS WINAPI DDraw_CopyFrameBuffer(DDRAW_CONTEXT *pContext,
     
     /* 
      * CRITICAL: DirectDraw gives us 32-bit BGRA, but the protocol expects 24-bit BGR!
-     * Convert BGRA (4 bytes) to BGR (3 bytes) by stripping alpha channel
-     * This reduces data size from 8,294,400 to 6,220,800 bytes
+     * Convert BGRA (4 bytes) to BGR (3 bytes) by stripping alpha channel.
+     * Output rows are DWORD-aligned to match Windows DIB convention.
      */
     if (pContext->screenInfo.dwBitCount == 32) {
         DWORD dwPixelCount = pContext->screenInfo.dwWidth;
+        DWORD dwDstStride = ((dwPixelCount * 3 + 3) & ~3);  /* DWORD-aligned 24-bit row */
         DWORD dwRow;
         LPBYTE pbSrcRow, pbDstRow;
         DWORD x;
         
-        DDraw_Log("Converting BGRA (32-bit) to BGR (24-bit)...");
+        /* ONE-TIME DIAGNOSTIC: Log detailed pixel format info on first frame */
+        if (pContext->dwSuccessCount <= 1) {
+            DDraw_Log("=== FIRST FRAME DIAGNOSTIC ===");
+            DDraw_Log("Surface: %lux%lu, %lu-bit, lPitch=%ld",
+                      ddsd.dwWidth, ddsd.dwHeight,
+                      ddsd.ddpfPixelFormat.dwRGBBitCount, ddsd.lPitch);
+            DDraw_Log("ScreenInfo: %lux%lu, %lu-bit, stored_pitch=%lu",
+                      pContext->screenInfo.dwWidth, pContext->screenInfo.dwHeight,
+                      pContext->screenInfo.dwBitCount, pContext->screenInfo.dwPitch);
+            DDraw_Log("Pixel masks: R=0x%08lx G=0x%08lx B=0x%08lx A=0x%08lx",
+                      ddsd.ddpfPixelFormat.dwRBitMask,
+                      ddsd.ddpfPixelFormat.dwGBitMask,
+                      ddsd.ddpfPixelFormat.dwBBitMask,
+                      ddsd.ddpfPixelFormat.dwRGBAlphaBitMask);
+            DDraw_Log("Output: dstStride=%lu (width*3=%lu) expectedTotal=%lu",
+                      dwDstStride, dwPixelCount * 3, dwExpectedSize);
+            /* Hex dump first 4 source pixels */
+            if (pbSource) {
+                DDraw_Log("Source pixels[0..3]: %02X %02X %02X %02X | %02X %02X %02X %02X | %02X %02X %02X %02X | %02X %02X %02X %02X",
+                          pbSource[0], pbSource[1], pbSource[2], pbSource[3],
+                          pbSource[4], pbSource[5], pbSource[6], pbSource[7],
+                          pbSource[8], pbSource[9], pbSource[10], pbSource[11],
+                          pbSource[12], pbSource[13], pbSource[14], pbSource[15]);
+            }
+            DDraw_Log("=== END DIAGNOSTIC ===");
+        }
+        
+        DDraw_Log("Converting BGRA (32-bit) to BGR (24-bit), dstStride=%lu...", dwDstStride);
         
         for (dwRow = 0; dwRow < pContext->screenInfo.dwHeight; dwRow++) {
             pbSrcRow = pbSource;
@@ -876,24 +906,25 @@ DDRAW_STATUS WINAPI DDraw_CopyFrameBuffer(DDRAW_CONTEXT *pContext,
                 pbDstRow += 3;  /* Move to next 24-bit pixel */
             }
             
-            /* Advance to next scanline */
+            /* Advance to next scanline using DWORD-aligned stride */
             pbSource += ddsd.lPitch;
-            pbDest += (dwPixelCount * 3);  /* 24-bit stride */
+            pbDest += dwDstStride;  /* DWORD-aligned 24-bit stride */
         }
         
-        /* Update bytes written to reflect 24-bit output */
-        *pdwBytesWritten = pContext->screenInfo.dwWidth * 3 * pContext->screenInfo.dwHeight;
+        /* Update bytes written to reflect DWORD-aligned 24-bit output */
+        *pdwBytesWritten = dwDstStride * pContext->screenInfo.dwHeight;
         
-        DDraw_Log("Conversion complete: %lu bytes (BGRA) -> %lu bytes (BGR)",
-                  dwExpectedSize, *pdwBytesWritten);
+        DDraw_Log("Conversion complete: %lu bytes output (stride=%lu)",
+                  *pdwBytesWritten, dwDstStride);
     } else {
-        /* Not 32-bit, copy as-is */
-        dwCopySize = pContext->screenInfo.dwWidth * (pContext->screenInfo.dwBitCount / 8);
+        /* Not 32-bit, copy as-is with DWORD-aligned destination rows */
+        DWORD dwSrcRowBytes = pContext->screenInfo.dwWidth * (pContext->screenInfo.dwBitCount / 8);
+        DWORD dwDstStride = ((dwSrcRowBytes + 3) & ~3);
         
         for (dwRow = 0; dwRow < pContext->screenInfo.dwHeight; dwRow++) {
-            CopyMemory(pbDest, pbSource, dwCopySize);
+            CopyMemory(pbDest, pbSource, dwSrcRowBytes);
             pbSource += ddsd.lPitch;
-            pbDest += dwCopySize;
+            pbDest += dwDstStride;
         }
         
         *pdwBytesWritten = dwExpectedSize;

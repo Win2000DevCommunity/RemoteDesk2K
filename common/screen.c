@@ -200,14 +200,26 @@ static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
         return 1;
     }
     
-    /* Copy pixels to caller's buffer */
+    /* Copy pixels to caller's buffer using proper DWORD-aligned stride.
+     * CreateDIBSection produces DWORD-aligned rows. We must copy row-by-row
+     * to ensure the destination buffer also has DWORD-aligned rows. */
     {
-        DWORD dwRowBytes = (DWORD)pParams->width * (pParams->bitsPerPixel / 8);
-        DWORD dwTotalBytes = dwRowBytes * (DWORD)pParams->height;
+        int bytesPerPixel = pParams->bitsPerPixel / 8;
+        DWORD dwSrcStride = (DWORD)((pParams->width * bytesPerPixel + 3) & ~3);  /* DIB stride */
+        DWORD dwDstStride = dwSrcStride;  /* Same DWORD-aligned stride for dest */
+        DWORD dwRowBytes = (DWORD)pParams->width * bytesPerPixel;  /* Actual pixel bytes per row */
+        int row;
+        DWORD dwTotalBytes = dwDstStride * (DWORD)pParams->height;
+        
         if (dwTotalBytes > pParams->pixelDataSize) {
             dwTotalBytes = pParams->pixelDataSize;
         }
-        memcpy(pParams->pPixelData, pBits, dwTotalBytes);
+        /* Row-by-row copy to handle stride properly */
+        for (row = 0; row < pParams->height; row++) {
+            DWORD offset = (DWORD)row * dwDstStride;
+            if (offset + dwRowBytes > pParams->pixelDataSize) break;
+            memcpy(pParams->pPixelData + offset, pBits + (row * dwSrcStride), dwRowBytes);
+        }
     }
     
     /* CRITICAL: Inject any pending input events while we're on the Winlogon desktop.
@@ -460,8 +472,41 @@ PSCREEN_CAPTURE ScreenCapture_Create(void)
             
             /* CRITICAL: DirectDraw outputs 24-bit BGR (after BGRA->BGR conversion) */
             if (pCapture->bitsPerPixel == 32) {
+                int newBpp;
+                DWORD newPixelDataSize;
                 ScreenLog("[CREATE] Adjusting bit depth: 32-bit -> 24-bit (DirectDraw outputs 24-bit BGR)\r\n");
                 pCapture->bitsPerPixel = 24;  /* DirectDraw output is 24-bit BGR */
+                
+                /* CRITICAL FIX: Recalculate pixelDataSize for 24-bit DWORD-aligned rows.
+                 * Must match the stride used by FindDirtyRects, SendScreenUpdate, and viewer. */
+                newBpp = 3;  /* 24 bits / 8 = 3 bytes per pixel */
+                newPixelDataSize = ((pCapture->width * newBpp + 3) & ~3) * pCapture->height;
+                
+                if (newPixelDataSize != pCapture->pixelDataSize) {
+                    char buf2[256];
+                    sprintf(buf2, "[CREATE] Recalculating pixelDataSize: %d -> %d (24-bit DWORD-aligned)\r\n",
+                            pCapture->pixelDataSize, newPixelDataSize);
+                    ScreenLog(buf2);
+                    pCapture->pixelDataSize = newPixelDataSize;
+                    
+                    /* Reallocate buffers at new (smaller) size */
+                    {
+                        BYTE *pNew = (BYTE*)calloc(1, newPixelDataSize);
+                        BYTE *pNewPrev = (BYTE*)malloc(newPixelDataSize);
+                        if (pNew && pNewPrev) {
+                            free(pCapture->pPixelData);
+                            free(pCapture->pPrevFrame);
+                            pCapture->pPixelData = pNew;
+                            pCapture->pPrevFrame = pNewPrev;
+                            memset(pCapture->pPrevFrame, 0xFF, newPixelDataSize);
+                            ScreenLog("[CREATE] Reallocated pixel buffers for 24-bit\r\n");
+                        } else {
+                            if (pNew) free(pNew);
+                            if (pNewPrev) free(pNewPrev);
+                            ScreenLog("[CREATE] WARNING: realloc failed, keeping 32-bit sized buffers\r\n");
+                        }
+                    }
+                }
             }
             
             /* CRITICAL: Sync display dimensions from DirectDraw (the SDK authoritative source!)
@@ -858,17 +903,18 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
      * allocated in ScreenCapture_Create(). This buffer is used later in SendScreenUpdate. */
     {
         char buf[256];
-        int expectedSize;
         int bytesPerPixel = (pCapture->bitsPerPixel + 7) / 8;  /* Convert bits to bytes */
+        int alignedStride;
+        int expectedSize;
         
-        /* Validate pixelDataSize against calculated expected size */
-        expectedSize = pCapture->width * pCapture->height * bytesPerPixel;
+        /* Validate pixelDataSize against DWORD-aligned expected size */
+        alignedStride = ((pCapture->width * bytesPerPixel + 3) & ~3);
+        expectedSize = alignedStride * pCapture->height;
         
         if (pCapture->pixelDataSize != expectedSize) {
-            sprintf(buf, "[CAPTURE] ERROR: pixelDataSize mismatch! stored=%d expected=%d (w=%d h=%d bpp=%d)\r\n",
-                    pCapture->pixelDataSize, expectedSize, pCapture->width, pCapture->height, pCapture->bitsPerPixel);
+            sprintf(buf, "[CAPTURE] pixelDataSize adjusted: stored=%d expected=%d (w=%d h=%d bpp=%d stride=%d)\r\n",
+                    pCapture->pixelDataSize, expectedSize, pCapture->width, pCapture->height, pCapture->bitsPerPixel, alignedStride);
             ScreenLog(buf);
-            /* Use the correct expected size instead of corrupted value */
             pCapture->pixelDataSize = expectedSize;
         }
         
@@ -887,13 +933,24 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
         /* Sanity check: size shouldn't be more than 8 bytes per pixel */
         char buf[256];
         int bytesPerPixel = (pCapture->bitsPerPixel + 7) / 8;
-        int expectedSize = pCapture->width * pCapture->height * bytesPerPixel;
+        int alignedStride = ((pCapture->width * bytesPerPixel + 3) & ~3);
+        int expectedSize = alignedStride * pCapture->height;
         sprintf(buf, "[CAPTURE] ERROR: pixelDataSize %d is unreasonable! Clamping to expected %d\r\n",
                 pCapture->pixelDataSize, expectedSize);
         ScreenLog(buf);
         pCapture->pixelDataSize = expectedSize;
-        memcpy(pCapture->pPixelData, pPixelData, pCapture->pixelDataSize);
+        /* Row-by-row copy from DIB (DWORD-aligned source) to buffer */
+        {
+            int bytesPerRow = pCapture->width * bytesPerPixel;
+            int row;
+            for (row = 0; row < pCapture->height; row++) {
+                memcpy(pCapture->pPixelData + row * alignedStride,
+                       pPixelData + row * alignedStride,
+                       bytesPerRow);
+            }
+        }
     } else {
+        /* DIB section produces DWORD-aligned rows - copy the full aligned size */
         memcpy(pCapture->pPixelData, pPixelData, pCapture->pixelDataSize);
         ScreenLog("[CAPTURE] Copied pixel data to persistent buffer\r\n");
     }

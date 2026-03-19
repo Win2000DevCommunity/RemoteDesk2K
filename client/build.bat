@@ -4,8 +4,9 @@ REM RemoteDesk2K Build Script
 REM Remote Desktop Application for Windows 2000
 REM Uses DDK compiler (Windows 2000 compatible)
 REM
-REM Usage:  build          (release - no debug logs)
+REM Usage:  build          (interactive - asks debug or release)
 REM         build debug    (debug - with file/OutputDebugString logging)
+REM         build release  (release - no debug logs)
 REM ============================================================
 
 setlocal
@@ -32,15 +33,41 @@ if not exist "%CL_PATH%" (
     goto :error
 )
 
+REM Determine build mode
+set DEBUG_FLAG=
+set BUILD_MODE=RELEASE
+
+if /I "%1"=="debug" (
+    set DEBUG_FLAG=/DRD2K_DEBUG
+    set BUILD_MODE=DEBUG
+    goto :start_build
+)
+if /I "%1"=="release" goto :start_build
+
+REM No argument - ask the user
+echo ============================================================
+echo  RemoteDesk2K Build Script
+echo ============================================================
+echo.
+echo  Select build mode:
+echo.
+echo    1. Release  (no debug logs, optimized)
+echo    2. Debug    (with DebugView + file logging)
+echo.
+set /p BUILD_CHOICE="  Enter choice (1 or 2): "
+
+if "%BUILD_CHOICE%"=="2" (
+    set DEBUG_FLAG=/DRD2K_DEBUG
+    set BUILD_MODE=DEBUG
+) else (
+    set BUILD_MODE=RELEASE
+)
+
+:start_build
+echo.
 echo ============================================================
 echo Building RemoteDesk2K - Remote Desktop for Windows 2000
 echo Using DDK compiler: %CL_PATH%
-
-REM Check for debug mode
-set DEBUG_FLAG=
-set BUILD_MODE=RELEASE
-if /I "%1"=="debug" set DEBUG_FLAG=/DRD2K_DEBUG
-if /I "%1"=="debug" set BUILD_MODE=DEBUG
 echo Mode: %BUILD_MODE%
 echo ============================================================
 echo.
