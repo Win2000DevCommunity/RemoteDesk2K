@@ -91,6 +91,7 @@ static volatile HANDLE  g_hWinlogonTokenForInput = NULL;
 static volatile LONG    g_bInputSwitchToWinlogon = 0;   /* 1 = switch pending */
 static volatile LONG    g_bInputSwitchToDefault = 0;    /* 1 = restore pending */
 static BOOL             g_bInputOnWinlogon = FALSE;     /* current state */
+static volatile BOOL    g_bWinlogonInputDesired = FALSE; /* TRUE = Winlogon mode requested */
 
 /* Input debug logging - writes to same log as screen/desktop */
 #include <stdio.h>
@@ -164,6 +165,7 @@ void Input_Shutdown(void)
     g_hWinlogonDesktopForInput = NULL;
     g_hWinlogonTokenForInput = NULL;
     g_bInputOnWinlogon = FALSE;
+    g_bWinlogonInputDesired = FALSE;
     
     /* Signal thread to stop */
     SetEvent(g_hInputStopEvent);
@@ -201,6 +203,7 @@ void Input_SetWinlogonDesktop(HDESK hDesktop, HANDLE hToken)
     if (!hDesktop || !hToken) return;
     g_hWinlogonDesktopForInput = (HDESK)hDesktop;
     g_hWinlogonTokenForInput = (HANDLE)hToken;
+    g_bWinlogonInputDesired = TRUE;
     InterlockedExchange((LONG*)&g_bInputSwitchToWinlogon, 1);
     InterlockedExchange((LONG*)&g_bInputSwitchToDefault, 0);
 }
@@ -211,6 +214,7 @@ void Input_SetWinlogonDesktop(HDESK hDesktop, HANDLE hToken)
  */
 void Input_ClearWinlogonDesktop(void)
 {
+    g_bWinlogonInputDesired = FALSE;
     InterlockedExchange((LONG*)&g_bInputSwitchToDefault, 1);
     InterlockedExchange((LONG*)&g_bInputSwitchToWinlogon, 0);
     g_hWinlogonDesktopForInput = (HDESK)NULL;
@@ -412,6 +416,9 @@ static DWORD WINAPI InputThreadProc(LPVOID lpParam)
                 if (ImpersonateLoggedOnUser(hTok)) {
                     if (SetThreadDesktop(hDesk)) {
                         g_bInputOnWinlogon = TRUE;
+                        /* Force screen dimension refresh for new desktop */
+                        g_screenWidth = 0;
+                        g_screenHeight = 0;
                         InputLog("Switched to Winlogon desktop for input injection\r\n");
                     } else {
                         char errBuf[128];
@@ -436,14 +443,18 @@ static DWORD WINAPI InputThreadProc(LPVOID lpParam)
                 }
                 RevertToSelf();
                 g_bInputOnWinlogon = FALSE;
+                /* Force screen dimension refresh for restored desktop */
+                g_screenWidth = 0;
+                g_screenHeight = 0;
                 InputLog("Switched back to Default desktop for input injection\r\n");
             }
         }
         
-        /* When on Winlogon, skip processing - the capture worker thread
-         * will drain the queue via Input_DrainQueueDirect() from a thread
-         * that is already on the Winlogon desktop (confirmed working). */
-        if (g_bInputOnWinlogon) {
+        /* If Winlogon mode was requested but SetThreadDesktop failed,
+         * DON'T inject events here (they'd go to the wrong desktop).
+         * Leave them queued for the worker thread's Input_DrainQueueDirect()
+         * which runs from a thread confirmed to be on Winlogon desktop. */
+        if (g_bWinlogonInputDesired && !g_bInputOnWinlogon) {
             continue;
         }
         
