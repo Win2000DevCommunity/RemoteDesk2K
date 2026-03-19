@@ -141,6 +141,24 @@ static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
             sprintf(pParams->szError, "Worker: ImpersonateLoggedOnUser failed: %lu", GetLastError());
             return 1;
         }
+        
+        /* Enable SeTcbPrivilege on THIS thread's impersonation token.
+         * Even though hDupToken now has SeTcbPrivilege enabled, some OS
+         * versions may not copy the enabled state to the thread token.
+         * This is critical for mouse_event/keybd_event on Winlogon desktop. */
+        {
+            HANDLE hThreadTok = NULL;
+            if (OpenThreadToken(GetCurrentThread(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                                FALSE, &hThreadTok)) {
+                TOKEN_PRIVILEGES tp;
+                tp.PrivilegeCount = 1;
+                tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                if (LookupPrivilegeValueA(NULL, "SeTcbPrivilege", &tp.Privileges[0].Luid)) {
+                    AdjustTokenPrivileges(hThreadTok, FALSE, &tp, 0, NULL, NULL);
+                }
+                CloseHandle(hThreadTok);
+            }
+        }
     }
     
     /* THIS IS THE KEY: clean thread with NO windows can switch desktop */
@@ -657,11 +675,13 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
                     /* Debounce expired - actually switch back to normal */
                     ScreenLog("[CAPTURE] Desktop returned to normal - restoring home desktop\r\n");
                     nConsecutiveNormal = 0;
-                    Desktop_RestoreHome(pCapture->pDesktopContext);
-                    pCapture->pDesktopContext->bOnWinlogonDesktop = FALSE;
-                    /* Switch input thread back to Default desktop */
+                    /* CRITICAL ORDER: Clear input thread globals FIRST (before closing handles).
+                     * This prevents a race where the input thread tries ImpersonateLoggedOnUser
+                     * with a handle that Desktop_RestoreHome already closed. */
                     Input_ClearWinlogonDesktop();
                     ScreenLog("[CAPTURE] Input thread switching back to Default desktop\r\n");
+                    Desktop_RestoreHome(pCapture->pDesktopContext);
+                    pCapture->pDesktopContext->bOnWinlogonDesktop = FALSE;
                     /* Close the Winlogon desktop handle */
                     if (pCapture->pDesktopContext->hWinlogonDesktop) {
                         CloseDesktop(pCapture->pDesktopContext->hWinlogonDesktop);

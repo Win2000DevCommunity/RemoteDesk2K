@@ -729,7 +729,55 @@ BOOL Desktop_ImpersonateWinlogon(PDESKTOP_CONTEXT pDesktop)
         DebugLog("[Impersonate] DuplicateTokenEx(MAXIMUM_ALLOWED) SUCCESS\r\n");
     }
     
-    /* Step 6: Impersonate! Thread now has SYSTEM security context */
+    /* ---- Enable ALL privileges on hDupToken BEFORE impersonation ----
+     * CRITICAL: Privileges must be enabled on hDupToken itself, not just on
+     * the thread's impersonation token copy. When worker/input threads later
+     * call ImpersonateLoggedOnUser(hDupToken), they inherit the privilege state
+     * of hDupToken. If we only enable privileges on the thread copy (via
+     * OpenThreadToken), those other threads get a token WITHOUT SeTcbPrivilege,
+     * causing mouse_event/keybd_event to silently fail on the Winlogon desktop. */
+    {
+        TOKEN_PRIVILEGES tp;
+        BOOL bEnabledTcb = FALSE;
+        
+        /* SeTcbPrivilege - THE key privilege for secure desktop access + input */
+        tp.PrivilegeCount = 1;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        if (LookupPrivilegeValueA(NULL, "SeTcbPrivilege", &tp.Privileges[0].Luid)) {
+            if (AdjustTokenPrivileges(hDupToken, FALSE, &tp, 0, NULL, NULL)) {
+                if (GetLastError() == ERROR_SUCCESS) {
+                    DebugLog("[Impersonate] SeTcbPrivilege ENABLED on hDupToken\r\n");
+                    bEnabledTcb = TRUE;
+                } else {
+                    DebugLog("[Impersonate] SeTcbPrivilege not held in hDupToken\r\n");
+                }
+            }
+        }
+        
+        /* SeAssignPrimaryTokenPrivilege */
+        if (LookupPrivilegeValueA(NULL, "SeAssignPrimaryTokenPrivilege", &tp.Privileges[0].Luid)) {
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            if (AdjustTokenPrivileges(hDupToken, FALSE, &tp, 0, NULL, NULL) && GetLastError() == ERROR_SUCCESS) {
+                DebugLog("[Impersonate] SeAssignPrimaryTokenPrivilege ENABLED on hDupToken\r\n");
+            }
+        }
+        
+        /* SeDebugPrivilege */
+        if (LookupPrivilegeValueA(NULL, "SeDebugPrivilege", &tp.Privileges[0].Luid)) {
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            if (AdjustTokenPrivileges(hDupToken, FALSE, &tp, 0, NULL, NULL) && GetLastError() == ERROR_SUCCESS) {
+                DebugLog("[Impersonate] SeDebugPrivilege ENABLED on hDupToken\r\n");
+            }
+        }
+        
+        if (!bEnabledTcb) {
+            DebugLog("[Impersonate] WARNING: SeTcbPrivilege could NOT be enabled on hDupToken - input injection may fail\r\n");
+        }
+    }
+    
+    /* Step 6: Impersonate! Thread now has SYSTEM security context
+     * ImpersonateLoggedOnUser creates a COPY of hDupToken with the same
+     * privilege state (including the privileges we just enabled above). */
     if (!ImpersonateLoggedOnUser(hDupToken)) {
         DWORD dwImpErr = GetLastError();
         sprintf(buf, "[Impersonate] ImpersonateLoggedOnUser failed: %lu, trying SetThreadToken...\r\n", dwImpErr);
@@ -750,35 +798,31 @@ BOOL Desktop_ImpersonateWinlogon(PDESKTOP_CONTEXT pDesktop)
     
     DebugLog("[Impersonate] SUCCESS - Thread is now impersonating SYSTEM\r\n");
     
-    /* Save token for later cleanup */
+    /* Save token for later use by worker/input threads */
     pDesktop->hImpersonationToken = hDupToken;
     pDesktop->bImpersonating = TRUE;
     
-    /* ---- Enable ALL privileges in the impersonation token ----
-     * The winlogon.exe token HAS SeTcbPrivilege (Act as part of the OS),
-     * SeAssignPrimaryTokenPrivilege, etc. but they may be DISABLED by default.
-     * SeTcbPrivilege is CRITICAL: it's what allows winlogon.exe to access
-     * restricted desktops (the "Winlogon" desktop).
-     * Without it enabled, OpenDesktop("Winlogon") returns ACCESS_DENIED (5)
-     * even when impersonating SYSTEM. */
+    /* ---- Also enable privileges on the thread's impersonation token copy ----
+     * Belt-and-suspenders: the thread copy was made from hDupToken (which now
+     * has privileges enabled), but some OS versions may not copy the enabled
+     * state. Explicitly enable on the thread token too. */
     {
         HANDLE hThreadToken = NULL;
         if (OpenThreadToken(GetCurrentThread(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, 
                             FALSE, &hThreadToken)) {
-            /* Enable specific critical privileges first */
             TOKEN_PRIVILEGES tp;
             BOOL bEnabledTcb = FALSE;
             
-            /* SeTcbPrivilege - THE key privilege for desktop access */
+            /* SeTcbPrivilege */
             tp.PrivilegeCount = 1;
             tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
             if (LookupPrivilegeValueA(NULL, "SeTcbPrivilege", &tp.Privileges[0].Luid)) {
                 if (AdjustTokenPrivileges(hThreadToken, FALSE, &tp, 0, NULL, NULL)) {
                     if (GetLastError() == ERROR_SUCCESS) {
-                        DebugLog("[Impersonate] SeTcbPrivilege ENABLED\r\n");
+                        DebugLog("[Impersonate] SeTcbPrivilege ENABLED on thread token\r\n");
                         bEnabledTcb = TRUE;
                     } else {
-                        DebugLog("[Impersonate] SeTcbPrivilege not held in token\r\n");
+                        DebugLog("[Impersonate] SeTcbPrivilege not held in thread token\r\n");
                     }
                 } else {
                     sprintf(buf, "[Impersonate] AdjustTokenPrivileges(SeTcb) failed: %lu\r\n", GetLastError());
@@ -790,11 +834,11 @@ BOOL Desktop_ImpersonateWinlogon(PDESKTOP_CONTEXT pDesktop)
             if (LookupPrivilegeValueA(NULL, "SeAssignPrimaryTokenPrivilege", &tp.Privileges[0].Luid)) {
                 tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
                 if (AdjustTokenPrivileges(hThreadToken, FALSE, &tp, 0, NULL, NULL) && GetLastError() == ERROR_SUCCESS) {
-                    DebugLog("[Impersonate] SeAssignPrimaryTokenPrivilege ENABLED\r\n");
+                    DebugLog("[Impersonate] SeAssignPrimaryTokenPrivilege ENABLED on thread token\r\n");
                 }
             }
             
-            /* SeDebugPrivilege (needed for process access) */
+            /* SeDebugPrivilege */
             if (LookupPrivilegeValueA(NULL, "SeDebugPrivilege", &tp.Privileges[0].Luid)) {
                 tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
                 if (AdjustTokenPrivileges(hThreadToken, FALSE, &tp, 0, NULL, NULL) && GetLastError() == ERROR_SUCCESS) {
@@ -1178,8 +1222,31 @@ BOOL Desktop_SwitchToWinlogon(PDESKTOP_CONTEXT pDesktop)
         DebugLog(buf);
         
         if (hFoundDesktop) {
+            /* The brute-force handle may lack DESKTOP_JOURNALPLAYBACK, which is
+             * required for mouse_event/keybd_event to work. Now that we're
+             * impersonating SYSTEM with SeTcbPrivilege, try to re-open the
+             * desktop by name with full input access rights. */
+            {
+                HDESK hUpgraded = OpenDesktopA("Winlogon", 0, FALSE, DESKTOP_INPUT_ACCESS);
+                if (hUpgraded) {
+                    DebugLog("[SwitchToWinlogon] Upgraded brute-force handle to DESKTOP_INPUT_ACCESS\r\n");
+                    CloseHandle(hFoundDesktop);
+                    hFoundDesktop = hUpgraded;
+                } else {
+                    /* Try GENERIC_ALL as second attempt */
+                    hUpgraded = OpenDesktopA("Winlogon", 0, FALSE, GENERIC_ALL);
+                    if (hUpgraded) {
+                        DebugLog("[SwitchToWinlogon] Upgraded brute-force handle to GENERIC_ALL\r\n");
+                        CloseHandle(hFoundDesktop);
+                        hFoundDesktop = hUpgraded;
+                    } else {
+                        sprintf(buf, "[SwitchToWinlogon] WARNING: Could not upgrade brute-force handle (error %lu) - input injection may fail\r\n", GetLastError());
+                        DebugLog(buf);
+                    }
+                }
+            }
             hWinlogonDesktop = hFoundDesktop;
-            DebugLog("[SwitchToWinlogon] Using brute-force duplicated Winlogon desktop handle\r\n");
+            DebugLog("[SwitchToWinlogon] Using brute-force Winlogon desktop handle\r\n");
             goto got_desktop;
         }
     }

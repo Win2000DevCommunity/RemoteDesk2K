@@ -100,7 +100,7 @@ static void InputLog(const char *msg)
 #ifdef RD2K_DEBUG
     FILE *f = fopen("rd2k_debug.log", "a");
     if (f) {
-        SYSTEMTIME st;
+        SYSTEMTIME st; 
         GetLocalTime(&st);
         fprintf(f, "[%02d:%02d:%02d.%03d] [INPUT] %s", 
                 st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg);
@@ -414,6 +414,20 @@ static DWORD WINAPI InputThreadProc(LPVOID lpParam)
             HANDLE hTok = (HANDLE)g_hWinlogonTokenForInput;
             if (hDesk && hTok && !g_bInputOnWinlogon) {
                 if (ImpersonateLoggedOnUser(hTok)) {
+                    /* Enable SeTcbPrivilege on this thread's impersonation token */
+                    {
+                        HANDLE hThreadTok = NULL;
+                        if (OpenThreadToken(GetCurrentThread(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                                            FALSE, &hThreadTok)) {
+                            TOKEN_PRIVILEGES tp;
+                            tp.PrivilegeCount = 1;
+                            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                            if (LookupPrivilegeValueA(NULL, "SeTcbPrivilege", &tp.Privileges[0].Luid)) {
+                                AdjustTokenPrivileges(hThreadTok, FALSE, &tp, 0, NULL, NULL);
+                            }
+                            CloseHandle(hThreadTok);
+                        }
+                    }
                     if (SetThreadDesktop(hDesk)) {
                         g_bInputOnWinlogon = TRUE;
                         /* Force screen dimension refresh for new desktop */
@@ -450,11 +464,14 @@ static DWORD WINAPI InputThreadProc(LPVOID lpParam)
             }
         }
         
-        /* If Winlogon mode was requested but SetThreadDesktop failed,
-         * DON'T inject events here (they'd go to the wrong desktop).
-         * Leave them queued for the worker thread's Input_DrainQueueDirect()
-         * which runs from a thread confirmed to be on Winlogon desktop. */
-        if (g_bWinlogonInputDesired && !g_bInputOnWinlogon) {
+        /* When Winlogon mode is active, ALWAYS leave events in queue for the
+         * capture worker thread's Input_DrainQueueDirect(). The worker thread
+         * has a PROVEN security context (same context that does BitBlt) and its
+         * mouse_event/keybd_event calls are guaranteed to target the Winlogon
+         * desktop. The input thread's SetThreadDesktop may have "succeeded" but
+         * the desktop handle may lack DESKTOP_JOURNALPLAYBACK, causing
+         * mouse_event to silently fail. Don't risk it — let the worker do it. */
+        if (g_bWinlogonInputDesired) {
             continue;
         }
         
