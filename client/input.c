@@ -236,13 +236,40 @@ int Input_DrainQueueDirect(void)
     INPUT_EVENT evt;
     int count = 0;
     int screenW, screenH;
-    char logbuf[256];
+    char logbuf[512];
+    int queueDepth = 0;
+    POINT cursorBefore, cursorAfter;
+    
+    /* Log call with thread/desktop info for debugging */
+    {
+        HDESK hCurDesk = GetThreadDesktop(GetCurrentThreadId());
+        char deskName[128] = {0};
+        DWORD dwLen = 0;
+        GetUserObjectInformationA(hCurDesk, 2 /* UOI_NAME */, deskName, sizeof(deskName), &dwLen);
+        sprintf(logbuf, "[DRAIN] ENTER: threadDesktop=0x%p name='%s' threadId=%lu\r\n",
+                (void*)hCurDesk, deskName, GetCurrentThreadId());
+        InputLog(logbuf);
+    }
+    
+    /* Check queue depth before draining */
+    {
+        LONG head = g_inputQueueHead;
+        LONG tail = g_inputQueueTail;
+        queueDepth = (int)((head - tail + INPUT_QUEUE_SIZE) % INPUT_QUEUE_SIZE);
+        sprintf(logbuf, "[DRAIN] Queue: head=%ld tail=%ld depth=%d\r\n", head, tail, queueDepth);
+        InputLog(logbuf);
+    }
     
     /* Get screen dimensions for mouse coordinate conversion */
     screenW = GetSystemMetrics(SM_CXSCREEN);
     screenH = GetSystemMetrics(SM_CYSCREEN);
+    sprintf(logbuf, "[DRAIN] Screen metrics: %dx%d\r\n", screenW, screenH);
+    InputLog(logbuf);
     if (screenW <= 0) screenW = 1024;
     if (screenH <= 0) screenH = 768;
+    
+    /* Get cursor position before injection */
+    GetCursorPos(&cursorBefore);
     
     while (DequeueInputEvent(&evt)) {
         if (evt.type == INPUT_EVT_MOUSE) {
@@ -257,23 +284,35 @@ int Input_DrainQueueDirect(void)
                 if (y >= screenH) y = screenH - 1;
                 dx = (DWORD)((x * 65535) / (screenW - 1));
                 dy = (DWORD)((y * 65535) / (screenH - 1));
+                if (count < 3) {
+                    sprintf(logbuf, "[DRAIN] mouse_event MOVE abs x=%d y=%d dx=%lu dy=%lu\r\n", x, y, dx, dy);
+                    InputLog(logbuf);
+                }
                 mouse_event(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, dx, dy, 0, 0);
             }
             /* Button down */
             if (evt.mouse.flags & 0x02) {
-                if (evt.mouse.buttons & 0x01)
+                if (evt.mouse.buttons & 0x01) {
+                    InputLog("[DRAIN] mouse_event LEFTDOWN\r\n");
                     mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
-                if (evt.mouse.buttons & 0x02)
+                }
+                if (evt.mouse.buttons & 0x02) {
+                    InputLog("[DRAIN] mouse_event RIGHTDOWN\r\n");
                     mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0);
+                }
                 if (evt.mouse.buttons & 0x04)
                     mouse_event(MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, 0);
             }
             /* Button up */
             if (evt.mouse.flags & 0x04) {
-                if (evt.mouse.buttons & 0x01)
+                if (evt.mouse.buttons & 0x01) {
+                    InputLog("[DRAIN] mouse_event LEFTUP\r\n");
                     mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
-                if (evt.mouse.buttons & 0x02)
+                }
+                if (evt.mouse.buttons & 0x02) {
+                    InputLog("[DRAIN] mouse_event RIGHTUP\r\n");
                     mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
+                }
                 if (evt.mouse.buttons & 0x04)
                     mouse_event(MOUSEEVENTF_MIDDLEUP, 0, 0, 0, 0);
             }
@@ -293,19 +332,29 @@ int Input_DrainQueueDirect(void)
             if (extended) dwFlags |= KEYEVENTF_EXTENDEDKEY;
             
             if (down && !up) {
+                if (count < 3) {
+                    sprintf(logbuf, "[DRAIN] keybd_event DOWN vk=0x%02X scan=0x%02X\r\n", evt.key.vk, evt.key.scan);
+                    InputLog(logbuf);
+                }
                 keybd_event((BYTE)evt.key.vk, (BYTE)evt.key.scan, dwFlags, 0);
             }
             if (up) {
+                if (count < 3) {
+                    sprintf(logbuf, "[DRAIN] keybd_event UP vk=0x%02X scan=0x%02X\r\n", evt.key.vk, evt.key.scan);
+                    InputLog(logbuf);
+                }
                 keybd_event((BYTE)evt.key.vk, (BYTE)evt.key.scan, dwFlags | KEYEVENTF_KEYUP, 0);
             }
         }
         count++;
     }
     
-    if (count > 0) {
-        sprintf(logbuf, "Injected %d events on Winlogon desktop (worker thread)\r\n", count);
-        InputLog(logbuf);
-    }
+    /* Check cursor position after injection to verify mouse_event worked */
+    GetCursorPos(&cursorAfter);
+    sprintf(logbuf, "[DRAIN] EXIT: injected=%d cursor_before=(%ld,%ld) cursor_after=(%ld,%ld) moved=%s\r\n",
+            count, cursorBefore.x, cursorBefore.y, cursorAfter.x, cursorAfter.y,
+            (cursorBefore.x != cursorAfter.x || cursorBefore.y != cursorAfter.y) ? "YES" : "NO");
+    InputLog(logbuf);
     
     return count;
 }

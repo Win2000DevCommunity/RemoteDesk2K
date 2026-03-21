@@ -151,14 +151,25 @@ static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
             if (OpenThreadToken(GetCurrentThread(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
                                 FALSE, &hThreadTok)) {
                 TOKEN_PRIVILEGES tp;
+                DWORD dwTcbErr;
                 tp.PrivilegeCount = 1;
                 tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
                 if (LookupPrivilegeValueA(NULL, "SeTcbPrivilege", &tp.Privileges[0].Luid)) {
                     AdjustTokenPrivileges(hThreadTok, FALSE, &tp, 0, NULL, NULL);
+                    dwTcbErr = GetLastError();
+                    ScreenLog(dwTcbErr == ERROR_SUCCESS 
+                        ? "[WORKER] SeTcbPrivilege ENABLED on worker thread\r\n"
+                        : "[WORKER] SeTcbPrivilege NOT available on worker thread\r\n");
                 }
                 CloseHandle(hThreadTok);
+            } else {
+                char errbuf[128];
+                sprintf(errbuf, "[WORKER] OpenThreadToken failed: %lu\r\n", GetLastError());
+                ScreenLog(errbuf);
             }
         }
+    } else {
+        ScreenLog("[WORKER] WARNING: No impersonation token provided!\r\n");
     }
     
     /* THIS IS THE KEY: clean thread with NO windows can switch desktop */
@@ -167,6 +178,20 @@ static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
         sprintf(pParams->szError, "Worker: SetThreadDesktop failed: %lu", dwErr);
         if (pParams->hToken) RevertToSelf();
         return 1;
+    }
+    
+    /* Log desktop we're now on for debugging */
+    {
+        char deskName[128] = {0};
+        DWORD dwLen = 0;
+        HDESK hCurDesk = GetThreadDesktop(GetCurrentThreadId());
+        GetUserObjectInformationA(hCurDesk, 2 /* UOI_NAME */, deskName, sizeof(deskName), &dwLen);
+        ScreenLog("[WORKER] SetThreadDesktop SUCCESS\r\n");
+        {
+            char logb[256];
+            sprintf(logb, "[WORKER] Now on desktop: '%s' handle=0x%p\r\n", deskName, (void*)hCurDesk);
+            ScreenLog(logb);
+        }
     }
     
     /* NOW GetDC(NULL) returns the Winlogon desktop's DC! */
@@ -245,7 +270,13 @@ static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
      * desktop. The normal input thread's SetThreadDesktop approach doesn't work
      * (process-level security check), but THIS worker thread's context does work
      * (same context that just did BitBlt successfully). */
-    Input_DrainQueueDirect();
+    ScreenLog("[WORKER] About to call Input_DrainQueueDirect()...\r\n");
+    {
+        int nInjected = Input_DrainQueueDirect();
+        char drainLog[128];
+        sprintf(drainLog, "[WORKER] Input_DrainQueueDirect returned: %d events injected\r\n", nInjected);
+        ScreenLog(drainLog);
+    }
     
     /* Cleanup */
     SelectObject(hdcMemory, hBitmapOld);

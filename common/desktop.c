@@ -1269,6 +1269,24 @@ got_desktop:
     
     DebugLog("[SwitchToWinlogon] Got desktop handle, calling SetThreadDesktop...\r\n");
     
+    /* ---- Ensure impersonation token is available for worker threads ----
+     * On Win7, OpenInputDesktop may succeed at Attempt 2 (before impersonation),
+     * skipping Desktop_ImpersonateWinlogon(). But the worker thread that actually 
+     * captures the screen needs an impersonation token with SeTcbPrivilege to
+     * successfully call SetThreadDesktop on the Winlogon desktop. Without it,
+     * SetThreadDesktop "succeeds" but the thread stays on the Default desktop.
+     * Always ensure we have an impersonation token, regardless of which attempt
+     * obtained the desktop handle. */
+    if (!pDesktop->hImpersonationToken) {
+        DebugLog("[SwitchToWinlogon] No impersonation token yet - acquiring for worker thread...\r\n");
+        if (Desktop_ImpersonateWinlogon(pDesktop)) {
+            bNeedImpersonation = TRUE;
+            DebugLog("[SwitchToWinlogon] Impersonation token acquired for worker threads\r\n");
+        } else {
+            DebugLog("[SwitchToWinlogon] WARNING: Could not acquire impersonation token - worker thread may fail\r\n");
+        }
+    }
+    
     /* Try to switch thread to Winlogon desktop */
     if (!SetThreadDesktop(hWinlogonDesktop)) {
         dwErr = GetLastError();
