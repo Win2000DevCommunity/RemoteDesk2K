@@ -2482,12 +2482,6 @@ void SendScreenUpdate(void)
     int stride;
     char buf[256];
     
-    /* Re-entrancy guard: nested message pumping (below) may dispatch TIMER_SCREEN
-     * which calls SendScreenUpdate again. Prevent recursive capture/send. */
-    static BOOL g_bInSendScreenUpdate = FALSE;
-    if (g_bInSendScreenUpdate) return;
-    g_bInSendScreenUpdate = TRUE;
-    
     DebugLog("[SENDSCREENUPDATE] ============ ENTER ============\r\n");
     
     if (!g_pCapture || !g_pServerNet || !g_bClientConnected) {
@@ -2498,7 +2492,6 @@ void SendScreenUpdate(void)
         DebugLog(" g_bClientConnected=");
         DebugLog(g_bClientConnected ? "true" : "false");
         DebugLog("\r\n");
-        g_bInSendScreenUpdate = FALSE;
         return;
     }
     
@@ -2521,7 +2514,6 @@ void SendScreenUpdate(void)
     __try {
         if (ScreenCapture_CaptureScreen(g_pCapture) != RD2K_SUCCESS) {
             DebugLog("[SEND_SCREEN] ScreenCapture_CaptureScreen FAILED\r\n");
-            g_bInSendScreenUpdate = FALSE;
             return;
         }
     }
@@ -2550,24 +2542,6 @@ void SendScreenUpdate(void)
         BYTE *pTempBuffer;
         DWORD rectDataSize, compressedSize;
         int x, y, w, h, j;
-        
-        /* Pump pending WM_TIMER messages so TIMER_NETWORK can receive input events
-         * from the viewer while we're busy sending frame data. This prevents the
-         * 3+ second input starvation on the first Winlogon frame (where the entire
-         * screen is dirty and network send takes a long time). The re-entrancy guard
-         * above prevents TIMER_SCREEN from recursing into SendScreenUpdate. */
-        {
-            MSG msg;
-            while (PeekMessage(&msg, NULL, WM_TIMER, WM_TIMER, PM_REMOVE)) {
-                DispatchMessage(&msg);
-            }
-        }
-        
-        /* Check if connection was lost during message pump */
-        if (!g_bClientConnected || !g_pServerNet || !g_pCapture) {
-            DebugLog("[SEND_SCREEN] Connection lost during send, aborting\r\n");
-            break;
-        }
         
         sprintf(buf, "[SEND_SCREEN] Processing rectangle %d/%d\r\n", i+1, numRects);
         DebugLog(buf);
@@ -2653,36 +2627,26 @@ void SendScreenUpdate(void)
         DebugLog(buf);
     }
     
-    /* Stop the Winlogon drain thread now that all rects are sent.
-     * The drain thread was kept alive during the send loop to inject input
-     * events as they arrived via TIMER_NETWORK (pumped above). */
-    if (g_pCapture) {
-        ScreenCapture_StopDrainThread(g_pCapture);
-    }
-    
     DebugLog("[SEND_SCREEN] All rectangles sent, updating previous frame\r\n");
     
-    if (g_pCapture) {
-        sprintf(buf, "[SEND_SCREEN] About to memcpy pPrevFrame: dst=%p src=%p size=%d\r\n",
-                (void*)g_pCapture->pPrevFrame, (void*)g_pCapture->pPixelData, 
+    sprintf(buf, "[SEND_SCREEN] About to memcpy pPrevFrame: dst=%p src=%p size=%d\r\n",
+            (void*)g_pCapture->pPrevFrame, (void*)g_pCapture->pPixelData, 
+            g_pCapture->pixelDataSize);
+    DebugLog(buf);
+    
+    if (!g_pCapture->pPrevFrame || !g_pCapture->pPixelData) {
+        DebugLog("[SEND_SCREEN] ERROR: Null pointer before final memcpy!\r\n");
+    } else if (g_pCapture->pixelDataSize <= 0) {
+        sprintf(buf, "[SEND_SCREEN] ERROR: Invalid size %d before final memcpy!\r\n", 
                 g_pCapture->pixelDataSize);
         DebugLog(buf);
-        
-        if (!g_pCapture->pPrevFrame || !g_pCapture->pPixelData) {
-            DebugLog("[SEND_SCREEN] ERROR: Null pointer before final memcpy!\r\n");
-        } else if (g_pCapture->pixelDataSize <= 0) {
-            sprintf(buf, "[SEND_SCREEN] ERROR: Invalid size %d before final memcpy!\r\n", 
-                    g_pCapture->pixelDataSize);
-            DebugLog(buf);
-        } else {
-            DebugLog("[SEND_SCREEN] Performing big memcpy...\r\n");
-            memcpy(g_pCapture->pPrevFrame, g_pCapture->pPixelData, g_pCapture->pixelDataSize);
-            DebugLog("[SEND_SCREEN] Big memcpy COMPLETE!\r\n");
-        }
+    } else {
+        DebugLog("[SEND_SCREEN] Performing big memcpy...\r\n");
+        memcpy(g_pCapture->pPrevFrame, g_pCapture->pPixelData, g_pCapture->pixelDataSize);
+        DebugLog("[SEND_SCREEN] Big memcpy COMPLETE!\r\n");
     }
     
     DebugLog("[SENDSCREENUPDATE] ============ EXIT ============\r\n");
-    g_bInSendScreenUpdate = FALSE;
 }
 
 /* Handle mouse event from client - uses modular input system */

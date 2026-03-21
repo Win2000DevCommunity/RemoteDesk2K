@@ -119,8 +119,6 @@ typedef struct _WINLOGON_CAPTURE_PARAMS {
     DWORD   pixelDataSize;  /* Size of pixel buffer */
     int     result;         /* Output: 0=success, -1=failure */
     char    szError[256];   /* Output: error description */
-    HANDLE  hCaptureComplete;  /* Signaled when capture (BitBlt+copy) is done */
-    HANDLE  hStopDrainEvent;   /* Signals worker to exit drain loop */
 } WINLOGON_CAPTURE_PARAMS;
 
 static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
@@ -280,74 +278,30 @@ static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
         ScreenLog(drainLog);
     }
     
-    /* Cleanup GDI resources (done with capture, but stay on desktop for input) */
+    /* Cleanup */
     SelectObject(hdcMemory, hBitmapOld);
     DeleteObject(hBitmap);
     DeleteDC(hdcMemory);
     ReleaseDC(NULL, hdcScreen);
     
+    if (pParams->hToken) RevertToSelf();
+    
     pParams->result = 0;  /* SUCCESS */
-    
-    /* Save locals before signaling - after SetEvent, pParams (stack-allocated
-     * in caller) may be freed. DO NOT access pParams after SetEvent. */
-    {
-        HANDLE hStopDrain = pParams->hStopDrainEvent;
-        BOOL bHasToken = (pParams->hToken != NULL);
-        
-        /* Signal main thread that capture is complete - pixels are ready */
-        SetEvent(pParams->hCaptureComplete);
-        /* === pParams is now INVALID - do not dereference === */
-        
-        /* Keep draining input queue while main thread sends frame data.
-         * This thread is still on the Winlogon desktop with SeTcbPrivilege,
-         * so mouse_event/keybd_event will target the correct desktop.
-         * The main thread's message pump feeds TIMER_NETWORK between rect
-         * sends, which receives input events and queues them. We drain
-         * those events here for immediate injection. */
-        if (hStopDrain) {
-            while (WaitForSingleObject(hStopDrain, 15) != WAIT_OBJECT_0) {
-                Input_DrainQueueDirect();
-            }
-            /* Final drain after stop signal */
-            Input_DrainQueueDirect();
-        }
-        
-        if (bHasToken) RevertToSelf();
-    }
-    
     return 0;
 }
 
 /* Capture the Winlogon desktop using a worker thread.
- * Returns 0 on success, -1 on failure.
- * The worker thread stays alive in a drain loop after capture, injecting
- * input events while the main thread sends frame data. Call
- * ScreenCapture_StopDrainThread() after the network send completes. */
+ * Returns 0 on success, -1 on failure. */
 static int ScreenCapture_CaptureWinlogonWorker(PSCREEN_CAPTURE pCapture)
 {
     WINLOGON_CAPTURE_PARAMS params;
     HANDLE hThread;
-    HANDLE hCaptureComplete;
-    HANDLE hStopDrain;
     DWORD dwWait;
     char logbuf[512];
     
     if (!pCapture || !pCapture->pDesktopContext || 
         !pCapture->pDesktopContext->hWinlogonDesktop) {
         ScreenLog("[CAPTURE] Worker: No Winlogon desktop handle\r\n");
-        return -1;
-    }
-    
-    /* Stop any previous drain thread before starting a new one */
-    ScreenCapture_StopDrainThread(pCapture);
-    
-    /* Create synchronization events */
-    hCaptureComplete = CreateEventA(NULL, TRUE, FALSE, NULL);  /* Manual-reset */
-    hStopDrain = CreateEventA(NULL, TRUE, FALSE, NULL);        /* Manual-reset */
-    if (!hCaptureComplete || !hStopDrain) {
-        if (hCaptureComplete) CloseHandle(hCaptureComplete);
-        if (hStopDrain) CloseHandle(hStopDrain);
-        ScreenLog("[CAPTURE] Worker: CreateEvent failed\r\n");
         return -1;
     }
     
@@ -360,78 +314,33 @@ static int ScreenCapture_CaptureWinlogonWorker(PSCREEN_CAPTURE pCapture)
     params.pPixelData = pCapture->pPixelData;
     params.pixelDataSize = pCapture->pixelDataSize;
     params.result = -1;
-    params.hCaptureComplete = hCaptureComplete;
-    params.hStopDrainEvent = hStopDrain;
     
     hThread = CreateThread(NULL, 0, WinlogonCaptureThread, &params, 0, NULL);
     if (!hThread) {
         sprintf(logbuf, "[CAPTURE] Worker: CreateThread failed: %lu\r\n", GetLastError());
         ScreenLog(logbuf);
-        CloseHandle(hCaptureComplete);
-        CloseHandle(hStopDrain);
         return -1;
     }
     
-    /* Wait for capture to complete OR thread to exit (whichever first).
-     * If capture succeeds, hCaptureComplete fires and thread stays alive for drain.
-     * If capture fails, thread exits (hThread signaled) without firing hCaptureComplete. */
-    {
-        HANDLE waitHandles[2];
-        waitHandles[0] = hCaptureComplete;
-        waitHandles[1] = hThread;
-        dwWait = WaitForMultipleObjects(2, waitHandles, FALSE, 5000);
-    }
-    CloseHandle(hCaptureComplete);
-    
-    if (dwWait == WAIT_TIMEOUT) {
-        ScreenLog("[CAPTURE] Worker: Capture timed out\r\n");
-        SetEvent(hStopDrain);
-        WaitForSingleObject(hThread, 1000);
+    /* Wait up to 5 seconds for capture to complete */
+    dwWait = WaitForSingleObject(hThread, 5000);
+    if (dwWait != WAIT_OBJECT_0) {
+        ScreenLog("[CAPTURE] Worker: Thread timed out\r\n");
         TerminateThread(hThread, 1);
         CloseHandle(hThread);
-        CloseHandle(hStopDrain);
         return -1;
     }
     
-    /* dwWait == WAIT_OBJECT_0 (capture complete) or WAIT_OBJECT_0+1 (thread exited) */
+    CloseHandle(hThread);
+    
     if (params.result != 0) {
         sprintf(logbuf, "[CAPTURE] Worker FAILED: %s\r\n", params.szError);
         ScreenLog(logbuf);
-        /* params are still valid here because capture-complete was signaled
-         * from within the error path before the drain loop. Stop the thread. */
-        SetEvent(hStopDrain);
-        WaitForSingleObject(hThread, 1000);
-        CloseHandle(hThread);
-        CloseHandle(hStopDrain);
         return -1;
     }
     
-    /* Capture succeeded. Thread is now in drain loop, injecting input events
-     * on the Winlogon desktop. Store handles so StopDrainThread can clean up. */
-    pCapture->hDrainThread = hThread;
-    pCapture->hDrainStopEvent = hStopDrain;
-    
-    ScreenLog("[CAPTURE] Worker: Winlogon desktop captured, drain thread active\r\n");
+    ScreenLog("[CAPTURE] Worker: Winlogon desktop captured successfully!\r\n");
     return 0;
-}
-
-/* Stop the Winlogon input drain thread if it's still running.
- * Safe to call even if no drain thread is active. */
-void ScreenCapture_StopDrainThread(PSCREEN_CAPTURE pCapture)
-{
-    if (!pCapture) return;
-    
-    if (pCapture->hDrainThread && pCapture->hDrainStopEvent) {
-        SetEvent(pCapture->hDrainStopEvent);
-        if (WaitForSingleObject(pCapture->hDrainThread, 2000) != WAIT_OBJECT_0) {
-            ScreenLog("[CAPTURE] Drain thread did not exit in time, terminating\r\n");
-            TerminateThread(pCapture->hDrainThread, 1);
-        }
-        CloseHandle(pCapture->hDrainThread);
-        CloseHandle(pCapture->hDrainStopEvent);
-        pCapture->hDrainThread = NULL;
-        pCapture->hDrainStopEvent = NULL;
-    }
 }
 
 
@@ -670,10 +579,7 @@ void ScreenCapture_Destroy(PSCREEN_CAPTURE pCapture)
 {
     if (!pCapture) return;
     
-    /* Stop any active drain thread FIRST */
-    ScreenCapture_StopDrainThread(pCapture);
-    
-    /* Shutdown desktop context (restores home desktop) */
+    /* Shutdown desktop context FIRST (restores home desktop) */
     if (pCapture->pDesktopContext) {
         Desktop_Shutdown(pCapture->pDesktopContext);
         pCapture->pDesktopContext = NULL;
