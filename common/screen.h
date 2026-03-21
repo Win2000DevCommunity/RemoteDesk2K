@@ -33,6 +33,11 @@ typedef struct _SCREEN_CAPTURE {
     
     /* Desktop context for UAC/Winlogon detection and switching */
     PDESKTOP_CONTEXT pDesktopContext;  /* Desktop enumeration and switching */
+    
+    /* Winlogon input drain thread - kept alive during network send so
+     * input events can be injected while the main thread sends frame data */
+    HANDLE hDrainThread;       /* Worker thread kept alive for input draining */
+    HANDLE hDrainStopEvent;    /* Manual-reset event to signal drain loop exit */
 } SCREEN_CAPTURE, *PSCREEN_CAPTURE;
 
 /* Compilation flags for DirectDraw support */
@@ -44,6 +49,7 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture);
 void ScreenCapture_GetDimensions(int *pWidth, int *pHeight);
 int ScreenCapture_GetColorDepth(void);
 BOOL ScreenCapture_SyncDisplayMode(PSCREEN_CAPTURE pCapture);  /* Sync dimensions from DirectDraw */
+void ScreenCapture_StopDrainThread(PSCREEN_CAPTURE pCapture);  /* Stop Winlogon input drain thread */
 DWORD CompressRLE(const BYTE *pSrc, DWORD srcSize, BYTE *pDst, DWORD dstMaxSize);
 DWORD DecompressRLE(const BYTE *pSrc, DWORD srcSize, BYTE *pDst, DWORD dstMaxSize);
 int FindDirtyRects(const BYTE *pOldFrame, const BYTE *pNewFrame, 
