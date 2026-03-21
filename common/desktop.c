@@ -291,6 +291,124 @@ DWORD Desktop_FindWinlogonPID(void)
     return dwWinlogonPID;
 }
 
+/* ============================================================================
+ * Desktop_AcquireWorkerToken - Lightweight token acquisition for worker threads.
+ * 
+ * This ONLY acquires and stores a SYSTEM impersonation token in pDesktop->
+ * hImpersonationToken. It does NOT impersonate the calling thread.
+ * 
+ * This is safe to call from the main GUI thread because it doesn't change
+ * the thread's security context (no ImpersonateLoggedOnUser). The worker
+ * thread will call ImpersonateLoggedOnUser(hToken) itself.
+ * 
+ * Used when early OpenDesktop/OpenInputDesktop attempts succeed without
+ * needing impersonation, but the worker thread still needs a token.
+ * ============================================================================ */
+static BOOL Desktop_AcquireWorkerToken(PDESKTOP_CONTEXT pDesktop)
+{
+    DWORD dwWinlogonPID;
+    HANDLE hProcess = NULL;
+    HANDLE hToken = NULL;
+    HANDLE hDupToken = NULL;
+    char buf[512];
+    HMODULE hNtdll = NULL;
+    PFN_NtOpenProcessToken pfnNtOpenProcessToken = NULL;
+    BOOL bGotToken = FALSE;
+    
+    if (!pDesktop) return FALSE;
+    if (pDesktop->hImpersonationToken) return TRUE;  /* Already have one */
+    
+    DebugLog("[AcquireToken] Getting SYSTEM token for worker threads (no impersonation)...\r\n");
+    
+    /* Enable SeDebugPrivilege first */
+    Desktop_EnableDebugPrivilege();
+    
+    dwWinlogonPID = Desktop_FindWinlogonPID();
+    if (dwWinlogonPID == 0) {
+        DebugLog("[AcquireToken] Cannot find winlogon.exe\r\n");
+        return FALSE;
+    }
+    
+    hNtdll = GetModuleHandleA("ntdll.dll");
+    
+    /* Try Win32 OpenProcessToken first */
+    hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, dwWinlogonPID);
+    if (hProcess) {
+        if (OpenProcessToken(hProcess, TOKEN_DUPLICATE | TOKEN_QUERY, &hToken)) {
+            DebugLog("[AcquireToken] OpenProcessToken succeeded (Win32 fast path)\r\n");
+            bGotToken = TRUE;
+        }
+        CloseHandle(hProcess);
+        hProcess = NULL;
+    }
+    
+    /* Try NtOpenProcessToken if Win32 failed (W2K/XP) */
+    if (!bGotToken && hNtdll) {
+        pfnNtOpenProcessToken = (PFN_NtOpenProcessToken)GetProcAddress(hNtdll, "NtOpenProcessToken");
+        if (pfnNtOpenProcessToken) {
+            DWORD dwAccessMasks[] = { TOKEN_DUPLICATE | TOKEN_QUERY, MAXIMUM_ALLOWED };
+            int m;
+            hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, dwWinlogonPID);
+            if (!hProcess) hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, dwWinlogonPID);
+            if (hProcess) {
+                for (m = 0; m < 2 && !bGotToken; m++) {
+                    NTSTATUS ntStatus = pfnNtOpenProcessToken(hProcess, dwAccessMasks[m], &hToken);
+                    if (ntStatus >= 0) {
+                        DebugLog("[AcquireToken] NtOpenProcessToken succeeded\r\n");
+                        bGotToken = TRUE;
+                    }
+                }
+                CloseHandle(hProcess);
+                hProcess = NULL;
+            }
+        }
+    }
+    
+    if (!bGotToken) {
+        DebugLog("[AcquireToken] Could not get winlogon token\r\n");
+        return FALSE;
+    }
+    
+    /* Duplicate as impersonation token */
+    if (!DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, NULL,
+                          SecurityImpersonation, TokenImpersonation, &hDupToken)) {
+        if (!DuplicateTokenEx(hToken, TOKEN_IMPERSONATE | TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ADJUST_PRIVILEGES,
+                              NULL, SecurityImpersonation, TokenImpersonation, &hDupToken)) {
+            sprintf(buf, "[AcquireToken] DuplicateTokenEx failed: %lu\r\n", GetLastError());
+            DebugLog(buf);
+            CloseHandle(hToken);
+            return FALSE;
+        }
+    }
+    
+    /* Enable SeTcbPrivilege on the duplicated token (for worker threads) */
+    {
+        TOKEN_PRIVILEGES tp;
+        tp.PrivilegeCount = 1;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        if (LookupPrivilegeValueA(NULL, "SeTcbPrivilege", &tp.Privileges[0].Luid)) {
+            if (AdjustTokenPrivileges(hDupToken, FALSE, &tp, 0, NULL, NULL) && GetLastError() == ERROR_SUCCESS) {
+                DebugLog("[AcquireToken] SeTcbPrivilege ENABLED on worker token\r\n");
+            } else {
+                DebugLog("[AcquireToken] SeTcbPrivilege NOT available on worker token\r\n");
+            }
+        }
+        /* SeDebugPrivilege */
+        if (LookupPrivilegeValueA(NULL, "SeDebugPrivilege", &tp.Privileges[0].Luid)) {
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            AdjustTokenPrivileges(hDupToken, FALSE, &tp, 0, NULL, NULL);
+        }
+    }
+    
+    CloseHandle(hToken);
+    
+    /* Store token for worker threads - do NOT impersonate the calling thread */
+    pDesktop->hImpersonationToken = hDupToken;
+    DebugLog("[AcquireToken] Token stored for worker threads (main thread NOT impersonating)\r\n");
+    
+    return TRUE;
+}
+
 BOOL Desktop_ImpersonateWinlogon(PDESKTOP_CONTEXT pDesktop)
 {
     DWORD dwWinlogonPID;
@@ -1275,15 +1393,17 @@ got_desktop:
      * captures the screen needs an impersonation token with SeTcbPrivilege to
      * successfully call SetThreadDesktop on the Winlogon desktop. Without it,
      * SetThreadDesktop "succeeds" but the thread stays on the Default desktop.
-     * Always ensure we have an impersonation token, regardless of which attempt
-     * obtained the desktop handle. */
+     *
+     * CRITICAL: Use Desktop_AcquireWorkerToken (NOT Desktop_ImpersonateWinlogon)
+     * because the main GUI thread must NOT impersonate SYSTEM. Impersonating SYSTEM
+     * on the main thread changes its security context, breaking socket operations,
+     * window handles, and causing disconnects (especially on Win2K/XP). */
     if (!pDesktop->hImpersonationToken) {
         DebugLog("[SwitchToWinlogon] No impersonation token yet - acquiring for worker thread...\r\n");
-        if (Desktop_ImpersonateWinlogon(pDesktop)) {
-            bNeedImpersonation = TRUE;
-            DebugLog("[SwitchToWinlogon] Impersonation token acquired for worker threads\r\n");
+        if (Desktop_AcquireWorkerToken(pDesktop)) {
+            DebugLog("[SwitchToWinlogon] Worker token acquired safely (main thread NOT impersonating)\r\n");
         } else {
-            DebugLog("[SwitchToWinlogon] WARNING: Could not acquire impersonation token - worker thread may fail\r\n");
+            DebugLog("[SwitchToWinlogon] WARNING: Could not acquire worker token - worker thread may fail\r\n");
         }
     }
     
