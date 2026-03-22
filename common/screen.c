@@ -193,7 +193,11 @@ static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
      * and resets to baseline on success (self-tuning). */
     Sleep(pParams->nSleepMs);
     
-    /* Log desktop we're now on for debugging */
+    /* FIX (v6.4): VALIDATE desktop after SetThreadDesktop. On the second
+     * Winlogon entry (release only), SetThreadDesktop can return TRUE but
+     * the thread may still be associated with the Default desktop due to
+     * stale kernel-level desktop state from the previous session's handles.
+     * Detect this and return an error so the caller can re-acquire. */
     {
         char deskName[128] = {0};
         DWORD dwLen = 0;
@@ -204,6 +208,12 @@ static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
             char logb[256];
             sprintf(logb, "[WORKER] Now on desktop: '%s' handle=0x%p\r\n", deskName, (void*)hCurDesk);
             ScreenLog(logb);
+        }
+        /* VALIDATION: Ensure we're actually on the Winlogon desktop, not Default */
+        if (deskName[0] != '\0' && _stricmp(deskName, "Winlogon") != 0) {
+            sprintf(pParams->szError, "Worker: SetThreadDesktop OK but on '%s' not 'Winlogon'", deskName);
+            if (pParams->hToken) RevertToSelf();
+            return 1;
         }
     }
     
@@ -337,6 +347,11 @@ static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
 #define WORKER_SLEEP_MAX_MS  100
 #define WORKER_SLEEP_STEP_MS 20
 static int nWorkerSleepMs = WORKER_SLEEP_BASE_MS;
+
+/* DDraw consecutive failure counter - file scope so Winlogon exit can reset it.
+ * After 3 consecutive failures, DDraw recovery is skipped. Reset on Winlogon
+ * exit to give DDraw another chance with a fresh desktop context. */
+static int g_nDDrawConsecutiveFailures = 0;
 
 /* Capture the Winlogon desktop using a worker thread.
  * Returns 0 on success, -1 on failure. */
@@ -770,6 +785,12 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
                     }
                     /* Force DirectDraw re-init since old surfaces are invalid after desktop switch */
                     pCapture->bDDrawFailed = TRUE;
+                    /* FIX (v6.4): Reset DDraw consecutive failures on Winlogon exit.
+                     * After a desktop switch, DDraw surfaces are dead and recovery
+                     * fails. But after returning to normal, DDraw can re-initialize
+                     * from scratch. Without this reset, DDraw is permanently dead
+                     * after the first Winlogon session (counter stuck at 3). */
+                    g_nDDrawConsecutiveFailures = 0;
                     /* CRITICAL: Reset capture mode to initial state - it may have fallen
                      * to DISABLED during Winlogon. Without this reset, all future captures
                      * stay in DISABLED mode even after returning to normal desktop. */
@@ -792,10 +813,9 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
      * Counter resets on DDraw success or explicit resolution change. */
     #define DDRAW_MAX_CONSECUTIVE_FAILURES 3
     {
-        static int nDDrawConsecutiveFailures = 0;
         
         if (!bForceGDI && pCapture->bUseDDraw && pCapture->pDDrawContext && pCapture->bDDrawFailed) {
-            if (nDDrawConsecutiveFailures >= DDRAW_MAX_CONSECUTIVE_FAILURES) {
+            if (g_nDDrawConsecutiveFailures >= DDRAW_MAX_CONSECUTIVE_FAILURES) {
                 /* DDraw has failed too many times in a row — skip it entirely */
             } else {
                 DDRAW_STATUS recoverStatus = DDraw_ValidateAndRecover((DDRAW_CONTEXT *)pCapture->pDDrawContext);
@@ -823,11 +843,11 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
             if (ddStatus == DDRAW_STATUS_SUCCESS) {
                 sprintf(buf, "[CAPTURE] DirectDraw GPU capture SUCCESS - %lu bytes\r\n", dwBytesWritten);
                 ScreenLog(buf);
-                nDDrawConsecutiveFailures = 0;  /* Reset on success */
+                g_nDDrawConsecutiveFailures = 0;  /* Reset on success */
                 return RD2K_SUCCESS;
             } else {
-                nDDrawConsecutiveFailures++;
-                sprintf(buf, "[CAPTURE] DirectDraw capture failed (0x%08lx), consecutive failures: %d\r\n", ddStatus, nDDrawConsecutiveFailures);
+                g_nDDrawConsecutiveFailures++;
+                sprintf(buf, "[CAPTURE] DirectDraw capture failed (0x%08lx), consecutive failures: %d\r\n", ddStatus, g_nDDrawConsecutiveFailures);
                 ScreenLog(buf);
                 pCapture->bDDrawFailed = TRUE;
                 /* NOTE: Don't cascade Desktop_TryNextCaptureMode here.
@@ -874,13 +894,33 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
         if (nWorkerConsecutiveFailures >= 2) {
             DESKTOP_STATE eRecheck = Desktop_DetectState(pCapture->pDesktopContext);
             if (eRecheck == DESKTOP_STATE_WINLOGON) {
-                /* OS confirms still on Winlogon — failure is a timing issue.
-                 * Increase the adaptive sleep so the next worker attempt
-                 * gives more time for SetThreadDesktop to finalize. */
-                nWorkerSleepMs = nWorkerSleepMs + WORKER_SLEEP_STEP_MS;
-                if (nWorkerSleepMs > WORKER_SLEEP_MAX_MS)
-                    nWorkerSleepMs = WORKER_SLEEP_MAX_MS;
-                ScreenLog("[CAPTURE] Worker failed 2x but OS still on Winlogon - increasing sleep, will retry\r\n");
+                if (nWorkerSleepMs >= WORKER_SLEEP_MAX_MS) {
+                    /* FIX (v6.4): INTELLIGENT RECURSIVE RE-ACQUISITION.
+                     * Sleep is already at max and worker still fails. The
+                     * desktop handle or token is stale (common on second
+                     * Winlogon entry in release mode). Tear down the
+                     * entire Winlogon state and let the NEXT frame do a
+                     * fresh SwitchToWinlogon from scratch. This is the
+                     * "recursive" fix — rebuild the capture stack. */
+                    ScreenLog("[CAPTURE] Worker failed at max sleep - forcing re-acquisition\r\n");
+                    Input_ClearWinlogonDesktop();
+                    Desktop_RestoreHome(pCapture->pDesktopContext);
+                    pCapture->pDesktopContext->bOnWinlogonDesktop = FALSE;
+                    if (pCapture->pDesktopContext->hWinlogonDesktop) {
+                        CloseDesktop(pCapture->pDesktopContext->hWinlogonDesktop);
+                        pCapture->pDesktopContext->hWinlogonDesktop = NULL;
+                    }
+                    nWorkerSleepMs = WORKER_SLEEP_BASE_MS;
+                    dwLastWinlogonTime = GetTickCount();
+                } else {
+                    /* OS confirms still on Winlogon — failure is a timing issue.
+                     * Increase the adaptive sleep so the next worker attempt
+                     * gives more time for SetThreadDesktop to finalize. */
+                    nWorkerSleepMs = nWorkerSleepMs + WORKER_SLEEP_STEP_MS;
+                    if (nWorkerSleepMs > WORKER_SLEEP_MAX_MS)
+                        nWorkerSleepMs = WORKER_SLEEP_MAX_MS;
+                    ScreenLog("[CAPTURE] Worker failed 2x but OS still on Winlogon - increasing sleep\r\n");
+                }
             } else {
                 /* OS left Winlogon — clear debounce for immediate exit */
                 ScreenLog("[CAPTURE] Worker failed 2x and OS left Winlogon - clearing debounce\r\n");
