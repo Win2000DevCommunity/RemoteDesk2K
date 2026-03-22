@@ -2548,12 +2548,22 @@ void SendScreenUpdate(void)
     /* When most of the screen is dirty (e.g., first Winlogon frame), sending
      * 1800 individual 32x32 tiles is catastrophically slow: each requires
      * malloc/compress/send overhead, and flooding the TCP buffer causes
-     * send() to block for minutes. Collapse into a few full-width bands. */
+     * send() to block for minutes. Collapse into full-width bands.
+     * Band height is capped so raw data stays under 450KB — the relay
+     * server's RELAY_BUFFER_SIZE is 512KB and rejects larger packets. */
     if (numRects > 100) {
-        int bandHeight = g_pCapture->height / 8;
+        int maxBandBytes = 450 * 1024;  /* Stay well under 512KB relay limit */
+        int rowBytes = g_pCapture->width * bytesPerPixel;
+        int bandHeight;
         int bandY, bh;
-        if (bandHeight < 1) bandHeight = g_pCapture->height;
-        sprintf(buf, "[SEND_SCREEN] Too many rects (%d), collapsing to bands\r\n", numRects);
+        if (rowBytes > 0) {
+            bandHeight = maxBandBytes / rowBytes;
+        } else {
+            bandHeight = 32;
+        }
+        if (bandHeight < 1) bandHeight = 1;
+        if (bandHeight > g_pCapture->height) bandHeight = g_pCapture->height;
+        sprintf(buf, "[SEND_SCREEN] Too many rects (%d), collapsing to bands of %d rows\r\n", numRects, bandHeight);
         DebugLog(buf);
         numRects = 0;
         for (bandY = 0; bandY < g_pCapture->height; bandY += bandHeight) {
