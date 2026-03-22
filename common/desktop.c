@@ -1400,6 +1400,26 @@ got_desktop:
     
     DebugLog("[SwitchToWinlogon] Got desktop handle, calling SetThreadDesktop...\r\n");
     
+    /* CRITICAL FIX (v6.2): If we impersonated SYSTEM for attempts 3-6,
+     * REVERT the impersonation NOW. The main GUI thread must NOT remain
+     * impersonating SYSTEM — it breaks socket operations, window handles,
+     * and causes crashes/disconnects. Keep the token handle so the worker
+     * thread can still use it via ImpersonateLoggedOnUser(hToken). */
+    if (bNeedImpersonation && pDesktop->bImpersonating) {
+        RevertToSelf();
+        pDesktop->bImpersonating = FALSE;
+        DebugLog("[SwitchToWinlogon] Reverted main thread impersonation (token kept for worker)\r\n");
+    }
+    
+    /* CRITICAL FIX (v6.2): If we switched the process window station in
+     * attempt 4, restore it NOW. The main thread's GUI windows depend on
+     * the original station. The worker thread uses SetThreadDesktop (not
+     * SetProcessWindowStation) so this won't affect it. */
+    if (bSwitchedWinSta && hOldWinSta) {
+        SetProcessWindowStation(hOldWinSta);
+        DebugLog("[SwitchToWinlogon] Restored process window station for GUI safety\r\n");
+    }
+    
     /* ---- Ensure impersonation token is available for worker threads ----
      * On Win7, OpenInputDesktop may succeed at Attempt 2 (before impersonation),
      * skipping Desktop_ImpersonateWinlogon(). But the worker thread that actually 
@@ -1433,10 +1453,10 @@ got_desktop:
          * The worker thread capture path in screen.c will spawn a clean thread
          * that CAN call SetThreadDesktop successfully. */
         
-        /* Store handles - the desktop handle is still valid */
-        if (bSwitchedWinSta) {
-            pDesktop->hSavedWinSta = hOldWinSta;
-            pDesktop->hWinSta0 = hWinSta;
+        /* Store handles - the desktop handle is still valid.
+         * Window station was already restored above, so close hWinSta. */
+        if (bSwitchedWinSta && hWinSta) {
+            CloseWindowStation(hWinSta);
         }
         pDesktop->hWinlogonDesktop = hWinlogonDesktop;
         pDesktop->bOnWinlogonDesktop = TRUE;
@@ -1448,13 +1468,12 @@ got_desktop:
     
     DebugLog("[SwitchToWinlogon] SUCCESS - thread is now on Winlogon desktop\r\n");
     
-    /* Store window station handles for cleanup/restore */
-    if (bSwitchedWinSta) {
-        pDesktop->hSavedWinSta = hOldWinSta;
-        pDesktop->hWinSta0 = hWinSta;
+    /* Window station was already restored above, so close hWinSta. */
+    if (bSwitchedWinSta && hWinSta) {
+        CloseWindowStation(hWinSta);
     }
     
-    /* Store for later restoration. Keep impersonation active for capture! */
+    /* Store for later restoration. */
     pDesktop->hWinlogonDesktop = hWinlogonDesktop;
     pDesktop->bOnWinlogonDesktop = TRUE;
     pDesktop->dwDesktopSwitches++;

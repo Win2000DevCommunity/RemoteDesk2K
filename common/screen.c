@@ -135,6 +135,11 @@ static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
     pParams->result = -1;
     pParams->szError[0] = '\0';
     
+    /* FIX (v6.2): Wrap entire worker thread in SEH. An access violation in
+     * this thread (bad DC, invalid desktop handle, etc.) would terminate the
+     * entire process. With SEH, we catch the fault and return an error. */
+    __try {
+    
     /* Impersonate if we have a token (needed for desktop access) */
     if (pParams->hToken) {
         if (!ImpersonateLoggedOnUser(pParams->hToken)) {
@@ -312,7 +317,17 @@ static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
     if (pParams->hToken) RevertToSelf();
     
     pParams->result = 0;  /* SUCCESS */
-    return 0;
+    
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        /* Caught an access violation or other fault in the worker thread.
+         * Without this handler, the exception would terminate the process. */
+        sprintf(pParams->szError, "Worker: SEH exception 0x%08lX", GetExceptionCode());
+        pParams->result = -1;
+        /* Best-effort cleanup */
+        if (pParams->hToken) RevertToSelf();
+    }
+    
+    return (pParams->result == 0) ? 0 : 1;
 }
 
 /* Capture the Winlogon desktop using a worker thread.
