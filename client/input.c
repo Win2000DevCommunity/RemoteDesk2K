@@ -92,6 +92,7 @@ static volatile LONG    g_bInputSwitchToWinlogon = 0;   /* 1 = switch pending */
 static volatile LONG    g_bInputSwitchToDefault = 0;    /* 1 = restore pending */
 static BOOL             g_bInputOnWinlogon = FALSE;     /* current state */
 static volatile BOOL    g_bWinlogonInputDesired = FALSE; /* TRUE = Winlogon mode requested */
+static volatile LONG    g_bInputBusy = 0; /* 1 = DrainQueueDirect is executing */
 
 /* Input debug logging - writes to same log as screen/desktop */
 #include <stdio.h>
@@ -158,9 +159,6 @@ void Input_Shutdown(void)
 {
     if (!g_bInputInitialized) return;
     
-    /* NOTE: UAC/desktop support shutdown no longer needed */
-    /* UacDesktop_Shutdown(); */
-    
     /* Clear Winlogon desktop state (input thread will revert on exit) */
     g_hWinlogonDesktopForInput = NULL;
     g_hWinlogonTokenForInput = NULL;
@@ -214,9 +212,17 @@ void Input_SetWinlogonDesktop(HDESK hDesktop, HANDLE hToken)
  */
 void Input_ClearWinlogonDesktop(void)
 {
+    int waitCount = 0;
     g_bWinlogonInputDesired = FALSE;
     InterlockedExchange((LONG*)&g_bInputSwitchToDefault, 1);
     InterlockedExchange((LONG*)&g_bInputSwitchToWinlogon, 0);
+    /* Wait for the input thread to finish any in-progress DrainQueueDirect.
+     * Without this, the caller may CloseDesktop() while the input thread
+     * is still using the handle → Access Violation. */
+    while (g_bInputBusy && waitCount < 50) {
+        Sleep(10);
+        waitCount++;
+    }
     g_hWinlogonDesktopForInput = (HDESK)NULL;
     g_hWinlogonTokenForInput = (HANDLE)NULL;
 }
@@ -239,6 +245,8 @@ int Input_DrainQueueDirect(void)
     char logbuf[512];
     int queueDepth = 0;
     POINT cursorBefore, cursorAfter;
+
+    InterlockedExchange((LONG*)&g_bInputBusy, 1);
     
     /* Log call with thread/desktop info for debugging */
     {
@@ -356,6 +364,7 @@ int Input_DrainQueueDirect(void)
             (cursorBefore.x != cursorAfter.x || cursorBefore.y != cursorAfter.y) ? "YES" : "NO");
     InputLog(logbuf);
     
+    InterlockedExchange((LONG*)&g_bInputBusy, 0);
     return count;
 }
 
@@ -522,7 +531,12 @@ static DWORD WINAPI InputThreadProc(LPVOID lpParam)
          * is blocked in SendScreenUpdate sending frame data. */
         if (g_bWinlogonInputDesired) {
             if (g_bInputOnWinlogon) {
-                Input_DrainQueueDirect();
+                __try {
+                    Input_DrainQueueDirect();
+                } __except(EXCEPTION_EXECUTE_HANDLER) {
+                    InterlockedExchange((LONG*)&g_bInputBusy, 0);
+                    InputLog("SEH: Exception in DrainQueueDirect on input thread\r\n");
+                }
             }
             continue;
         }
@@ -660,7 +674,6 @@ BOOL Input_IsModifierHeld(void)
 static void DoMouseMove(int x, int y)
 {
     DWORD dx, dy;
-    void *pDesktopCtx = NULL;  /* PDESKTOP_CONTEXT no longer available - using void* */
     
     GetScreenSize();
     

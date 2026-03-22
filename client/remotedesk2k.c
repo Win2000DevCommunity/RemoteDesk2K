@@ -2078,13 +2078,6 @@ void ProcessServerNetwork(void)
         
         int messageCount = 0;  /* C89: declare at block start */
         
-        /* Disable verbose logging for performance - enable DEBUG_NETWORK_VERBOSE only if needed */
-        /* #define DEBUG_NETWORK_VERBOSE to enable */
-        #ifdef DEBUG_NETWORK_VERBOSE
-        sprintf(dbgBuf, "[PSN] Checking relay socket for incoming data (g_bClientConnected=%d)\n", g_bClientConnected);
-        DebugLog(dbgBuf);
-        #endif
-        
         /* Loop to process all pending messages (e.g., PARTNER_CONNECTED then handshake).
          * Without loop, if both arrive together, we'd only process PARTNER_CONNECTED
          * and miss the handshake until next timer tick - causing auth timeout! */
@@ -2314,16 +2307,18 @@ void ProcessServerNetwork(void)
             sprintf(dbgBuf2, "[PSN] Packet loop iteration %d - calling Network_RecvPacket\r\n", loopCount);
             DebugLog(dbgBuf2);
             
-            if (loopCount > 500) {
+            if (loopCount > 50) {
                 sprintf(dbgBuf2, "[PSN] ERROR: Packet loop safety limit exceeded! Breaking to prevent hang.\r\n");
                 DebugLog(dbgBuf2);
                 break;
             }
             
-            /* CRITICAL: Add time limit - if loop takes >500ms, something is wrong on socket */
+            /* CRITICAL: Check time BEFORE entering blocking recv.
+             * The old 500ms limit was checked at loop top but recv itself
+             * could block for seconds in relay mode. 100ms keeps UI responsive. */
             loopElapsedMs = GetTickCount() - loopStartTick;
-            if (loopElapsedMs > 500) {  /* 500ms timeout */
-                sprintf(dbgBuf2, "[PSN] WARNING: Packet loop time exceeded %lu ms. Possible socket hang. Breaking.\r\n", loopElapsedMs);
+            if (loopElapsedMs > 100) {
+                sprintf(dbgBuf2, "[PSN] WARNING: Packet loop time exceeded %lu ms. Breaking.\r\n", loopElapsedMs);
                 DebugLog(dbgBuf2);
                 break;
             }
@@ -2476,43 +2471,33 @@ void ProcessServerNetwork(void)
 /* Send screen update */
 void SendScreenUpdate(void)
 {
-    RECT dirtyRects[2048];  /* Increased for full screen support */
+    RECT dirtyRects[2048];
     int numRects, i;
-    int bytesPerPixel;      /* Calculated from actual screen depth */
+    int bytesPerPixel;
     int stride;
     char buf[256];
     static BOOL bInSendScreenUpdate = FALSE;
+    /* Reusable temp buffer to avoid malloc-per-rect overhead.
+     * Grows as needed and persists across calls. */
+    static BYTE *s_pTempBuffer = NULL;
+    static DWORD s_tempBufferSize = 0;
     
-    /* Re-entrancy guard: ProcessServerNetwork() below may handle
-     * MSG_FULL_SCREEN_REQ which calls SendScreenUpdate(). */
     if (bInSendScreenUpdate) return;
     
     DebugLog("[SENDSCREENUPDATE] ============ ENTER ============\r\n");
     
     if (!g_pCapture || !g_pServerNet || !g_bClientConnected) {
-        DebugLog("[SENDSCREENUPDATE] Early exit - checking: g_pCapture=");
-        DebugLog(g_pCapture ? "OK" : "NULL");
-        DebugLog(" g_pServerNet=");
-        DebugLog(g_pServerNet ? "OK" : "NULL");
-        DebugLog(" g_bClientConnected=");
-        DebugLog(g_bClientConnected ? "true" : "false");
-        DebugLog("\r\n");
         return;
     }
     
     bInSendScreenUpdate = TRUE;
     
-    /* Calculate bytesPerPixel from actual screen depth instead of hardcoding! */
     bytesPerPixel = g_pCapture->bitsPerPixel / 8;
-    if (bytesPerPixel <= 0) bytesPerPixel = 3;  /* Safety default */
+    if (bytesPerPixel <= 0) bytesPerPixel = 3;
     
     sprintf(buf, "[SENDSCREENUPDATE] Using actual color depth: %d BPP = %d bytes/pixel\r\n",
             g_pCapture->bitsPerPixel, bytesPerPixel);
     DebugLog(buf);
-    
-    /* CRITICAL: DirectDraw and GDI capture provide reliable frame acquisition
-     * even on UAC-protected and secure desktops. Single-session architecture
-     * is stable and reliable for current requirements. */
     
     /* THREAD-SAFE CAPTURE: Protect g_pCapture with critical section
      * The IPC handler thread will call SafeReadCaptureState() to read this data
@@ -2533,11 +2518,6 @@ void SendScreenUpdate(void)
     
     stride = ((g_pCapture->width * bytesPerPixel + 3) & ~3);
     
-    sprintf(buf, "[SEND_SCREEN] About to call FindDirtyRects: pPrevFrame=%p pPixelData=%p w=%d h=%d\r\n",
-            (void*)g_pCapture->pPrevFrame, (void*)g_pCapture->pPixelData, 
-            g_pCapture->width, g_pCapture->height);
-    DebugLog(buf);
-    
     numRects = FindDirtyRects(g_pCapture->pPrevFrame, g_pCapture->pPixelData,
                               g_pCapture->width, g_pCapture->height, bytesPerPixel,
                               dirtyRects, 2048);
@@ -2547,12 +2527,10 @@ void SendScreenUpdate(void)
     
     /* When most of the screen is dirty (e.g., first Winlogon frame), sending
      * 1800 individual 32x32 tiles is catastrophically slow: each requires
-     * malloc/compress/send overhead, and flooding the TCP buffer causes
-     * send() to block for minutes. Collapse into full-width bands.
-     * Band height is capped so raw data stays under 450KB — the relay
-     * server's RELAY_BUFFER_SIZE is 512KB and rejects larger packets. */
+     * compress/send overhead, and flooding the TCP buffer causes send() to
+     * block. Collapse into full-width bands under 450KB relay limit. */
     if (numRects > 100) {
-        int maxBandBytes = 450 * 1024;  /* Stay well under 512KB relay limit */
+        int maxBandBytes = 450 * 1024;
         int rowBytes = g_pCapture->width * bytesPerPixel;
         int bandHeight;
         int bandY, bh;
@@ -2563,8 +2541,6 @@ void SendScreenUpdate(void)
         }
         if (bandHeight < 1) bandHeight = 1;
         if (bandHeight > g_pCapture->height) bandHeight = g_pCapture->height;
-        sprintf(buf, "[SEND_SCREEN] Too many rects (%d), collapsing to bands of %d rows\r\n", numRects, bandHeight);
-        DebugLog(buf);
         numRects = 0;
         for (bandY = 0; bandY < g_pCapture->height; bandY += bandHeight) {
             bh = g_pCapture->height - bandY;
@@ -2575,77 +2551,46 @@ void SendScreenUpdate(void)
             dirtyRects[numRects].bottom = bandY + bh;
             numRects++;
         }
-        sprintf(buf, "[SEND_SCREEN] Collapsed to %d bands\r\n", numRects);
-        DebugLog(buf);
-    }
-    
-    /* Receive any pending input events before the send loop.
-     * The main thread is about to be busy sending rects, so TIMER_NETWORK
-     * won't fire. Get events into the queue for the input thread. */
-    if (g_bClientConnected) {
-        ProcessServerNetwork();
-        if (!g_bClientConnected || !g_pServerNet || !g_pCapture) {
-            bInSendScreenUpdate = FALSE;
-            return;
-        }
     }
     
     for (i = 0; i < numRects; i++) {
         RD2K_RECT rectHeader;
-        BYTE *pTempBuffer;
         DWORD rectDataSize, compressedSize;
         int x, y, w, h, j;
         
-        /* Every 5 rects, receive pending input events from the viewer.
-         * During Winlogon capture the main thread is blocked here, so
-         * TIMER_NETWORK cannot fire. Direct call is fast (select + recv
-         * only if data is available) with no message pump overhead. */
-        if (i > 0 && (i % 5) == 0 && g_bClientConnected) {
+        /* Every 20 rects, drain pending input events to keep the queue moving.
+         * Reduced from every 5 rects — ProcessServerNetwork can block in relay
+         * mode, so fewer calls means less risk of stalling the send loop. */
+        if (i > 0 && (i % 20) == 0 && g_bClientConnected) {
             ProcessServerNetwork();
             if (!g_bClientConnected || !g_pServerNet) break;
         }
-        
-        sprintf(buf, "[SEND_SCREEN] Processing rectangle %d/%d\r\n", i+1, numRects);
-        DebugLog(buf);
         
         x = dirtyRects[i].left;
         y = dirtyRects[i].top;
         w = dirtyRects[i].right - dirtyRects[i].left;
         h = dirtyRects[i].bottom - dirtyRects[i].top;
         
-        sprintf(buf, "[SEND_SCREEN] Rect %d: pos=(%d,%d) size=%dx%d\r\n", i, x, y, w, h);
-        DebugLog(buf);
-        
         rectDataSize = w * h * bytesPerPixel;
         
-        sprintf(buf, "[SEND_SCREEN] Allocating temp buffer: %d bytes\r\n", rectDataSize);
-        DebugLog(buf);
-        
-        pTempBuffer = (BYTE*)malloc(rectDataSize);
-        if (!pTempBuffer) {
-            sprintf(buf, "[SEND_SCREEN] FAILED to allocate temp buffer for rect %d\r\n", i);
-            DebugLog(buf);
-            continue;
+        /* Reuse static temp buffer — avoids malloc+free per rect (was 50+
+         * allocations per frame when navigating Explorer, causing lag). */
+        if (rectDataSize > s_tempBufferSize) {
+            BYTE *pNew = (BYTE*)realloc(s_pTempBuffer, rectDataSize);
+            if (!pNew) continue;
+            s_pTempBuffer = pNew;
+            s_tempBufferSize = rectDataSize;
         }
         
-        sprintf(buf, "[SEND_SCREEN] Copying pixels from screen buffer\r\n");
-        DebugLog(buf);
-        
         for (j = 0; j < h; j++) {
-            memcpy(pTempBuffer + j * w * bytesPerPixel,
+            memcpy(s_pTempBuffer + j * w * bytesPerPixel,
                    g_pCapture->pPixelData + (y + j) * stride + x * bytesPerPixel,
                    w * bytesPerPixel);
         }
         
-        sprintf(buf, "[SEND_SCREEN] Starting RLE compression on %d bytes\r\n", rectDataSize);
-        DebugLog(buf);
-        
-        compressedSize = CompressRLE(pTempBuffer, rectDataSize,
+        compressedSize = CompressRLE(s_pTempBuffer, rectDataSize,
                                      g_pCapture->pCompressBuffer,
                                      g_pCapture->compressBufferSize);
-        
-        sprintf(buf, "[SEND_SCREEN] Compression complete: %d -> %d bytes\r\n", rectDataSize, compressedSize);
-        DebugLog(buf);
         
         rectHeader.x = (WORD)x;
         rectHeader.y = (WORD)y;
@@ -2655,62 +2600,17 @@ void SendScreenUpdate(void)
         rectHeader.reserved = 0;
         rectHeader.dataSize = compressedSize;
         
-        sprintf(buf, "[SEND_SCREEN] Creating packet header - offset check: total=%d hdr=%d\r\n",
-                (int)(sizeof(rectHeader) + compressedSize), (int)sizeof(rectHeader));
-        DebugLog(buf);
-        
-        sprintf(buf, "[SEND_SCREEN] Copying header to sendBuffer\r\n");
-        DebugLog(buf);
-        
         memcpy(g_pServerNet->sendBuffer, &rectHeader, sizeof(rectHeader));
-        
-        sprintf(buf, "[SEND_SCREEN] Copying compressed data to sendBuffer\r\n");
-        DebugLog(buf);
-        
         memcpy(g_pServerNet->sendBuffer + sizeof(rectHeader),
                g_pCapture->pCompressBuffer, compressedSize);
-        
-        sprintf(buf, "[SEND_SCREEN] About to send network packet: %d total bytes\r\n",
-                (int)(sizeof(rectHeader) + compressedSize));
-        DebugLog(buf);
         
         Network_SendPacket(g_pServerNet, MSG_SCREEN_UPDATE,
                           g_pServerNet->sendBuffer,
                           sizeof(rectHeader) + compressedSize);
-        
-        DebugLog("[SEND_SCREEN] Network packet sent successfully\r\n");
-        
-        sprintf(buf, "[SEND_SCREEN] Sent rect %d, freeing temp buffer\r\n", i);
-        DebugLog(buf);
-        
-        free(pTempBuffer);
-        
-        sprintf(buf, "[SEND_SCREEN] Freed temp buffer for rect %d\r\n", i);
-        DebugLog(buf);
     }
     
-    DebugLog("[SEND_SCREEN] All rectangles sent, updating previous frame\r\n");
-    
-    /* Receive any input events that arrived during the send */
-    if (g_bClientConnected && g_pServerNet) {
-        ProcessServerNetwork();
-    }
-    
-    sprintf(buf, "[SEND_SCREEN] About to memcpy pPrevFrame: dst=%p src=%p size=%d\r\n",
-            (void*)g_pCapture->pPrevFrame, (void*)g_pCapture->pPixelData, 
-            g_pCapture->pixelDataSize);
-    DebugLog(buf);
-    
-    if (!g_pCapture->pPrevFrame || !g_pCapture->pPixelData) {
-        DebugLog("[SEND_SCREEN] ERROR: Null pointer before final memcpy!\r\n");
-    } else if (g_pCapture->pixelDataSize <= 0) {
-        sprintf(buf, "[SEND_SCREEN] ERROR: Invalid size %d before final memcpy!\r\n", 
-                g_pCapture->pixelDataSize);
-        DebugLog(buf);
-    } else {
-        DebugLog("[SEND_SCREEN] Performing big memcpy...\r\n");
+    if (g_pCapture->pPrevFrame && g_pCapture->pPixelData && g_pCapture->pixelDataSize > 0) {
         memcpy(g_pCapture->pPrevFrame, g_pCapture->pPixelData, g_pCapture->pixelDataSize);
-        DebugLog("[SEND_SCREEN] Big memcpy COMPLETE!\r\n");
     }
     
     DebugLog("[SENDSCREENUPDATE] ============ EXIT ============\r\n");

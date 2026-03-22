@@ -91,6 +91,18 @@ static void ConfigureRelaySocket(SOCKET sock)
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char*)&opt, sizeof(opt));
     setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char*)&opt, sizeof(opt));
     
+    /* Set recv timeout to prevent indefinite blocking.
+     * Without this, if select says readable but recv blocks (TCP edge case),
+     * the main thread hangs forever. 2 seconds is long enough for legitimate
+     * data but short enough to not freeze the app or trigger relay UNPAIR. */
+    opt = 2000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&opt, sizeof(opt));
+    
+    /* Set send timeout to prevent send() from blocking forever
+     * when the relay connection becomes congested or drops. */
+    opt = 5000;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&opt, sizeof(opt));
+    
     /* Enable keep-alive */
     opt = 1;
     setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (const char*)&opt, sizeof(opt));
