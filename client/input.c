@@ -513,14 +513,17 @@ static DWORD WINAPI InputThreadProc(LPVOID lpParam)
             }
         }
         
-        /* When Winlogon mode is active, ALWAYS leave events in queue for the
-         * capture worker thread's Input_DrainQueueDirect(). The worker thread
-         * has a PROVEN security context (same context that does BitBlt) and its
-         * mouse_event/keybd_event calls are guaranteed to target the Winlogon
-         * desktop. The input thread's SetThreadDesktop may have "succeeded" but
-         * the desktop handle may lack DESKTOP_JOURNALPLAYBACK, causing
-         * mouse_event to silently fail. Don't risk it — let the worker do it. */
+        /* When Winlogon mode is active and the input thread has successfully
+         * switched to the Winlogon desktop, drain the queue here using the same
+         * proven code path the worker thread uses (Input_DrainQueueDirect).
+         * This thread is event-driven: SetEvent(g_hInputEvent) wakes it
+         * immediately when ProcessServerNetwork queues an input event, so
+         * injection happens with minimal latency even while the main thread
+         * is blocked in SendScreenUpdate sending frame data. */
         if (g_bWinlogonInputDesired) {
+            if (g_bInputOnWinlogon) {
+                Input_DrainQueueDirect();
+            }
             continue;
         }
         

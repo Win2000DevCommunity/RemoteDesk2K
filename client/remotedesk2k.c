@@ -2481,6 +2481,11 @@ void SendScreenUpdate(void)
     int bytesPerPixel;      /* Calculated from actual screen depth */
     int stride;
     char buf[256];
+    static BOOL bInSendScreenUpdate = FALSE;
+    
+    /* Re-entrancy guard: ProcessServerNetwork() below may handle
+     * MSG_FULL_SCREEN_REQ which calls SendScreenUpdate(). */
+    if (bInSendScreenUpdate) return;
     
     DebugLog("[SENDSCREENUPDATE] ============ ENTER ============\r\n");
     
@@ -2494,6 +2499,8 @@ void SendScreenUpdate(void)
         DebugLog("\r\n");
         return;
     }
+    
+    bInSendScreenUpdate = TRUE;
     
     /* Calculate bytesPerPixel from actual screen depth instead of hardcoding! */
     bytesPerPixel = g_pCapture->bitsPerPixel / 8;
@@ -2514,6 +2521,7 @@ void SendScreenUpdate(void)
     __try {
         if (ScreenCapture_CaptureScreen(g_pCapture) != RD2K_SUCCESS) {
             DebugLog("[SEND_SCREEN] ScreenCapture_CaptureScreen FAILED\r\n");
+            bInSendScreenUpdate = FALSE;
             return;
         }
     }
@@ -2542,6 +2550,15 @@ void SendScreenUpdate(void)
         BYTE *pTempBuffer;
         DWORD rectDataSize, compressedSize;
         int x, y, w, h, j;
+        
+        /* Every 10 rects, receive pending input events from the viewer.
+         * During Winlogon capture the main thread is blocked here, so
+         * TIMER_NETWORK cannot fire. Direct call is fast (select + recv
+         * only if data is available) with no message pump overhead. */
+        if ((i % 10) == 9 && g_bClientConnected) {
+            ProcessServerNetwork();
+            if (!g_bClientConnected || !g_pServerNet) break;
+        }
         
         sprintf(buf, "[SEND_SCREEN] Processing rectangle %d/%d\r\n", i+1, numRects);
         DebugLog(buf);
@@ -2647,6 +2664,7 @@ void SendScreenUpdate(void)
     }
     
     DebugLog("[SENDSCREENUPDATE] ============ EXIT ============\r\n");
+    bInSendScreenUpdate = FALSE;
 }
 
 /* Handle mouse event from client - uses modular input system */

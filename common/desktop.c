@@ -1093,12 +1093,25 @@ BOOL Desktop_SwitchToWinlogon(PDESKTOP_CONTEXT pDesktop)
     /* ---- Attempt 2: Try OpenInputDesktop (opens whatever desktop has input focus) ---- */
     hWinlogonDesktop = OpenInputDesktop(0, FALSE, DESKTOP_INPUT_ACCESS);
     if (hWinlogonDesktop) {
-        DebugLog("[SwitchToWinlogon] OpenInputDesktop succeeded (full access)\r\n");
-        goto got_desktop;
+        /* Validate the returned desktop is actually "Winlogon".
+         * On Win7+, OpenInputDesktop may return the "Default" desktop
+         * due to session isolation, causing capture on the wrong desktop. */
+        char szCheckName[256];
+        szCheckName[0] = '\0';
+        GetDesktopName(hWinlogonDesktop, szCheckName, sizeof(szCheckName));
+        if (_stricmp(szCheckName, "Winlogon") == 0) {
+            DebugLog("[SwitchToWinlogon] OpenInputDesktop succeeded - confirmed 'Winlogon'\r\n");
+            goto got_desktop;
+        }
+        sprintf(buf, "[SwitchToWinlogon] OpenInputDesktop returned '%s' (not Winlogon) - rejecting\r\n", szCheckName);
+        DebugLog(buf);
+        CloseDesktop(hWinlogonDesktop);
+        hWinlogonDesktop = NULL;
+    } else {
+        dwErr = GetLastError();
+        sprintf(buf, "[SwitchToWinlogon] OpenInputDesktop failed (error %lu)\r\n", dwErr);
+        DebugLog(buf);
     }
-    dwErr = GetLastError();
-    sprintf(buf, "[SwitchToWinlogon] OpenInputDesktop failed (error %lu)\r\n", dwErr);
-    DebugLog(buf);
     
     /* ---- Impersonate SYSTEM with SeTcbPrivilege for remaining attempts ---- */
     if (!Desktop_ImpersonateWinlogon(pDesktop)) {
