@@ -117,6 +117,7 @@ typedef struct _WINLOGON_CAPTURE_PARAMS {
     int     bitsPerPixel;   /* Color depth */
     BYTE   *pPixelData;     /* Output: caller's pixel buffer */
     DWORD   pixelDataSize;  /* Size of pixel buffer */
+    int     nSleepMs;       /* Adaptive sleep after SetThreadDesktop (ms) */
     int     result;         /* Output: 0=success, -1=failure */
     char    szError[256];   /* Output: error description */
 } WINLOGON_CAPTURE_PARAMS;
@@ -185,10 +186,12 @@ static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
         return 1;
     }
     
-    /* FIX (v6.2): Brief pause after SetThreadDesktop to let OS finalize
+    /* FIX (v6.3): Adaptive pause after SetThreadDesktop to let OS finalize
      * desktop graphics context. In debug mode, ScreenLog file I/O provides
-     * implicit delay. In release mode, ScreenLog is a no-op. */
-    Sleep(10);
+     * implicit delay (~20ms). In release mode, ScreenLog is a no-op so we
+     * need an explicit sleep. The caller increases this on repeated failures
+     * and resets to baseline on success (self-tuning). */
+    Sleep(pParams->nSleepMs);
     
     /* Log desktop we're now on for debugging */
     {
@@ -328,6 +331,13 @@ static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
     return (pParams->result == 0) ? 0 : 1;
 }
 
+/* Adaptive worker sleep: starts at 30ms, grows on failure, resets on success.
+ * File-scope so both CaptureWinlogonWorker and CaptureScreen can access it. */
+#define WORKER_SLEEP_BASE_MS 30
+#define WORKER_SLEEP_MAX_MS  100
+#define WORKER_SLEEP_STEP_MS 20
+static int nWorkerSleepMs = WORKER_SLEEP_BASE_MS;
+
 /* Capture the Winlogon desktop using a worker thread.
  * Returns 0 on success, -1 on failure. */
 static int ScreenCapture_CaptureWinlogonWorker(PSCREEN_CAPTURE pCapture)
@@ -351,6 +361,7 @@ static int ScreenCapture_CaptureWinlogonWorker(PSCREEN_CAPTURE pCapture)
     params.bitsPerPixel = pCapture->bitsPerPixel;
     params.pPixelData = pCapture->pPixelData;
     params.pixelDataSize = pCapture->pixelDataSize;
+    params.nSleepMs = nWorkerSleepMs;
     params.result = -1;
     
     hThread = CreateThread(NULL, 0, WinlogonCaptureThread, &params, 0, NULL);
@@ -842,6 +853,7 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
         if (ScreenCapture_CaptureWinlogonWorker(pCapture) == 0) {
             ScreenLog("[CAPTURE] Worker thread Winlogon capture SUCCESS\r\n");
             nWorkerConsecutiveFailures = 0;
+            nWorkerSleepMs = WORKER_SLEEP_BASE_MS;  /* Reset adaptive sleep on success */
             return RD2K_SUCCESS;
         }
         
@@ -850,16 +862,37 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
          * WRONG desktop (Default instead of Winlogon). */
         nWorkerConsecutiveFailures++;
         
-        /* FIX (v6.3): If worker fails 2+ times in a row, the Winlogon desktop
-         * handle is stale (OS left Winlogon but debounce kept us retrying).
-         * Clear debounce so the NEXT frame exits Winlogon mode immediately
-         * instead of wasting 2+ seconds on doomed retries. */
+        /* FIX (v6.3): Intelligent adaptive retry. Instead of blindly clearing
+         * debounce after 2 failures (which caused release-mode regression —
+         * worker failed because Sleep was too short, then debounce got cleared,
+         * then Winlogon was abandoned even though the OS was still on it),
+         * we now RE-CHECK the actual desktop state before deciding what to do.
+         *
+         * - If OS is still on Winlogon: increase worker sleep (self-tuning)
+         *   and keep retrying. The failure was a timing issue, not stale handle.
+         * - If OS left Winlogon: clear debounce for fast exit. */
         if (nWorkerConsecutiveFailures >= 2) {
-            ScreenLog("[CAPTURE] Worker failed 2x - clearing debounce, will exit Winlogon next frame\r\n");
-            dwLastWinlogonTime = 0;
+            DESKTOP_STATE eRecheck = Desktop_DetectState(pCapture->pDesktopContext);
+            if (eRecheck == DESKTOP_STATE_WINLOGON) {
+                /* OS confirms still on Winlogon — failure is a timing issue.
+                 * Increase the adaptive sleep so the next worker attempt
+                 * gives more time for SetThreadDesktop to finalize. */
+                nWorkerSleepMs = nWorkerSleepMs + WORKER_SLEEP_STEP_MS;
+                if (nWorkerSleepMs > WORKER_SLEEP_MAX_MS)
+                    nWorkerSleepMs = WORKER_SLEEP_MAX_MS;
+                ScreenLog("[CAPTURE] Worker failed 2x but OS still on Winlogon - increasing sleep, will retry\r\n");
+            } else {
+                /* OS left Winlogon — clear debounce for immediate exit */
+                ScreenLog("[CAPTURE] Worker failed 2x and OS left Winlogon - clearing debounce\r\n");
+                dwLastWinlogonTime = 0;
+            }
             nWorkerConsecutiveFailures = 0;
         } else {
-            ScreenLog("[CAPTURE] Worker thread capture failed - will retry next frame\r\n");
+            /* First failure: increase sleep slightly for next attempt */
+            nWorkerSleepMs = nWorkerSleepMs + WORKER_SLEEP_STEP_MS;
+            if (nWorkerSleepMs > WORKER_SLEEP_MAX_MS)
+                nWorkerSleepMs = WORKER_SLEEP_MAX_MS;
+            ScreenLog("[CAPTURE] Worker thread capture failed - increasing sleep, will retry next frame\r\n");
         }
         return RD2K_ERR_SCREEN;
     }
