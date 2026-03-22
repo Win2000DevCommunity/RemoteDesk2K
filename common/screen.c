@@ -185,12 +185,10 @@ static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
         return 1;
     }
     
-    /* CRITICAL FIX (v6.2): In release mode, ScreenLog is a no-op so there's
-     * zero delay between SetThreadDesktop and GetDC/BitBlt. In debug mode,
-     * ScreenLog does fopen/fprintf/fclose (~5-25ms total) which gives the OS
-     * time to finalize the desktop graphics context. Without this delay,
-     * BitBlt fails with ERROR_INVALID_HANDLE (6) in release builds. */
-    Sleep(50);
+    /* FIX (v6.2): Brief pause after SetThreadDesktop to let OS finalize
+     * desktop graphics context. In debug mode, ScreenLog file I/O provides
+     * implicit delay. In release mode, ScreenLog is a no-op. */
+    Sleep(10);
     
     /* Log desktop we're now on for debugging */
     {
@@ -659,7 +657,8 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
      * Require NORMAL to persist for at least 2 seconds before actually switching back. */
     static DWORD dwLastWinlogonTime = 0;
     static int nConsecutiveNormal = 0;
-    #define WINLOGON_DEBOUNCE_MS 2000
+    static int nWorkerConsecutiveFailures = 0;
+    #define WINLOGON_DEBOUNCE_MS 500
     
     if (!pCapture) {
         ScreenLog("[CAPTURE] Invalid pCapture\r\n");
@@ -842,14 +841,26 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
         
         if (ScreenCapture_CaptureWinlogonWorker(pCapture) == 0) {
             ScreenLog("[CAPTURE] Worker thread Winlogon capture SUCCESS\r\n");
+            nWorkerConsecutiveFailures = 0;
             return RD2K_SUCCESS;
         }
         
         /* FIX (v6.2): Do NOT fall through to normal GDI when worker fails.
          * The main thread is on Default desktop, so GDI would capture the
-         * WRONG desktop (Default instead of Winlogon). Return error and let
-         * the next TIMER_SCREEN cycle retry. */
-        ScreenLog("[CAPTURE] Worker thread capture failed - returning error (will retry next frame)\r\n");
+         * WRONG desktop (Default instead of Winlogon). */
+        nWorkerConsecutiveFailures++;
+        
+        /* FIX (v6.3): If worker fails 2+ times in a row, the Winlogon desktop
+         * handle is stale (OS left Winlogon but debounce kept us retrying).
+         * Clear debounce so the NEXT frame exits Winlogon mode immediately
+         * instead of wasting 2+ seconds on doomed retries. */
+        if (nWorkerConsecutiveFailures >= 2) {
+            ScreenLog("[CAPTURE] Worker failed 2x - clearing debounce, will exit Winlogon next frame\r\n");
+            dwLastWinlogonTime = 0;
+            nWorkerConsecutiveFailures = 0;
+        } else {
+            ScreenLog("[CAPTURE] Worker thread capture failed - will retry next frame\r\n");
+        }
         return RD2K_ERR_SCREEN;
     }
     
