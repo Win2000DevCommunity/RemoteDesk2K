@@ -186,11 +186,11 @@ static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
         return 1;
     }
     
-    /* FIX (v6.3): Adaptive pause after SetThreadDesktop to let OS finalize
+    /* FIX (v6.5): Adaptive pause after SetThreadDesktop to let OS finalize
      * desktop graphics context. In debug mode, ScreenLog file I/O provides
-     * implicit delay (~20ms). In release mode, ScreenLog is a no-op so we
-     * need an explicit sleep. The caller increases this on repeated failures
-     * and resets to baseline on success (self-tuning). */
+     * implicit delay (~20ms). In release mode, ScreenLog is a no-op so the
+     * base sleep must be large enough on its own (100ms). The caller
+     * increases this on repeated failures and cools down on success. */
     Sleep(pParams->nSleepMs);
     
     /* FIX (v6.4): VALIDATE desktop after SetThreadDesktop. On the second
@@ -341,11 +341,14 @@ static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
     return (pParams->result == 0) ? 0 : 1;
 }
 
-/* Adaptive worker sleep: starts at 30ms, grows on failure, resets on success.
- * File-scope so both CaptureWinlogonWorker and CaptureScreen can access it. */
-#define WORKER_SLEEP_BASE_MS 30
-#define WORKER_SLEEP_MAX_MS  100
-#define WORKER_SLEEP_STEP_MS 20
+/* Adaptive worker sleep: starts at 100ms, grows on failure, cools down on success.
+ * In debug builds, ScreenLog file I/O after SetThreadDesktop adds ~20-30ms of
+ * implicit delay that helps the OS finalize the desktop graphics context. In
+ * release builds, ScreenLog is a no-op, so the explicit sleep must be larger.
+ * 100ms base works reliably in both modes. */
+#define WORKER_SLEEP_BASE_MS 100
+#define WORKER_SLEEP_MAX_MS  300
+#define WORKER_SLEEP_STEP_MS 50
 static int nWorkerSleepMs = WORKER_SLEEP_BASE_MS;
 
 /* DDraw consecutive failure counter - file scope so Winlogon exit can reset it.
@@ -873,7 +876,16 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
         if (ScreenCapture_CaptureWinlogonWorker(pCapture) == 0) {
             ScreenLog("[CAPTURE] Worker thread Winlogon capture SUCCESS\r\n");
             nWorkerConsecutiveFailures = 0;
-            nWorkerSleepMs = WORKER_SLEEP_BASE_MS;  /* Reset adaptive sleep on success */
+            /* Cool down gradually instead of hard-resetting to base.
+             * Hard reset caused release-mode regression: base (30ms) was too
+             * short without ScreenLog I/O delays, so every frame after a
+             * successful one failed, giving ~20% capture rate. Gradual
+             * cool-down settles at the minimum working value. */
+            if (nWorkerSleepMs > WORKER_SLEEP_BASE_MS) {
+                nWorkerSleepMs -= WORKER_SLEEP_STEP_MS;
+                if (nWorkerSleepMs < WORKER_SLEEP_BASE_MS)
+                    nWorkerSleepMs = WORKER_SLEEP_BASE_MS;
+            }
             return RD2K_SUCCESS;
         }
         
