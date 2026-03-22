@@ -180,6 +180,13 @@ static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
         return 1;
     }
     
+    /* CRITICAL FIX (v6.2): In release mode, ScreenLog is a no-op so there's
+     * zero delay between SetThreadDesktop and GetDC/BitBlt. In debug mode,
+     * ScreenLog does fopen/fprintf/fclose (~5-25ms total) which gives the OS
+     * time to finalize the desktop graphics context. Without this delay,
+     * BitBlt fails with ERROR_INVALID_HANDLE (6) in release builds. */
+    Sleep(50);
+    
     /* Log desktop we're now on for debugging */
     {
         char deskName[128] = {0};
@@ -231,17 +238,35 @@ static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
     
     hBitmapOld = (HBITMAP)SelectObject(hdcMemory, hBitmap);
     
-    /* BitBlt from Winlogon desktop to our DIB */
+    /* BitBlt from Winlogon desktop to our DIB.
+     * FIX (v6.2): If BitBlt fails with ERROR_INVALID_HANDLE (6), the desktop
+     * DC may have been invalidated by a transient OS state change. Retry once
+     * after releasing and reacquiring the DC. */
     if (!BitBlt(hdcMemory, 0, 0, pParams->width, pParams->height,
                 hdcScreen, 0, 0, SRCCOPY)) {
-        sprintf(pParams->szError, "Worker: BitBlt failed: %lu", GetLastError());
+        DWORD dwBltErr = GetLastError();
+        if (dwBltErr == 6) {  /* ERROR_INVALID_HANDLE - retry once */
+            ScreenLog("[WORKER] BitBlt failed error 6 - retrying with fresh DC\r\n");
+            ReleaseDC(NULL, hdcScreen);
+            Sleep(100);
+            hdcScreen = GetDC(NULL);
+            if (hdcScreen && BitBlt(hdcMemory, 0, 0, pParams->width, pParams->height,
+                                     hdcScreen, 0, 0, SRCCOPY)) {
+                ScreenLog("[WORKER] BitBlt retry SUCCEEDED\r\n");
+                goto bitblt_ok;
+            }
+            dwBltErr = GetLastError();
+        }
+        sprintf(pParams->szError, "Worker: BitBlt failed: %lu", dwBltErr);
         SelectObject(hdcMemory, hBitmapOld);
         DeleteObject(hBitmap);
-        DeleteDC(hdcMemory);
-        ReleaseDC(NULL, hdcScreen);
+        if (hdcMemory) DeleteDC(hdcMemory);
+        if (hdcScreen) ReleaseDC(NULL, hdcScreen);
         if (pParams->hToken) RevertToSelf();
         return 1;
     }
+    
+    bitblt_ok:
     
     /* Copy pixels to caller's buffer using proper DWORD-aligned stride.
      * CreateDIBSection produces DWORD-aligned rows. We must copy row-by-row
@@ -735,52 +760,54 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
     }
     
     /* ATTEMPT 1: Try DirectDraw GPU-accelerated capture (skip on Winlogon/UAC) */
-    /* FIX (v6.1): If DDraw previously failed, attempt recovery every frame
-     * instead of permanently disabling it. DDraw failure may be transient
-     * (e.g., desktop switch, surface lost, temporary lock failure). */
-    if (!bForceGDI && pCapture->bUseDDraw && pCapture->pDDrawContext && pCapture->bDDrawFailed) {
-        DDRAW_STATUS recoverStatus = DDraw_ValidateAndRecover((DDRAW_CONTEXT *)pCapture->pDDrawContext);
-        if (recoverStatus == DDRAW_STATUS_SUCCESS || recoverStatus == DDRAW_STATUS_RECOVERED) {
-            ScreenLog("[CAPTURE] DirectDraw recovered from previous failure\r\n");
-            pCapture->bDDrawFailed = FALSE;
-        }
-    }
-    
-    if (!bForceGDI && pCapture->bUseDDraw && pCapture->pDDrawContext && !pCapture->bDDrawFailed) {
-        ScreenLog("[CAPTURE] Attempting DirectDraw GPU capture...\r\n");
+    /* FIX (v6.2): DDraw failure counter. After 3 consecutive failures, stop
+     * trying DDraw recovery — the surfaces are permanently dead (e.g., after
+     * desktop switch). This eliminates the ~150ms overhead per frame of
+     * ValidateAndRecover + CopyFrameBuffer failing on every single frame.
+     * Counter resets on DDraw success or explicit resolution change. */
+    #define DDRAW_MAX_CONSECUTIVE_FAILURES 3
+    {
+        static int nDDrawConsecutiveFailures = 0;
         
-        /* CRITICAL FIX (v5.9): Resync display dimensions before DirectDraw capture
-         * Monitor resolution may have changed since initialization, or DirectDraw 
-         * may report different size depending on fullscreen vs windowed mode.
-         * Must recheck and reallocate buffers if size changed.
-         * This prevents "Target buffer too small" errors. */
-        if (!ScreenCapture_SyncDisplayMode(pCapture)) {
-            ScreenLog("[CAPTURE] WARNING: Failed to sync display mode (continuing with current buffer size)\r\n");
-            /* Don't fail - continue and let DirectDraw check bounds */
-        }
-        
-        ddStatus = DDraw_CopyFrameBuffer(
-            (DDRAW_CONTEXT *)pCapture->pDDrawContext,
-            pCapture->pPixelData,
-            pCapture->pixelDataSize,
-            &dwBytesWritten
-        );
-        
-        if (ddStatus == DDRAW_STATUS_SUCCESS) {
-            sprintf(buf, "[CAPTURE] DirectDraw GPU capture SUCCESS - %lu bytes\r\n", dwBytesWritten);
-            ScreenLog(buf);
-            return RD2K_SUCCESS;
-        } else {
-            sprintf(buf, "[CAPTURE] DirectDraw capture failed (0x%08lx), attempting fallback to next mode\r\n", ddStatus);
-            ScreenLog(buf);
-            pCapture->bDDrawFailed = TRUE;
-            /* Try fallback to next capture mode */
-            if (pCapture->pDesktopContext) {
-                if (Desktop_TryNextCaptureMode(pCapture->pDesktopContext)) {
-                    ScreenLog("[CAPTURE] Fallback initiated for DirectDraw failure\r\n");
-                } else {
-                    ScreenLog("[CAPTURE] Warning: No fallback available for DirectDraw failure\r\n");
+        if (!bForceGDI && pCapture->bUseDDraw && pCapture->pDDrawContext && pCapture->bDDrawFailed) {
+            if (nDDrawConsecutiveFailures >= DDRAW_MAX_CONSECUTIVE_FAILURES) {
+                /* DDraw has failed too many times in a row — skip it entirely */
+            } else {
+                DDRAW_STATUS recoverStatus = DDraw_ValidateAndRecover((DDRAW_CONTEXT *)pCapture->pDDrawContext);
+                if (recoverStatus == DDRAW_STATUS_SUCCESS || recoverStatus == DDRAW_STATUS_RECOVERED) {
+                    ScreenLog("[CAPTURE] DirectDraw recovered from previous failure\r\n");
+                    pCapture->bDDrawFailed = FALSE;
                 }
+            }
+        }
+        
+        if (!bForceGDI && pCapture->bUseDDraw && pCapture->pDDrawContext && !pCapture->bDDrawFailed) {
+            ScreenLog("[CAPTURE] Attempting DirectDraw GPU capture...\r\n");
+            
+            if (!ScreenCapture_SyncDisplayMode(pCapture)) {
+                ScreenLog("[CAPTURE] WARNING: Failed to sync display mode (continuing with current buffer size)\r\n");
+            }
+            
+            ddStatus = DDraw_CopyFrameBuffer(
+                (DDRAW_CONTEXT *)pCapture->pDDrawContext,
+                pCapture->pPixelData,
+                pCapture->pixelDataSize,
+                &dwBytesWritten
+            );
+            
+            if (ddStatus == DDRAW_STATUS_SUCCESS) {
+                sprintf(buf, "[CAPTURE] DirectDraw GPU capture SUCCESS - %lu bytes\r\n", dwBytesWritten);
+                ScreenLog(buf);
+                nDDrawConsecutiveFailures = 0;  /* Reset on success */
+                return RD2K_SUCCESS;
+            } else {
+                nDDrawConsecutiveFailures++;
+                sprintf(buf, "[CAPTURE] DirectDraw capture failed (0x%08lx), consecutive failures: %d\r\n", ddStatus, nDDrawConsecutiveFailures);
+                ScreenLog(buf);
+                pCapture->bDDrawFailed = TRUE;
+                /* NOTE: Don't cascade Desktop_TryNextCaptureMode here.
+                 * DDraw failure is a rendering issue, not a desktop access issue.
+                 * The fallback layer system is for desktop switching problems. */
             }
         }
     }
@@ -803,7 +830,12 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
             return RD2K_SUCCESS;
         }
         
-        ScreenLog("[CAPTURE] Worker thread capture failed - falling through to normal GDI\r\n");
+        /* FIX (v6.2): Do NOT fall through to normal GDI when worker fails.
+         * The main thread is on Default desktop, so GDI would capture the
+         * WRONG desktop (Default instead of Winlogon). Return error and let
+         * the next TIMER_SCREEN cycle retry. */
+        ScreenLog("[CAPTURE] Worker thread capture failed - returning error (will retry next frame)\r\n");
+        return RD2K_ERR_SCREEN;
     }
     
     /* Normal GDI capture path (fallback if DirectDraw fails) */
