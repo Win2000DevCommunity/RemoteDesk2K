@@ -2545,17 +2545,52 @@ void SendScreenUpdate(void)
     sprintf(buf, "[SEND_SCREEN] FindDirtyRects returned %d rectangles\r\n", numRects);
     DebugLog(buf);
     
+    /* When most of the screen is dirty (e.g., first Winlogon frame), sending
+     * 1800 individual 32x32 tiles is catastrophically slow: each requires
+     * malloc/compress/send overhead, and flooding the TCP buffer causes
+     * send() to block for minutes. Collapse into a few full-width bands. */
+    if (numRects > 100) {
+        int bandHeight = g_pCapture->height / 8;
+        int bandY, bh;
+        if (bandHeight < 1) bandHeight = g_pCapture->height;
+        sprintf(buf, "[SEND_SCREEN] Too many rects (%d), collapsing to bands\r\n", numRects);
+        DebugLog(buf);
+        numRects = 0;
+        for (bandY = 0; bandY < g_pCapture->height; bandY += bandHeight) {
+            bh = g_pCapture->height - bandY;
+            if (bh > bandHeight) bh = bandHeight;
+            dirtyRects[numRects].left = 0;
+            dirtyRects[numRects].top = bandY;
+            dirtyRects[numRects].right = g_pCapture->width;
+            dirtyRects[numRects].bottom = bandY + bh;
+            numRects++;
+        }
+        sprintf(buf, "[SEND_SCREEN] Collapsed to %d bands\r\n", numRects);
+        DebugLog(buf);
+    }
+    
+    /* Receive any pending input events before the send loop.
+     * The main thread is about to be busy sending rects, so TIMER_NETWORK
+     * won't fire. Get events into the queue for the input thread. */
+    if (g_bClientConnected) {
+        ProcessServerNetwork();
+        if (!g_bClientConnected || !g_pServerNet || !g_pCapture) {
+            bInSendScreenUpdate = FALSE;
+            return;
+        }
+    }
+    
     for (i = 0; i < numRects; i++) {
         RD2K_RECT rectHeader;
         BYTE *pTempBuffer;
         DWORD rectDataSize, compressedSize;
         int x, y, w, h, j;
         
-        /* Every 10 rects, receive pending input events from the viewer.
+        /* Every 5 rects, receive pending input events from the viewer.
          * During Winlogon capture the main thread is blocked here, so
          * TIMER_NETWORK cannot fire. Direct call is fast (select + recv
          * only if data is available) with no message pump overhead. */
-        if ((i % 10) == 9 && g_bClientConnected) {
+        if (i > 0 && (i % 5) == 0 && g_bClientConnected) {
             ProcessServerNetwork();
             if (!g_bClientConnected || !g_pServerNet) break;
         }
@@ -2645,6 +2680,11 @@ void SendScreenUpdate(void)
     }
     
     DebugLog("[SEND_SCREEN] All rectangles sent, updating previous frame\r\n");
+    
+    /* Receive any input events that arrived during the send */
+    if (g_bClientConnected && g_pServerNet) {
+        ProcessServerNetwork();
+    }
     
     sprintf(buf, "[SEND_SCREEN] About to memcpy pPrevFrame: dst=%p src=%p size=%d\r\n",
             (void*)g_pCapture->pPrevFrame, (void*)g_pCapture->pPixelData, 
