@@ -2498,7 +2498,7 @@ void ProcessServerNetwork(void)
 /* Send screen update */
 void SendScreenUpdate(void)
 {
-    RECT dirtyRects[2048];
+    static RECT dirtyRects[2048]; /* Static: persists for resume across ticks */
     int numRects, i;
     int bytesPerPixel;
     int stride;
@@ -2509,15 +2509,42 @@ void SendScreenUpdate(void)
     static BYTE *s_pTempBuffer = NULL;
     static DWORD s_tempBufferSize = 0;
     
+    /* FIX (v6.14): Resume state for time-limited band sending.
+     * When the send loop hits its 2s time limit, these statics preserve
+     * the band list and position.  The NEXT timer tick skips screen capture
+     * (pPixelData still has the original frame) and resumes sending from
+     * where we left off.  pPrevFrame is only updated when ALL bands are
+     * sent, which prevents the v6.12 "never converges" bug while also
+     * keeping the UI responsive (max 2s block per tick). */
+    static int s_nPendingStart = 0;    /* Next rect index to send (0 = nothing pending) */
+    static int s_nPendingTotal = 0;    /* Total rects in the pending frame */
+    static int s_nPendingBPP = 0;      /* bytesPerPixel of pending frame */
+    static int s_nPendingStride = 0;   /* Row stride of pending frame */
+    
     if (bInSendScreenUpdate) return;
     
     DebugLog("[SENDSCREENUPDATE] ============ ENTER ============\r\n");
     
     if (!g_pCapture || !g_pServerNet || !g_bClientConnected) {
+        s_nPendingStart = 0;  /* Clear stale pending state on disconnect */
         return;
     }
     
     bInSendScreenUpdate = TRUE;
+    
+    /* ================================================================
+     * RESUME PATH: unsent bands from previous tick still in dirtyRects[].
+     * pPixelData still holds the original capture (we skip CaptureScreen).
+     * ================================================================ */
+    if (s_nPendingStart > 0) {
+        numRects = s_nPendingTotal;
+        bytesPerPixel = s_nPendingBPP;
+        stride = s_nPendingStride;
+        sprintf(buf, "[SEND_SCREEN] Resuming from band %d/%d\r\n",
+                s_nPendingStart, numRects);
+        DebugLog(buf);
+        goto send_bands;
+    }
     
     bytesPerPixel = g_pCapture->bitsPerPixel / 8;
     if (bytesPerPixel <= 0) bytesPerPixel = 3;
@@ -2600,25 +2627,50 @@ void SendScreenUpdate(void)
         }
     }
     
-    /* FIX (v6.13): Removed the v6.12 time-limit that broke screen updates.
-     * The time-limit caused pPrevFrame to only partially update, but each
-     * new DDraw capture differed slightly from the partial pPrevFrame
-     * (cursor blink, clock, taskbar) so FindDirtyRects found 660+ dirty
-     * rects EVERY tick.  This forced banding EVERY tick, flooding the
-     * relay with ~1.5MB/tick continuously for 60+ seconds until the TCP
-     * stream desynchronized and the relay read data bytes as a header
-     * (getting "Invalid data length: 3875872064") and disconnected.
+    /* FIX (v6.14): Resume-based band sending.
      *
-     * Correct approach: send ALL bands in one go (no time limit), then
-     * do a full pPrevFrame update.  With 256KB bands, the first full-screen
-     * frame blocks ~3-4s over relay, then subsequent frames have only
-     * small changes (< 100 rects) and send in < 200ms.  The one-time 3-4s
-     * cost on connect/desktop-switch is acceptable and replaces the old
-     * infinite-flood-then-disconnect behavior. */
-    for (i = 0; i < numRects; i++) {
+     * History of the send-loop bugs:
+     *  v6.11: 2s time limit + full pPrevFrame update → unsent bands permanently
+     *         marked "sent" → confused/mixed screen on viewer.
+     *  v6.12: 2s time limit + partial pPrevFrame → each new capture differs
+     *         from partial pPrevFrame (cursor blink, clock) → 660+ dirty rects
+     *         EVERY tick → relay flooded → TCP desync → disconnect.
+     *  v6.13: No time limit + full pPrevFrame → correct screen, but 6-7s UI
+     *         freeze on every big change → "Not Responding" → user thinks stuck.
+     *
+     * Correct approach (v6.14): time limit WITH deferred capture.
+     *  - Send bands for up to 2 seconds per timer tick.
+     *  - If time expires, save the band index and exit WITHOUT updating
+     *    pPrevFrame and WITHOUT re-capturing on the next tick.
+     *  - Next tick: resume sending from saved index (pPixelData still valid).
+     *  - Only update pPrevFrame when ALL bands are sent.
+     *  - Next capture then sees only real delta → fast small updates.
+     *
+     * Behaviour: 21 bands at ~300ms each = ~7 bands per 2s tick.
+     * Full Winlogon frame: 3 ticks × 2s = 6s total (same throughput as v6.13)
+     * but with ~100ms UI-responsive gaps between ticks. */
+send_bands:
+    {
+    DWORD dwSendStart = GetTickCount();
+    
+    for (i = s_nPendingStart; i < numRects; i++) {
         RD2K_RECT rectHeader;
         DWORD rectDataSize, compressedSize;
         int x, y, w, h, j;
+        
+        /* Time limit: yield to message pump after 2 seconds.
+         * Remaining bands are saved and resumed on the next timer tick. */
+        if (i > s_nPendingStart && (GetTickCount() - dwSendStart > 2000)) {
+            sprintf(buf, "[SEND_SCREEN] Time limit after %d/%d rects - deferring\r\n",
+                    i, numRects);
+            DebugLog(buf);
+            s_nPendingStart = i;
+            s_nPendingTotal = numRects;
+            s_nPendingBPP = bytesPerPixel;
+            s_nPendingStride = stride;
+            /* Do NOT update pPrevFrame — unsent bands still reference pPixelData */
+            goto exit_sendscreen;
+        }
         
         /* Drain pending input every 5 rects to keep clicks responsive.
          * Without this, TIMER_NETWORK can't fire while SendScreenUpdate runs,
@@ -2626,7 +2678,10 @@ void SendScreenUpdate(void)
          * frame finishes sending — causing ~2s perceived click lag. */
         if ((i % 5) == 0 && g_bClientConnected) {
             ProcessServerNetwork();
-            if (!g_bClientConnected || !g_pServerNet) break;
+            if (!g_bClientConnected || !g_pServerNet) {
+                s_nPendingStart = 0;  /* Client gone — discard pending */
+                goto exit_sendscreen;
+            }
         }
         
         x = dirtyRects[i].left;
@@ -2686,14 +2741,18 @@ void SendScreenUpdate(void)
                           g_pServerNet->sendBuffer,
                           sizeof(rectHeader) + compressedSize);
     }
+    } /* end send block */
     
-    /* FIX (v6.13): Always do a full pPrevFrame update after the send loop.
-     * The v6.12 "progressive" partial update was the root cause of the
-     * relay disconnect — see comment above the for loop. */
+    /* All rects sent — clear pending state and update pPrevFrame.
+     * This is the ONLY place pPrevFrame is updated, guaranteeing
+     * the viewer has received the complete frame before we mark
+     * it as "already sent" in the delta buffer. */
+    s_nPendingStart = 0;
     if (g_pCapture->pPrevFrame && g_pCapture->pPixelData && g_pCapture->pixelDataSize > 0) {
         memcpy(g_pCapture->pPrevFrame, g_pCapture->pPixelData, g_pCapture->pixelDataSize);
     }
     
+exit_sendscreen:
     DebugLog("[SENDSCREENUPDATE] ============ EXIT ============\r\n");
     bInSendScreenUpdate = FALSE;
 }
