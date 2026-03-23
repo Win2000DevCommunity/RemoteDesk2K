@@ -2600,28 +2600,25 @@ void SendScreenUpdate(void)
         }
     }
     
-    /* FIX (v6.12): Time-limit the send loop to prevent UI freeze.
-     * Each Network_SendPacket can block for seconds on a slow relay.
-     * If the time limit fires, unsent bands are NOT lost — pPrevFrame
-     * is only updated for the rows actually sent, so unsent rows
-     * remain "dirty" and get sent on the next timer tick.  The viewer
-     * sees the screen fill in progressively (top-to-bottom) over
-     * 2-3 ticks (~200-300ms) instead of one massive blocking burst. */
-    {
-    DWORD dwSendStart = GetTickCount();
-    
+    /* FIX (v6.13): Removed the v6.12 time-limit that broke screen updates.
+     * The time-limit caused pPrevFrame to only partially update, but each
+     * new DDraw capture differed slightly from the partial pPrevFrame
+     * (cursor blink, clock, taskbar) so FindDirtyRects found 660+ dirty
+     * rects EVERY tick.  This forced banding EVERY tick, flooding the
+     * relay with ~1.5MB/tick continuously for 60+ seconds until the TCP
+     * stream desynchronized and the relay read data bytes as a header
+     * (getting "Invalid data length: 3875872064") and disconnected.
+     *
+     * Correct approach: send ALL bands in one go (no time limit), then
+     * do a full pPrevFrame update.  With 256KB bands, the first full-screen
+     * frame blocks ~3-4s over relay, then subsequent frames have only
+     * small changes (< 100 rects) and send in < 200ms.  The one-time 3-4s
+     * cost on connect/desktop-switch is acceptable and replaces the old
+     * infinite-flood-then-disconnect behavior. */
     for (i = 0; i < numRects; i++) {
         RD2K_RECT rectHeader;
         DWORD rectDataSize, compressedSize;
         int x, y, w, h, j;
-        
-        /* Time limit: don't block the UI thread for more than 2 seconds.
-         * Remaining bands stay dirty via partial pPrevFrame update below. */
-        if (GetTickCount() - dwSendStart > 2000) {
-            sprintf(buf, "[SEND_SCREEN] Time limit reached after %d/%d rects - deferring\r\n", i, numRects);
-            DebugLog(buf);
-            break;
-        }
         
         /* Drain pending input every 5 rects to keep clicks responsive.
          * Without this, TIMER_NETWORK can't fire while SendScreenUpdate runs,
@@ -2689,31 +2686,12 @@ void SendScreenUpdate(void)
                           g_pServerNet->sendBuffer,
                           sizeof(rectHeader) + compressedSize);
     }
-    } /* end time-limited send block */
     
-    /* FIX (v6.12): Only update pPrevFrame for rows we actually sent.
-     * The old code did an unconditional full memcpy here.  When the
-     * time-limit break fired (i < numRects), unsent bands were marked
-     * as "already sent" in pPrevFrame and NEVER retransmitted — causing
-     * a permanently confused/mixed screen on the viewer.
-     *
-     * Now: if all rects were sent (i >= numRects), full update as before.
-     * If partial (i < numRects), update only rows 0..lastSentBottom so
-     * unsent rows remain dirty for the next timer tick. */
+    /* FIX (v6.13): Always do a full pPrevFrame update after the send loop.
+     * The v6.12 "progressive" partial update was the root cause of the
+     * relay disconnect — see comment above the for loop. */
     if (g_pCapture->pPrevFrame && g_pCapture->pPixelData && g_pCapture->pixelDataSize > 0) {
-        if (i >= numRects) {
-            /* Complete send — full pPrevFrame update */
-            memcpy(g_pCapture->pPrevFrame, g_pCapture->pPixelData, g_pCapture->pixelDataSize);
-        } else if (i > 0) {
-            /* Partial send — update only the rows we actually transmitted.
-             * Bands are emitted top-to-bottom; dirtyRects[i-1].bottom is the
-             * last row of the last transmitted band. */
-            DWORD sentBytes = (DWORD)dirtyRects[i - 1].bottom * (DWORD)stride;
-            if (sentBytes > 0 && sentBytes <= (DWORD)g_pCapture->pixelDataSize) {
-                memcpy(g_pCapture->pPrevFrame, g_pCapture->pPixelData, sentBytes);
-            }
-        }
-        /* i == 0: nothing sent at all, leave pPrevFrame as-is */
+        memcpy(g_pCapture->pPrevFrame, g_pCapture->pPixelData, g_pCapture->pixelDataSize);
     }
     
     DebugLog("[SENDSCREENUPDATE] ============ EXIT ============\r\n");
