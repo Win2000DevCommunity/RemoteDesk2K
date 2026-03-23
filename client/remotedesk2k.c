@@ -2589,9 +2589,24 @@ void SendScreenUpdate(void)
                    w * bytesPerPixel);
         }
         
-        compressedSize = CompressRLE(s_pTempBuffer, rectDataSize,
-                                     g_pCapture->pCompressBuffer,
-                                     g_pCapture->compressBufferSize);
+        /* FIX (v6.8): Cap CompressRLE output to what sendBuffer can hold.
+         * compressBufferSize (~6MB) > sendBufferSize (4MB). Without this cap,
+         * CompressRLE could produce output that overflows sendBuffer on memcpy,
+         * corrupting the heap. Crash manifests later on the next realloc/free. */
+        {
+            DWORD maxCompressed = g_pServerNet->sendBufferSize - sizeof(RD2K_RECT);
+            DWORD dstLimit = g_pCapture->compressBufferSize;
+            if (dstLimit > maxCompressed) dstLimit = maxCompressed;
+            
+            compressedSize = CompressRLE(s_pTempBuffer, rectDataSize,
+                                         g_pCapture->pCompressBuffer,
+                                         dstLimit);
+        }
+        
+        /* Safety: skip rect if compressed data won't fit in sendBuffer */
+        if (sizeof(RD2K_RECT) + compressedSize > g_pServerNet->sendBufferSize) {
+            continue;
+        }
         
         rectHeader.x = (WORD)x;
         rectHeader.y = (WORD)y;

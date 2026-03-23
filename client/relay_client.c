@@ -73,10 +73,29 @@ static int SendRelayPacket(SOCKET sock, BYTE msgType, const BYTE *data, DWORD da
         Crypto_Encrypt(s_sendBuf + sizeof(RELAY_HEADER), dataLength);
     }
     
-    result = send(sock, (const char*)s_sendBuf, packetSize, 0);
-    
-    if (result == SOCKET_ERROR) {
-        return RD2K_ERR_SEND;
+    /* FIX (v6.8): Handle partial sends — TCP send() can transmit fewer
+     * bytes than requested. Without a loop, the relay server receives a
+     * truncated packet and the stream desynchronises, causing a disconnect
+     * that looks like a crash on the remote end. */
+    {
+        DWORD totalSent = 0;
+        int retries = 0;
+        while (totalSent < packetSize) {
+            int toSend = (int)(packetSize - totalSent);
+            result = send(sock, (const char*)(s_sendBuf + totalSent), toSend, 0);
+            if (result == SOCKET_ERROR) {
+                int err = WSAGetLastError();
+                if (err == WSAEWOULDBLOCK) {
+                    if (++retries > 200) return RD2K_ERR_SEND;
+                    Sleep(10);
+                    continue;
+                }
+                return RD2K_ERR_SEND;
+            }
+            if (result == 0) return RD2K_ERR_SEND;
+            totalSent += (DWORD)result;
+            retries = 0;
+        }
     }
     
     return RD2K_SUCCESS;
