@@ -758,6 +758,14 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
             if (!pCapture->pDesktopContext->bOnWinlogonDesktop) {
                 BOOL bSwitched = FALSE;
                 ScreenLog("[CAPTURE] Winlogon detected - switching to Winlogon desktop\r\n");
+                /* FIX (v6.12): Force full-screen dirty detection on the first
+                 * Winlogon frame.  pPrevFrame still holds the normal desktop;
+                 * some areas could accidentally match the Winlogon capture
+                 * (similar colours) and never be retransmitted.  Setting
+                 * pPrevFrame to 0xFF guarantees every pixel differs. */
+                if (pCapture->pPrevFrame) {
+                    memset(pCapture->pPrevFrame, 0xFF, pCapture->pixelDataSize);
+                }
                 /* FIX (v6.7): Wrap Desktop_SwitchToWinlogon in SEH.
                  * The brute-force token scan inside this function manipulates
                  * handles from SYSTEM processes (lsass, winlogon, csrss).

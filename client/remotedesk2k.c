@@ -2600,13 +2600,13 @@ void SendScreenUpdate(void)
         }
     }
     
-    /* FIX (v6.11): Time-limit the send loop.  Each Network_SendPacket can
-     * block for seconds on a slow relay (SO_SNDTIMEO = 5s).  With 3 huge
-     * bands the UI thread was blocked for 7+ seconds, preventing WM_TIMER
-     * from firing again.  The pPrevFrame memcpy at the end of this function
-     * ensures that any un-sent bands will NOT be re-sent next tick — the
-     * viewer gets rapid successive incremental updates instead of one
-     * massive blocking burst. */
+    /* FIX (v6.12): Time-limit the send loop to prevent UI freeze.
+     * Each Network_SendPacket can block for seconds on a slow relay.
+     * If the time limit fires, unsent bands are NOT lost — pPrevFrame
+     * is only updated for the rows actually sent, so unsent rows
+     * remain "dirty" and get sent on the next timer tick.  The viewer
+     * sees the screen fill in progressively (top-to-bottom) over
+     * 2-3 ticks (~200-300ms) instead of one massive blocking burst. */
     {
     DWORD dwSendStart = GetTickCount();
     
@@ -2615,10 +2615,9 @@ void SendScreenUpdate(void)
         DWORD rectDataSize, compressedSize;
         int x, y, w, h, j;
         
-        /* Time limit: don't block the UI thread for more than 1 second.
-         * Remaining bands are implicitly skipped; pPrevFrame update below
-         * ensures they won't appear dirty on the next timer tick. */
-        if (GetTickCount() - dwSendStart > 1000) {
+        /* Time limit: don't block the UI thread for more than 2 seconds.
+         * Remaining bands stay dirty via partial pPrevFrame update below. */
+        if (GetTickCount() - dwSendStart > 2000) {
             sprintf(buf, "[SEND_SCREEN] Time limit reached after %d/%d rects - deferring\r\n", i, numRects);
             DebugLog(buf);
             break;
@@ -2692,8 +2691,29 @@ void SendScreenUpdate(void)
     }
     } /* end time-limited send block */
     
+    /* FIX (v6.12): Only update pPrevFrame for rows we actually sent.
+     * The old code did an unconditional full memcpy here.  When the
+     * time-limit break fired (i < numRects), unsent bands were marked
+     * as "already sent" in pPrevFrame and NEVER retransmitted — causing
+     * a permanently confused/mixed screen on the viewer.
+     *
+     * Now: if all rects were sent (i >= numRects), full update as before.
+     * If partial (i < numRects), update only rows 0..lastSentBottom so
+     * unsent rows remain dirty for the next timer tick. */
     if (g_pCapture->pPrevFrame && g_pCapture->pPixelData && g_pCapture->pixelDataSize > 0) {
-        memcpy(g_pCapture->pPrevFrame, g_pCapture->pPixelData, g_pCapture->pixelDataSize);
+        if (i >= numRects) {
+            /* Complete send — full pPrevFrame update */
+            memcpy(g_pCapture->pPrevFrame, g_pCapture->pPixelData, g_pCapture->pixelDataSize);
+        } else if (i > 0) {
+            /* Partial send — update only the rows we actually transmitted.
+             * Bands are emitted top-to-bottom; dirtyRects[i-1].bottom is the
+             * last row of the last transmitted band. */
+            DWORD sentBytes = (DWORD)dirtyRects[i - 1].bottom * (DWORD)stride;
+            if (sentBytes > 0 && sentBytes <= (DWORD)g_pCapture->pixelDataSize) {
+                memcpy(g_pCapture->pPrevFrame, g_pCapture->pPixelData, sentBytes);
+            }
+        }
+        /* i == 0: nothing sent at all, leave pPrevFrame as-is */
     }
     
     DebugLog("[SENDSCREENUPDATE] ============ EXIT ============\r\n");
