@@ -1074,12 +1074,15 @@ BOOL Desktop_SwitchToWinlogon(PDESKTOP_CONTEXT pDesktop)
     
     /* ---- Attempt 1: Direct OpenDesktop with adaptive retry ----
      * In release builds this function runs in microseconds, outrunning the OS
-     * desktop transition. Instead of a blind Sleep(200), poll OpenDesktopA in
-     * a tight loop. Returns instantly when the desktop is already ready;
-     * worst-case ~200ms (20 x 10ms) if the OS is still transitioning. */
+     * desktop transition. Poll OpenDesktopA in a loop so we return instantly
+     * when the desktop is already ready; worst-case ~1s (50 x 20ms) if the
+     * OS is still transitioning (e.g., first Winlogon after boot).
+     * FIX (v6.9): Increased from 20x10ms (200ms) to 50x20ms (1000ms).
+     * 200ms was too short for the first-ever Winlogon transition in release
+     * builds where no DebugLog I/O delays slow down the caller. */
     {
         int openRetry;
-        for (openRetry = 0; openRetry < 20; openRetry++) {
+        for (openRetry = 0; openRetry < 50; openRetry++) {
             hWinlogonDesktop = OpenDesktopA("Winlogon", 0, FALSE, DESKTOP_INPUT_ACCESS);
             if (hWinlogonDesktop) {
                 DebugLog("[SwitchToWinlogon] Direct OpenDesktop succeeded (full access)\r\n");
@@ -1088,7 +1091,7 @@ BOOL Desktop_SwitchToWinlogon(PDESKTOP_CONTEXT pDesktop)
             dwErr = GetLastError();
             /* ACCESS_DENIED = need impersonation, don't waste time retrying */
             if (dwErr == ERROR_ACCESS_DENIED) break;
-            Sleep(10);
+            Sleep(20);
         }
         sprintf(buf, "[SwitchToWinlogon] Direct OpenDesktop failed after %d tries (error %lu)\r\n", openRetry, dwErr);
         DebugLog(buf);

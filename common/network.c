@@ -11,7 +11,7 @@
 /* Socket timeout values (milliseconds) */
 #define SOCKET_SEND_TIMEOUT     60000   /* 60 seconds for large files */
 #define SOCKET_RECV_TIMEOUT     60000   /* 60 seconds for large files */
-#define SOCKET_BUFFER_SIZE      (512 * 1024)  /* 512 KB socket buffer for large transfers */
+#define SOCKET_BUFFER_SIZE      (2 * 1024 * 1024)  /* 2 MB socket buffer - matches RELAY_BUFFER_SIZE */
 #define SOCKET_SELECT_TIMEOUT   200     /* 200ms select timeout */
 #define MAX_RETRY_COUNT         600     /* 600 * 200ms = 120 seconds for large file transfers */
 

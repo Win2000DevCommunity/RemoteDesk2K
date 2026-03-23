@@ -95,19 +95,33 @@ static void FormatClientId(DWORD id, char *buffer)
             id & 0xFF);
 }
 
-/* Helper: Send a relay packet to a socket with XOR encryption */
+/* Helper: Send a relay packet to a socket with XOR encryption.
+ * FIX (v6.9): Replaced malloc+free per packet with stack buffer for small
+ * messages and a proper send loop for partial sends.  During screen updates
+ * the relay forwards 100-500+ rects per frame — malloc+free for each was a
+ * major source of throughput loss.  The send loop prevents truncated writes
+ * from corrupting the TCP stream (same bug fixed on the client in v6.8). */
 static int SendRelayPacket(SOCKET sock, BYTE msgType, const BYTE *data, DWORD dataLength)
 {
     RELAY_HEADER header;
+    BYTE stackBuf[4096];  /* Stack buffer for small control messages */
     BYTE *packet;
     DWORD packetSize;
-    int result;
+    DWORD totalSent;
+    int sent, retries;
     
     if (sock == INVALID_SOCKET) return RD2K_ERR_SOCKET;
     
     packetSize = sizeof(RELAY_HEADER) + dataLength;
-    packet = (BYTE*)malloc(packetSize);
-    if (!packet) return RD2K_ERR_MEMORY;
+    
+    /* Use stack for small packets (register, connect, ping, etc.),
+     * heap only for large data payloads */
+    if (packetSize <= sizeof(stackBuf)) {
+        packet = stackBuf;
+    } else {
+        packet = (BYTE*)malloc(packetSize);
+        if (!packet) return RD2K_ERR_MEMORY;
+    }
     
     header.msgType = msgType;
     header.flags = 0x01;  /* Flag: encrypted */
@@ -121,13 +135,34 @@ static int SendRelayPacket(SOCKET sock, BYTE msgType, const BYTE *data, DWORD da
         Crypto_Encrypt(packet + sizeof(RELAY_HEADER), dataLength);
     }
     
-    result = send(sock, (const char*)packet, packetSize, 0);
-    free(packet);
-    
-    if (result == SOCKET_ERROR) {
-        return RD2K_ERR_SEND;
+    /* Send with proper partial-send handling */
+    totalSent = 0;
+    retries = 0;
+    while (totalSent < packetSize) {
+        sent = send(sock, (const char*)(packet + totalSent),
+                    (int)(packetSize - totalSent), 0);
+        if (sent == SOCKET_ERROR) {
+            int err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK) {
+                if (++retries > 200) {
+                    if (packet != stackBuf) free(packet);
+                    return RD2K_ERR_SEND;
+                }
+                Sleep(10);
+                continue;
+            }
+            if (packet != stackBuf) free(packet);
+            return RD2K_ERR_SEND;
+        }
+        if (sent == 0) {
+            if (packet != stackBuf) free(packet);
+            return RD2K_ERR_SEND;
+        }
+        totalSent += (DWORD)sent;
+        retries = 0;
     }
     
+    if (packet != stackBuf) free(packet);
     return RD2K_SUCCESS;
 }
 
@@ -638,7 +673,7 @@ static void ConfigureClientSocket(SOCKET sock)
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&opt, sizeof(opt));
     
     /* Increase socket buffers for large transfers */
-    opt = 512 * 1024;  /* 512KB */
+    opt = RELAY_BUFFER_SIZE;
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char*)&opt, sizeof(opt));
     setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char*)&opt, sizeof(opt));
     

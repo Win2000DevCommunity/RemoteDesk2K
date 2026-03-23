@@ -15,7 +15,7 @@
 #define RELAY_DEFAULT_PORT          5000
 #define RELAY_MAX_CONNECTIONS       1024
 #define RELAY_CONNECTION_TIMEOUT    300000  /* 5 minutes in milliseconds */
-#define RELAY_BUFFER_SIZE           (512 * 1024)  /* 512 KB per connection - must handle large screen updates */
+#define RELAY_BUFFER_SIZE           (2 * 1024 * 1024)  /* 2 MB per connection - must handle large screen updates */
 #define RELAY_QUEUE_SIZE            16
 
 /* Relay protocol message types */

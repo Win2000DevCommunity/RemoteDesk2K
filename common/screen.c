@@ -189,10 +189,11 @@ static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
      * Instead of guessing how long the OS needs to finalize the desktop
      * graphics context, we POLL: try GetDC+BitBlt in a loop with short
      * sleeps. This is deterministic — adapts to actual hardware/OS speed.
-     * Max ~1s total (100 retries × 10ms). Typical success: 10-50ms.
-     * Doubled from 50 retries to handle slow machines / slow transitions. */
-    #define CAPTURE_RETRY_MAX    100
-    #define CAPTURE_RETRY_SLEEP  10
+     * FIX (v6.9): Increased from 100x10ms (1s) to 150x20ms (3s) to cover
+     * the first-ever Winlogon transition in release builds where the OS
+     * desktop graphics context can take over 1s to finalize. */
+    #define CAPTURE_RETRY_MAX    150
+    #define CAPTURE_RETRY_SLEEP  20
     {
         char deskName[128] = {0};
         DWORD dwLen = 0;

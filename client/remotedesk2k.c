@@ -2528,9 +2528,11 @@ void SendScreenUpdate(void)
     /* When most of the screen is dirty (e.g., first Winlogon frame), sending
      * 1800 individual 32x32 tiles is catastrophically slow: each requires
      * compress/send overhead, and flooding the TCP buffer causes send() to
-     * block. Collapse into full-width bands under 450KB relay limit. */
+     * block. Collapse into full-width bands under the relay buffer limit.
+     * FIX (v6.9): Raised from 450KB to 1800KB now that RELAY_BUFFER_SIZE
+     * is 2MB — bigger bands = fewer packets = less relay overhead. */
     if (numRects > 100) {
-        int maxBandBytes = 450 * 1024;
+        int maxBandBytes = 1800 * 1024;
         int rowBytes = g_pCapture->width * bytesPerPixel;
         int bandHeight;
         int bandY, bh;
