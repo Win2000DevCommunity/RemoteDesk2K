@@ -20,7 +20,11 @@ extern "C" {
 
 #define DDRAW_ENABLE_CAPTURE            1  /* Enable DirectDraw capture */
 #define DDRAW_ENABLE_FALLBACK           1  /* Fallback to GDI if DirectDraw fails */
+#ifdef RD2K_DEBUG
 #define DDRAW_ENABLE_DETAILED_LOGGING   1  /* Enable debug logging */
+#else
+#define DDRAW_ENABLE_DETAILED_LOGGING   0
+#endif
 #define DDRAW_MAX_INIT_ATTEMPTS         3  /* Retry count for init */
 #define DDRAW_TIMEOUT_MS                100 /* Max time for lock operations */
 

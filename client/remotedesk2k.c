@@ -2558,10 +2558,11 @@ void SendScreenUpdate(void)
         DWORD rectDataSize, compressedSize;
         int x, y, w, h, j;
         
-        /* Every 20 rects, drain pending input events to keep the queue moving.
-         * Reduced from every 5 rects — ProcessServerNetwork can block in relay
-         * mode, so fewer calls means less risk of stalling the send loop. */
-        if (i > 0 && (i % 20) == 0 && g_bClientConnected) {
+        /* Drain pending input every 5 rects to keep clicks responsive.
+         * Without this, TIMER_NETWORK can't fire while SendScreenUpdate runs,
+         * so mouse clicks sit unprocessed in the TCP buffer until the full
+         * frame finishes sending — causing ~2s perceived click lag. */
+        if ((i % 5) == 0 && g_bClientConnected) {
             ProcessServerNetwork();
             if (!g_bClientConnected || !g_pServerNet) break;
         }
