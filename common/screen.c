@@ -218,11 +218,15 @@ static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
         /* RETRY LOOP: Attempt GetDC + CreateCompatibleDC + DIB + BitBlt.
          * On each failure, release resources, sleep briefly, and retry.
          * The OS graphics context finalizes asynchronously after
-         * SetThreadDesktop, so we poll until it's ready. */
+         * SetThreadDesktop, so we poll until it's ready.
+         *
+         * CRITICAL: The first attempt MUST wait for the OS to begin
+         * finalizing the desktop graphics context. Without any initial
+         * delay, GetDC+BitBlt can return TRUE with all-black pixels
+         * (stale DC from previous desktop). 50ms lets the OS start
+         * the switch; the retry loop handles the remaining variance. */
         for (captureRetry = 0; captureRetry < CAPTURE_RETRY_MAX; captureRetry++) {
-            if (captureRetry > 0) {
-                Sleep(CAPTURE_RETRY_SLEEP);
-            }
+            Sleep(captureRetry == 0 ? 50 : CAPTURE_RETRY_SLEEP);
             
             hdcScreen = GetDC(NULL);
             if (!hdcScreen) continue;
@@ -257,11 +261,37 @@ static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
             
             if (BitBlt(hdcMemory, 0, 0, pParams->width, pParams->height,
                         hdcScreen, 0, 0, SRCCOPY)) {
-                bCaptured = TRUE;
-                break;  /* SUCCESS */
+                /* VALIDATION: Check that captured pixels are not all-black.
+                 * After SetThreadDesktop, BitBlt can return TRUE but copy
+                 * stale/black pixels from the old DC before the OS fully
+                 * maps the new desktop's framebuffer. The Winlogon desktop
+                 * (GINA dialog) always has non-black content (blue background,
+                 * white text, gray buttons), so all-black is a sure sign of
+                 * a stale capture. Sampling a few points is sufficient. */
+                {
+                    int bytesPerPx = pParams->bitsPerPixel / 8;
+                    DWORD stride = (DWORD)((pParams->width * bytesPerPx + 3) & ~3);
+                    int midRow = pParams->height / 2;
+                    int qtrRow = pParams->height / 4;
+                    BOOL bAllBlack = TRUE;
+                    int sx;
+                    /* Sample ~20 pixels across two rows */
+                    for (sx = 0; sx < pParams->width && bAllBlack; sx += pParams->width / 10) {
+                        BYTE *p1 = pBits + midRow * stride + sx * bytesPerPx;
+                        BYTE *p2 = pBits + qtrRow * stride + sx * bytesPerPx;
+                        if (p1[0] || p1[1] || p1[2] || p2[0] || p2[1] || p2[2]) {
+                            bAllBlack = FALSE;
+                        }
+                    }
+                    if (!bAllBlack) {
+                        bCaptured = TRUE;
+                        break;  /* SUCCESS — real content captured */
+                    }
+                    /* All-black: stale DC output, retry */
+                }
             }
             
-            /* BitBlt failed — clean up and retry */
+            /* BitBlt failed or produced black output — clean up and retry */
             SelectObject(hdcMemory, hBitmapOld);
             DeleteObject(hBitmap);
             hBitmap = NULL;
@@ -718,16 +748,24 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
             nConsecutiveNormal = 0;               /* Reset normal counter */
             
             if (!pCapture->pDesktopContext->bOnWinlogonDesktop) {
-                BOOL bSwitched;
+                BOOL bSwitched = FALSE;
                 ScreenLog("[CAPTURE] Winlogon detected - switching to Winlogon desktop\r\n");
-                bSwitched = Desktop_SwitchToWinlogon(pCapture->pDesktopContext);
-                if (!bSwitched) {
-                    /* First attempt failed - OS desktop transition may still be settling.
-                     * Retry once after a brief delay. In debug builds, the hundreds of
-                     * DebugLog file I/O calls inside SwitchToWinlogon provide ~200ms of
-                     * implicit delay. In release builds, we need this explicit retry. */
-                    Sleep(250);
+                /* FIX (v6.7): Wrap Desktop_SwitchToWinlogon in SEH.
+                 * The brute-force token scan inside this function manipulates
+                 * handles from SYSTEM processes (lsass, winlogon, csrss).
+                 * On some configurations, this can trigger an access violation
+                 * (e.g., invalid handle, stale kernel object) that would
+                 * terminate the entire process. SEH catches the fault and
+                 * lets the capture timer retry on the next frame. */
+                __try {
                     bSwitched = Desktop_SwitchToWinlogon(pCapture->pDesktopContext);
+                    if (!bSwitched) {
+                        Sleep(250);
+                        bSwitched = Desktop_SwitchToWinlogon(pCapture->pDesktopContext);
+                    }
+                } __except(EXCEPTION_EXECUTE_HANDLER) {
+                    ScreenLog("[CAPTURE] SEH: Desktop_SwitchToWinlogon crashed - will retry next frame\r\n");
+                    bSwitched = FALSE;
                 }
                 if (bSwitched) {
                     ScreenLog("[CAPTURE] Successfully switched to Winlogon desktop for capture\r\n");
