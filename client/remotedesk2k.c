@@ -386,15 +386,20 @@ static void LoadClientConfig(void) {
 
 /* FIX (v6.10): Crash handler for graceful disconnect.
  * If the process hits an unhandled exception (e.g., AV in a code path
- * not wrapped with SEH), try to send a DISCONNECT to the relay so the
- * remote partner gets notified immediately instead of waiting for TCP
- * keepalive timeout (up to 2 hours on Win2000). */
+ * not wrapped with SEH), close the relay socket so the relay server
+ * detects the TCP reset and notifies the remote partner immediately.
+ * FIX (v6.11): Use closesocket() instead of Relay_SendDisconnect().
+ * The old handler called send() during a crash — if the crash occurred
+ * inside an in-progress send() on the same socket, the handler's send
+ * caused undefined behavior and could block for SO_SNDTIMEO seconds
+ * while the input thread ran on the Winlogon desktop (crashing Win2000). */
 static LONG WINAPI RD2K_CrashHandler(EXCEPTION_POINTERS *pExInfo)
 {
     (void)pExInfo;
     __try {
         if (g_relaySocket != INVALID_SOCKET) {
-            Relay_SendDisconnect(g_relaySocket);
+            closesocket(g_relaySocket);
+            g_relaySocket = INVALID_SOCKET;
         }
     }
     __except(EXCEPTION_EXECUTE_HANDLER) {
@@ -2566,10 +2571,13 @@ void SendScreenUpdate(void)
      * 1800 individual 32x32 tiles is catastrophically slow: each requires
      * compress/send overhead, and flooding the TCP buffer causes send() to
      * block. Collapse into full-width bands under the relay buffer limit.
-     * FIX (v6.9): Raised from 450KB to 1800KB now that RELAY_BUFFER_SIZE
-     * is 2MB — bigger bands = fewer packets = less relay overhead. */
+     * FIX (v6.11): Reduced from 1800KB to 256KB.  The old 1800KB bands
+     * produced ~3 enormous send() calls that blocked the UI thread for
+     * 7+ seconds on relay connections — freezing the app, killing the
+     * capture timer, and crashing Win2000 during Winlogon transitions.
+     * Smaller bands keep individual send() calls under ~100ms. */
     if (numRects > 100) {
-        int maxBandBytes = 1800 * 1024;
+        int maxBandBytes = 256 * 1024;
         int rowBytes = g_pCapture->width * bytesPerPixel;
         int bandHeight;
         int bandY, bh;
@@ -2592,10 +2600,29 @@ void SendScreenUpdate(void)
         }
     }
     
+    /* FIX (v6.11): Time-limit the send loop.  Each Network_SendPacket can
+     * block for seconds on a slow relay (SO_SNDTIMEO = 5s).  With 3 huge
+     * bands the UI thread was blocked for 7+ seconds, preventing WM_TIMER
+     * from firing again.  The pPrevFrame memcpy at the end of this function
+     * ensures that any un-sent bands will NOT be re-sent next tick — the
+     * viewer gets rapid successive incremental updates instead of one
+     * massive blocking burst. */
+    {
+    DWORD dwSendStart = GetTickCount();
+    
     for (i = 0; i < numRects; i++) {
         RD2K_RECT rectHeader;
         DWORD rectDataSize, compressedSize;
         int x, y, w, h, j;
+        
+        /* Time limit: don't block the UI thread for more than 1 second.
+         * Remaining bands are implicitly skipped; pPrevFrame update below
+         * ensures they won't appear dirty on the next timer tick. */
+        if (GetTickCount() - dwSendStart > 1000) {
+            sprintf(buf, "[SEND_SCREEN] Time limit reached after %d/%d rects - deferring\r\n", i, numRects);
+            DebugLog(buf);
+            break;
+        }
         
         /* Drain pending input every 5 rects to keep clicks responsive.
          * Without this, TIMER_NETWORK can't fire while SendScreenUpdate runs,
@@ -2663,6 +2690,7 @@ void SendScreenUpdate(void)
                           g_pServerNet->sendBuffer,
                           sizeof(rectHeader) + compressedSize);
     }
+    } /* end time-limited send block */
     
     if (g_pCapture->pPrevFrame && g_pCapture->pPixelData && g_pCapture->pixelDataSize > 0) {
         memcpy(g_pCapture->pPrevFrame, g_pCapture->pPixelData, g_pCapture->pixelDataSize);

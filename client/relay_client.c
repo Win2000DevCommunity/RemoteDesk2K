@@ -81,7 +81,14 @@ static int SendRelayPacket(SOCKET sock, BYTE msgType, const BYTE *data, DWORD da
         DWORD totalSent = 0;
         int retries = 0;
         while (totalSent < packetSize) {
+            /* FIX (v6.11): Limit to 16KB per send() call, matching
+             * Network_Send().  Without this, a single send() of a 500KB
+             * compressed band would block for SO_SNDTIMEO on congested
+             * relays, making the time-limit check in SendScreenUpdate
+             * ineffective. Small sends return quickly, letting the caller
+             * check elapsed time between bands. */
             int toSend = (int)(packetSize - totalSent);
+            if (toSend > 16384) toSend = 16384;
             result = send(sock, (const char*)(s_sendBuf + totalSent), toSend, 0);
             if (result == SOCKET_ERROR) {
                 int err = WSAGetLastError();
@@ -125,8 +132,12 @@ static void ConfigureRelaySocket(SOCKET sock)
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&opt, sizeof(opt));
     
     /* Set send timeout to prevent send() from blocking forever
-     * when the relay connection becomes congested or drops. */
-    opt = 5000;
+     * when the relay connection becomes congested or drops.
+     * FIX (v6.11): Reduced from 5s to 2s.  During Winlogon full-screen
+     * transitions, multiple large band sends could each block for up to
+     * SO_SNDTIMEO seconds — freezing the UI thread for 7+ seconds total
+     * and killing the capture timer.  2s matches SO_RCVTIMEO. */
+    opt = 2000;
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&opt, sizeof(opt));
     
     /* Enable keep-alive */
