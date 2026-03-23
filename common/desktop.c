@@ -1072,23 +1072,27 @@ BOOL Desktop_SwitchToWinlogon(PDESKTOP_CONTEXT pDesktop)
         return TRUE;
     }
     
-    /* Allow OS desktop transition to settle before attempting to access
-     * the Winlogon desktop. In debug builds, logging I/O (fopen/fprintf/fclose
-     * per DebugLog call, ~50 calls in this function) provides ~200ms of implicit
-     * delay distributed throughout. In release builds, this function runs in
-     * microseconds, often outrunning the OS desktop switch. This brief pause
-     * gives the OS time to finalize the Winlogon desktop transition. */
-    Sleep(200);
-    
-    /* ---- Attempt 1: Direct OpenDesktop (no impersonation, no winsta switch) ---- */
-    hWinlogonDesktop = OpenDesktopA("Winlogon", 0, FALSE, DESKTOP_INPUT_ACCESS);
-    if (hWinlogonDesktop) {
-        DebugLog("[SwitchToWinlogon] Direct OpenDesktop succeeded (full access)\r\n");
-        goto got_desktop;
+    /* ---- Attempt 1: Direct OpenDesktop with adaptive retry ----
+     * In release builds this function runs in microseconds, outrunning the OS
+     * desktop transition. Instead of a blind Sleep(200), poll OpenDesktopA in
+     * a tight loop. Returns instantly when the desktop is already ready;
+     * worst-case ~200ms (20 x 10ms) if the OS is still transitioning. */
+    {
+        int openRetry;
+        for (openRetry = 0; openRetry < 20; openRetry++) {
+            hWinlogonDesktop = OpenDesktopA("Winlogon", 0, FALSE, DESKTOP_INPUT_ACCESS);
+            if (hWinlogonDesktop) {
+                DebugLog("[SwitchToWinlogon] Direct OpenDesktop succeeded (full access)\r\n");
+                goto got_desktop;
+            }
+            dwErr = GetLastError();
+            /* ACCESS_DENIED = need impersonation, don't waste time retrying */
+            if (dwErr == ERROR_ACCESS_DENIED) break;
+            Sleep(10);
+        }
+        sprintf(buf, "[SwitchToWinlogon] Direct OpenDesktop failed after %d tries (error %lu)\r\n", openRetry, dwErr);
+        DebugLog(buf);
     }
-    dwErr = GetLastError();
-    sprintf(buf, "[SwitchToWinlogon] Direct OpenDesktop failed (error %lu)\r\n", dwErr);
-    DebugLog(buf);
     
     /* ---- Attempt 2: Try OpenInputDesktop (opens whatever desktop has input focus) ---- */
     hWinlogonDesktop = OpenInputDesktop(0, FALSE, DESKTOP_INPUT_ACCESS);

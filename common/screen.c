@@ -187,11 +187,11 @@ static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
     
     /* FIX (v6.6): DYNAMIC RETRY LOOP replaces blind Sleep().
      * Instead of guessing how long the OS needs to finalize the desktop
-     * graphics context (30ms too short in release, 100ms still fails on
-     * 3rd entry), we POLL: try GetDC+BitBlt in a loop with short sleeps.
-     * This is deterministic — adapts to actual hardware/OS speed.
-     * Max 500ms total (50 retries × 10ms). Typical success: 10-50ms. */
-    #define CAPTURE_RETRY_MAX    50
+     * graphics context, we POLL: try GetDC+BitBlt in a loop with short
+     * sleeps. This is deterministic — adapts to actual hardware/OS speed.
+     * Max ~1s total (100 retries × 10ms). Typical success: 10-50ms.
+     * Doubled from 50 retries to handle slow machines / slow transitions. */
+    #define CAPTURE_RETRY_MAX    100
     #define CAPTURE_RETRY_SLEEP  10
     {
         char deskName[128] = {0};
@@ -220,13 +220,13 @@ static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
          * The OS graphics context finalizes asynchronously after
          * SetThreadDesktop, so we poll until it's ready.
          *
-         * CRITICAL: The first attempt MUST wait for the OS to begin
+         * CRITICAL: The first attempt waits briefly for the OS to begin
          * finalizing the desktop graphics context. Without any initial
          * delay, GetDC+BitBlt can return TRUE with all-black pixels
-         * (stale DC from previous desktop). 50ms lets the OS start
+         * (stale DC from previous desktop). 20ms lets the OS start
          * the switch; the retry loop handles the remaining variance. */
         for (captureRetry = 0; captureRetry < CAPTURE_RETRY_MAX; captureRetry++) {
-            Sleep(captureRetry == 0 ? 50 : CAPTURE_RETRY_SLEEP);
+            Sleep(captureRetry == 0 ? 20 : CAPTURE_RETRY_SLEEP);
             
             hdcScreen = GetDC(NULL);
             if (!hdcScreen) continue;
@@ -759,10 +759,6 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
                  * lets the capture timer retry on the next frame. */
                 __try {
                     bSwitched = Desktop_SwitchToWinlogon(pCapture->pDesktopContext);
-                    if (!bSwitched) {
-                        Sleep(250);
-                        bSwitched = Desktop_SwitchToWinlogon(pCapture->pDesktopContext);
-                    }
                 } __except(EXCEPTION_EXECUTE_HANDLER) {
                     ScreenLog("[CAPTURE] SEH: Desktop_SwitchToWinlogon crashed - will retry next frame\r\n");
                     bSwitched = FALSE;
@@ -915,18 +911,19 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
             return RD2K_SUCCESS;
         }
         
-        /* Worker thread has its own retry loop (up to 500ms of GetDC+BitBlt
-         * retries). If it STILL fails, the desktop handle or token is stale.
-         * Re-check the actual desktop state to decide what to do. */
+        /* Worker thread has its own retry loop (up to 1s of GetDC+BitBlt
+         * retries). If it STILL fails repeatedly, the desktop handle or token
+         * is stale. Allow 4 attempts (4 timer frames ≈ 400ms between retries)
+         * before tearing down and re-acquiring from scratch. */
         nWorkerConsecutiveFailures++;
         
-        if (nWorkerConsecutiveFailures >= 2) {
+        if (nWorkerConsecutiveFailures >= 4) {
             DESKTOP_STATE eRecheck = Desktop_DetectState(pCapture->pDesktopContext);
             if (eRecheck == DESKTOP_STATE_WINLOGON) {
                 /* OS confirms still on Winlogon but worker fails repeatedly.
                  * The desktop handle or token is stale. Tear down and let
                  * the NEXT frame do a fresh SwitchToWinlogon from scratch. */
-                ScreenLog("[CAPTURE] Worker failed 2x - forcing re-acquisition\r\n");
+                ScreenLog("[CAPTURE] Worker failed 4x - forcing re-acquisition\r\n");
                 Input_ClearWinlogonDesktop();
                 Desktop_RestoreHome(pCapture->pDesktopContext);
                 pCapture->pDesktopContext->bOnWinlogonDesktop = FALSE;
@@ -937,7 +934,7 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
                 dwLastWinlogonTime = GetTickCount();
             } else {
                 /* OS left Winlogon — clear debounce for immediate exit */
-                ScreenLog("[CAPTURE] Worker failed 2x and OS left Winlogon - clearing debounce\r\n");
+                ScreenLog("[CAPTURE] Worker failed 4x and OS left Winlogon - clearing debounce\r\n");
                 dwLastWinlogonTime = 0;
             }
             nWorkerConsecutiveFailures = 0;
