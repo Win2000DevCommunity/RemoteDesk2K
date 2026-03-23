@@ -57,7 +57,7 @@ typedef int         SOCKET;
 /* Relay configuration */
 #define RELAY_DEFAULT_PORT          5000
 #define RELAY_MAX_CONNECTIONS       1024
-#define RELAY_BUFFER_SIZE           (512 * 1024)    /* 512KB - must handle large screen updates */
+#define RELAY_BUFFER_SIZE           (2 * 1024 * 1024)  /* 2MB - must handle large screen updates */
 #define RELAY_CONNECTION_TIMEOUT    300000
 
 /* Relay message types */
