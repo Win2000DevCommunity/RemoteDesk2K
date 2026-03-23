@@ -491,7 +491,7 @@ BOOL ScreenCapture_SyncDisplayMode(PSCREEN_CAPTURE pCapture)
         
         /* Allocate new buffers (recursive pattern - allocate all before freeing old) */
         pNewPixelData = (BYTE*)calloc(1, newPixelDataSize);
-        pNewPrevFrame = (BYTE*)calloc(1, newPixelDataSize);
+        pNewPrevFrame = (BYTE*)malloc(newPixelDataSize);
         pNewCompressBuffer = (BYTE*)calloc(1, newCompressBufferSize);
         
         if (!pNewPixelData || !pNewPrevFrame || !pNewCompressBuffer) {
@@ -502,6 +502,13 @@ BOOL ScreenCapture_SyncDisplayMode(PSCREEN_CAPTURE pCapture)
             if (pNewCompressBuffer) free(pNewCompressBuffer);
             return FALSE;
         }
+        
+        /* FIX (v6.10): Initialize pPrevFrame to 0xFF (white) to force first-frame
+         * detection after a resolution change.  The old code used calloc (0x00),
+         * which meant black screen areas matched pPrevFrame and were never sent,
+         * causing a "black band" on the viewer at startup or after any display
+         * mode change (e.g., DDraw sync reports different size than WORKAREA). */
+        memset(pNewPrevFrame, 0xFF, newPixelDataSize);
         
         /* Recursive cleanup pattern: free old buffers after successful allocation */
         SAFE_FREE(pCapture->pPixelData);
@@ -832,12 +839,35 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
                      * stay in DISABLED mode even after returning to normal desktop. */
                     pCapture->pDesktopContext->eCaptureMode = CAPTURE_MODE_TOKEN_HIJACKING;
                     pCapture->pDesktopContext->dwCaptureFailures = 0;
+                    /* FIX (v6.10): Invalidate pPrevFrame to force full-screen update.
+                     * Without this, stale Winlogon pixels in pPrevFrame cause delta
+                     * detection to miss regions that look similar, resulting in
+                     * "confused screen" with Winlogon remnants mixed into the
+                     * normal desktop.  memset to 0xFF forces FindDirtyRects to
+                     * treat every pixel as changed on the next frame. */
+                    if (pCapture->pPrevFrame) {
+                        memset(pCapture->pPrevFrame, 0xFF, pCapture->pixelDataSize);
+                    }
                     ScreenLog("[CAPTURE] Home desktop restored, capture mode reset, DirectDraw will re-init\r\n");
                 }
             }
         } else if (eDesktopState == DESKTOP_STATE_UAC_ACTIVE) {
             bForceGDI = TRUE;  /* DirectDraw also fails on UAC desktop */
             ScreenLog("[CAPTURE] UAC desktop detected - forcing GDI capture\r\n");
+        } else if (eDesktopState == DESKTOP_STATE_UNAVAILABLE) {
+            /* FIX (v6.10): Desktop state unknown - DDraw surfaces may be stale.
+             * Force GDI fallback which is more resilient to desktop switches.
+             * This prevents AV crashes when DDraw tries to lock an invalid
+             * primary surface after a desktop switch (screensaver/lock/etc). */
+            bForceGDI = TRUE;
+            ScreenLog("[CAPTURE] Desktop unavailable - forcing GDI capture\r\n");
+        } else if (eDesktopState == DESKTOP_STATE_SCREENSAVER) {
+            /* FIX (v6.10): Screensaver running on separate desktop.
+             * Our thread is on Default desktop, so GDI still captures
+             * the real desktop.  Force GDI to avoid DDraw surface issues
+             * that occur when the input desktop differs from ours. */
+            bForceGDI = TRUE;
+            ScreenLog("[CAPTURE] Screensaver desktop detected - forcing GDI capture\r\n");
         }
     }
     

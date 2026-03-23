@@ -192,6 +192,18 @@ DESKTOP_STATE Desktop_DetectState(PDESKTOP_CONTEXT pDesktop)
         return DESKTOP_STATE_WINLOGON;
     }
     
+    /* FIX (v6.10): Detect screensaver desktop.
+     * On Windows 2000/XP, password-protected screensavers run on a separate
+     * desktop named "Screen-saver". DDraw surfaces created for the Default
+     * desktop may become invalid when the screensaver desktop is active.
+     * Detect this to force GDI capture and avoid DDraw AV crashes. */
+    if (_stricmp(szInputDesktopName, "Screen-saver") == 0 ||
+        _stricmp(szInputDesktopName, "Screensaver") == 0) {
+        DebugLog("[DetectState] Input desktop is screensaver - returning SCREENSAVER\r\n");
+        pDesktop->eCurrentState = DESKTOP_STATE_SCREENSAVER;
+        return DESKTOP_STATE_SCREENSAVER;
+    }
+    
     pDesktop->eCurrentState = DESKTOP_STATE_NORMAL;
     return DESKTOP_STATE_NORMAL;
 }
@@ -1564,6 +1576,7 @@ const char* Desktop_StateToString(DESKTOP_STATE eState)
         case DESKTOP_STATE_UAC_ACTIVE:   return "UAC_ACTIVE";
         case DESKTOP_STATE_WINLOGON:     return "WINLOGON";
         case DESKTOP_STATE_UNAVAILABLE:  return "UNAVAILABLE";
+        case DESKTOP_STATE_SCREENSAVER:  return "SCREENSAVER";
         default:                         return "UNKNOWN";
     }
 }

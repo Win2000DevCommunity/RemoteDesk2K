@@ -384,6 +384,25 @@ static void LoadClientConfig(void) {
     }
 }
 
+/* FIX (v6.10): Crash handler for graceful disconnect.
+ * If the process hits an unhandled exception (e.g., AV in a code path
+ * not wrapped with SEH), try to send a DISCONNECT to the relay so the
+ * remote partner gets notified immediately instead of waiting for TCP
+ * keepalive timeout (up to 2 hours on Win2000). */
+static LONG WINAPI RD2K_CrashHandler(EXCEPTION_POINTERS *pExInfo)
+{
+    (void)pExInfo;
+    __try {
+        if (g_relaySocket != INVALID_SOCKET) {
+            Relay_SendDisconnect(g_relaySocket);
+        }
+    }
+    __except(EXCEPTION_EXECUTE_HANDLER) {
+        /* Ignore any exception during cleanup */
+    }
+    return EXCEPTION_CONTINUE_SEARCH;  /* Let default handler terminate */
+}
+
 /* Entry Point */
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                    LPSTR lpCmdLine, int nCmdShow)
@@ -428,6 +447,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     
     /* Initialize capture protection critical section */
     InitializeCriticalSection(&g_csCaptureProtection);
+    
+    /* FIX (v6.10): Install crash handler for graceful disconnect notification */
+    SetUnhandledExceptionFilter(RD2K_CrashHandler);
     
     /* Initialize session manager for centralized connection state */
     Session_Initialize();
@@ -2502,16 +2524,31 @@ void SendScreenUpdate(void)
     /* THREAD-SAFE CAPTURE: Protect g_pCapture with critical section
      * The IPC handler thread will call SafeReadCaptureState() to read this data
      * while we're updating it here in the main thread. */
-    EnterCriticalSection(&g_csCaptureProtection);
-    __try {
-        if (ScreenCapture_CaptureScreen(g_pCapture) != RD2K_SUCCESS) {
+    {
+        int captureResult = RD2K_ERR_SCREEN;
+        EnterCriticalSection(&g_csCaptureProtection);
+        /* FIX (v6.10): Use __try/__except instead of __try/__finally.
+         * The old __try/__finally only guaranteed CS release but did NOT
+         * catch exceptions.  If ScreenCapture_CaptureScreen hit an access
+         * violation (e.g., stale DDraw surface after desktop switch during
+         * screensaver/lock), the AV propagated through WM_TIMER and
+         * terminated the process - the "app exits on screensaver" bug.
+         * __try/__except catches the fault, lets us release the CS, and
+         * returns failure so the next timer tick can retry cleanly. */
+        __try {
+            captureResult = ScreenCapture_CaptureScreen(g_pCapture);
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER) {
+            DebugLog("[SEND_SCREEN] SEH: Exception caught in ScreenCapture_CaptureScreen - recovering\r\n");
+            captureResult = RD2K_ERR_SCREEN;
+        }
+        LeaveCriticalSection(&g_csCaptureProtection);
+        
+        if (captureResult != RD2K_SUCCESS) {
             DebugLog("[SEND_SCREEN] ScreenCapture_CaptureScreen FAILED\r\n");
             bInSendScreenUpdate = FALSE;
             return;
         }
-    }
-    __finally {
-        LeaveCriticalSection(&g_csCaptureProtection);
     }
     
     DebugLog("[SEND_SCREEN] Screen captured successfully\r\n");

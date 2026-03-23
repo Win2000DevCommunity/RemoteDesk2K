@@ -27,7 +27,8 @@ typedef enum {
     DESKTOP_STATE_NORMAL = 0,        /* Normal user desktop */
     DESKTOP_STATE_UAC_ACTIVE = 1,    /* UAC/Secure desktop active */
     DESKTOP_STATE_WINLOGON = 2,      /* Winlogon (login screen) */
-    DESKTOP_STATE_UNAVAILABLE = 3    /* Desktop not accessible */
+    DESKTOP_STATE_UNAVAILABLE = 3,   /* Desktop not accessible */
+    DESKTOP_STATE_SCREENSAVER = 4    /* Screensaver running on separate desktop */
 } DESKTOP_STATE;
 
 /* Capture mode fallback levels (multi-layer strategy) */
