@@ -432,8 +432,11 @@ int Network_RecvExact(PRD2K_NETWORK pNet, BYTE *buffer, DWORD length)
 int Network_SendPacket(PRD2K_NETWORK pNet, BYTE msgType, const BYTE *data, DWORD dataLength)
 {
     RD2K_HEADER header;
-    BYTE *encryptedData = NULL;
     int result;
+    /* Reusable encryption buffer — avoids malloc+free per packet.
+     * In direct mode, every screen rect triggers encrypt+send. */
+    static BYTE *s_encBuf = NULL;
+    static DWORD s_encBufSize = 0;
     
     if (!pNet) return RD2K_ERR_SEND;
     
@@ -449,13 +452,15 @@ int Network_SendPacket(PRD2K_NETWORK pNet, BYTE msgType, const BYTE *data, DWORD
     if (data && dataLength > 0) {
         /* Encrypt data before sending (for direct connections) */
         if (!pNet->bRelayMode) {
-            encryptedData = (BYTE*)malloc(dataLength);
-            if (!encryptedData) return RD2K_ERR_MEMORY;
-            
-            CopyMemory(encryptedData, data, dataLength);
-            Crypto_Encrypt(encryptedData, dataLength);
-            result = Network_Send(pNet, encryptedData, dataLength);
-            free(encryptedData);
+            if (dataLength > s_encBufSize) {
+                BYTE *pNew = (BYTE*)realloc(s_encBuf, dataLength);
+                if (!pNew) return RD2K_ERR_MEMORY;
+                s_encBuf = pNew;
+                s_encBufSize = dataLength;
+            }
+            CopyMemory(s_encBuf, data, dataLength);
+            Crypto_Encrypt(s_encBuf, dataLength);
+            result = Network_Send(pNet, s_encBuf, dataLength);
         } else {
             /* Relay mode - encryption handled by relay layer */
             result = Network_Send(pNet, data, dataLength);

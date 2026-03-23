@@ -117,7 +117,6 @@ typedef struct _WINLOGON_CAPTURE_PARAMS {
     int     bitsPerPixel;   /* Color depth */
     BYTE   *pPixelData;     /* Output: caller's pixel buffer */
     DWORD   pixelDataSize;  /* Size of pixel buffer */
-    int     nSleepMs;       /* Adaptive sleep after SetThreadDesktop (ms) */
     int     result;         /* Output: 0=success, -1=failure */
     char    szError[256];   /* Output: error description */
 } WINLOGON_CAPTURE_PARAMS;
@@ -186,22 +185,23 @@ static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
         return 1;
     }
     
-    /* FIX (v6.5): Adaptive pause after SetThreadDesktop to let OS finalize
-     * desktop graphics context. In debug mode, ScreenLog file I/O provides
-     * implicit delay (~20ms). In release mode, ScreenLog is a no-op so the
-     * base sleep must be large enough on its own (100ms). The caller
-     * increases this on repeated failures and cools down on success. */
-    Sleep(pParams->nSleepMs);
-    
-    /* FIX (v6.4): VALIDATE desktop after SetThreadDesktop. On the second
-     * Winlogon entry (release only), SetThreadDesktop can return TRUE but
-     * the thread may still be associated with the Default desktop due to
-     * stale kernel-level desktop state from the previous session's handles.
-     * Detect this and return an error so the caller can re-acquire. */
+    /* FIX (v6.6): DYNAMIC RETRY LOOP replaces blind Sleep().
+     * Instead of guessing how long the OS needs to finalize the desktop
+     * graphics context (30ms too short in release, 100ms still fails on
+     * 3rd entry), we POLL: try GetDC+BitBlt in a loop with short sleeps.
+     * This is deterministic — adapts to actual hardware/OS speed.
+     * Max 500ms total (50 retries × 10ms). Typical success: 10-50ms. */
+    #define CAPTURE_RETRY_MAX    50
+    #define CAPTURE_RETRY_SLEEP  10
     {
         char deskName[128] = {0};
         DWORD dwLen = 0;
-        HDESK hCurDesk = GetThreadDesktop(GetCurrentThreadId());
+        HDESK hCurDesk;
+        int captureRetry;
+        BOOL bCaptured = FALSE;
+        
+        /* First validate we're actually on the Winlogon desktop */
+        hCurDesk = GetThreadDesktop(GetCurrentThreadId());
         GetUserObjectInformationA(hCurDesk, 2 /* UOI_NAME */, deskName, sizeof(deskName), &dwLen);
         ScreenLog("[WORKER] SetThreadDesktop SUCCESS\r\n");
         {
@@ -209,80 +209,89 @@ static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
             sprintf(logb, "[WORKER] Now on desktop: '%s' handle=0x%p\r\n", deskName, (void*)hCurDesk);
             ScreenLog(logb);
         }
-        /* VALIDATION: Ensure we're actually on the Winlogon desktop, not Default */
         if (deskName[0] != '\0' && _stricmp(deskName, "Winlogon") != 0) {
             sprintf(pParams->szError, "Worker: SetThreadDesktop OK but on '%s' not 'Winlogon'", deskName);
             if (pParams->hToken) RevertToSelf();
             return 1;
         }
-    }
-    
-    /* NOW GetDC(NULL) returns the Winlogon desktop's DC! */
-    hdcScreen = GetDC(NULL);
-    if (!hdcScreen) {
-        sprintf(pParams->szError, "Worker: GetDC(NULL) failed: %lu", GetLastError());
-        if (pParams->hToken) RevertToSelf();
-        return 1;
-    }
-    
-    hdcMemory = CreateCompatibleDC(hdcScreen);
-    if (!hdcMemory) {
-        sprintf(pParams->szError, "Worker: CreateCompatibleDC failed");
-        ReleaseDC(NULL, hdcScreen);
-        if (pParams->hToken) RevertToSelf();
-        return 1;
-    }
-    
-    /* Create DIB section */
-    ZeroMemory(&bmpInfo, sizeof(BITMAPINFO));
-    bmpInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmpInfo.bmiHeader.biWidth = pParams->width;
-    bmpInfo.bmiHeader.biHeight = -pParams->height;  /* top-down */
-    bmpInfo.bmiHeader.biPlanes = 1;
-    bmpInfo.bmiHeader.biBitCount = (WORD)pParams->bitsPerPixel;
-    bmpInfo.bmiHeader.biCompression = BI_RGB;
-    
-    hBitmap = CreateDIBSection(hdcMemory, &bmpInfo, DIB_RGB_COLORS,
-                               (void**)&pBits, NULL, 0);
-    if (!hBitmap || !pBits) {
-        sprintf(pParams->szError, "Worker: CreateDIBSection failed");
-        DeleteDC(hdcMemory);
-        ReleaseDC(NULL, hdcScreen);
-        if (pParams->hToken) RevertToSelf();
-        return 1;
-    }
-    
-    hBitmapOld = (HBITMAP)SelectObject(hdcMemory, hBitmap);
-    
-    /* BitBlt from Winlogon desktop to our DIB.
-     * FIX (v6.2): If BitBlt fails with ERROR_INVALID_HANDLE (6), the desktop
-     * DC may have been invalidated by a transient OS state change. Retry once
-     * after releasing and reacquiring the DC. */
-    if (!BitBlt(hdcMemory, 0, 0, pParams->width, pParams->height,
-                hdcScreen, 0, 0, SRCCOPY)) {
-        DWORD dwBltErr = GetLastError();
-        if (dwBltErr == 6) {  /* ERROR_INVALID_HANDLE - retry once */
-            ScreenLog("[WORKER] BitBlt failed error 6 - retrying with fresh DC\r\n");
-            ReleaseDC(NULL, hdcScreen);
-            Sleep(100);
-            hdcScreen = GetDC(NULL);
-            if (hdcScreen && BitBlt(hdcMemory, 0, 0, pParams->width, pParams->height,
-                                     hdcScreen, 0, 0, SRCCOPY)) {
-                ScreenLog("[WORKER] BitBlt retry SUCCEEDED\r\n");
-                goto bitblt_ok;
+        
+        /* RETRY LOOP: Attempt GetDC + CreateCompatibleDC + DIB + BitBlt.
+         * On each failure, release resources, sleep briefly, and retry.
+         * The OS graphics context finalizes asynchronously after
+         * SetThreadDesktop, so we poll until it's ready. */
+        for (captureRetry = 0; captureRetry < CAPTURE_RETRY_MAX; captureRetry++) {
+            if (captureRetry > 0) {
+                Sleep(CAPTURE_RETRY_SLEEP);
             }
-            dwBltErr = GetLastError();
+            
+            hdcScreen = GetDC(NULL);
+            if (!hdcScreen) continue;
+            
+            hdcMemory = CreateCompatibleDC(hdcScreen);
+            if (!hdcMemory) {
+                ReleaseDC(NULL, hdcScreen);
+                hdcScreen = NULL;
+                continue;
+            }
+            
+            /* Create DIB section */
+            ZeroMemory(&bmpInfo, sizeof(BITMAPINFO));
+            bmpInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bmpInfo.bmiHeader.biWidth = pParams->width;
+            bmpInfo.bmiHeader.biHeight = -pParams->height;  /* top-down */
+            bmpInfo.bmiHeader.biPlanes = 1;
+            bmpInfo.bmiHeader.biBitCount = (WORD)pParams->bitsPerPixel;
+            bmpInfo.bmiHeader.biCompression = BI_RGB;
+            
+            hBitmap = CreateDIBSection(hdcMemory, &bmpInfo, DIB_RGB_COLORS,
+                                       (void**)&pBits, NULL, 0);
+            if (!hBitmap || !pBits) {
+                DeleteDC(hdcMemory);
+                hdcMemory = NULL;
+                ReleaseDC(NULL, hdcScreen);
+                hdcScreen = NULL;
+                continue;
+            }
+            
+            hBitmapOld = (HBITMAP)SelectObject(hdcMemory, hBitmap);
+            
+            if (BitBlt(hdcMemory, 0, 0, pParams->width, pParams->height,
+                        hdcScreen, 0, 0, SRCCOPY)) {
+                bCaptured = TRUE;
+                break;  /* SUCCESS */
+            }
+            
+            /* BitBlt failed — clean up and retry */
+            SelectObject(hdcMemory, hBitmapOld);
+            DeleteObject(hBitmap);
+            hBitmap = NULL;
+            pBits = NULL;
+            DeleteDC(hdcMemory);
+            hdcMemory = NULL;
+            ReleaseDC(NULL, hdcScreen);
+            hdcScreen = NULL;
         }
-        sprintf(pParams->szError, "Worker: BitBlt failed: %lu", dwBltErr);
-        SelectObject(hdcMemory, hBitmapOld);
-        DeleteObject(hBitmap);
-        if (hdcMemory) DeleteDC(hdcMemory);
-        if (hdcScreen) ReleaseDC(NULL, hdcScreen);
-        if (pParams->hToken) RevertToSelf();
-        return 1;
+        
+        if (!bCaptured) {
+            sprintf(pParams->szError, "Worker: BitBlt failed after %d retries", captureRetry);
+            /* Clean up any lingering resources */
+            if (hBitmap) {
+                SelectObject(hdcMemory, hBitmapOld);
+                DeleteObject(hBitmap);
+            }
+            if (hdcMemory) DeleteDC(hdcMemory);
+            if (hdcScreen) ReleaseDC(NULL, hdcScreen);
+            if (pParams->hToken) RevertToSelf();
+            return 1;
+        }
+        
+        {
+            char retryLog[128];
+            sprintf(retryLog, "[WORKER] BitBlt succeeded on attempt %d (~%dms)\r\n",
+                    captureRetry + 1, captureRetry * CAPTURE_RETRY_SLEEP);
+            ScreenLog(retryLog);
+        }
     }
-    
-    bitblt_ok:
     
     /* Copy pixels to caller's buffer using proper DWORD-aligned stride.
      * CreateDIBSection produces DWORD-aligned rows. We must copy row-by-row
@@ -341,16 +350,6 @@ static DWORD WINAPI WinlogonCaptureThread(LPVOID lpParam)
     return (pParams->result == 0) ? 0 : 1;
 }
 
-/* Adaptive worker sleep: starts at 100ms, grows on failure, cools down on success.
- * In debug builds, ScreenLog file I/O after SetThreadDesktop adds ~20-30ms of
- * implicit delay that helps the OS finalize the desktop graphics context. In
- * release builds, ScreenLog is a no-op, so the explicit sleep must be larger.
- * 100ms base works reliably in both modes. */
-#define WORKER_SLEEP_BASE_MS 100
-#define WORKER_SLEEP_MAX_MS  300
-#define WORKER_SLEEP_STEP_MS 50
-static int nWorkerSleepMs = WORKER_SLEEP_BASE_MS;
-
 /* DDraw consecutive failure counter - file scope so Winlogon exit can reset it.
  * After 3 consecutive failures, DDraw recovery is skipped. Reset on Winlogon
  * exit to give DDraw another chance with a fresh desktop context. */
@@ -379,7 +378,6 @@ static int ScreenCapture_CaptureWinlogonWorker(PSCREEN_CAPTURE pCapture)
     params.bitsPerPixel = pCapture->bitsPerPixel;
     params.pPixelData = pCapture->pPixelData;
     params.pixelDataSize = pCapture->pixelDataSize;
-    params.nSleepMs = nWorkerSleepMs;
     params.result = -1;
     
     hThread = CreateThread(NULL, 0, WinlogonCaptureThread, &params, 0, NULL);
@@ -876,63 +874,29 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
         if (ScreenCapture_CaptureWinlogonWorker(pCapture) == 0) {
             ScreenLog("[CAPTURE] Worker thread Winlogon capture SUCCESS\r\n");
             nWorkerConsecutiveFailures = 0;
-            /* Cool down gradually instead of hard-resetting to base.
-             * Hard reset caused release-mode regression: base (30ms) was too
-             * short without ScreenLog I/O delays, so every frame after a
-             * successful one failed, giving ~20% capture rate. Gradual
-             * cool-down settles at the minimum working value. */
-            if (nWorkerSleepMs > WORKER_SLEEP_BASE_MS) {
-                nWorkerSleepMs -= WORKER_SLEEP_STEP_MS;
-                if (nWorkerSleepMs < WORKER_SLEEP_BASE_MS)
-                    nWorkerSleepMs = WORKER_SLEEP_BASE_MS;
-            }
             return RD2K_SUCCESS;
         }
         
-        /* FIX (v6.2): Do NOT fall through to normal GDI when worker fails.
-         * The main thread is on Default desktop, so GDI would capture the
-         * WRONG desktop (Default instead of Winlogon). */
+        /* Worker thread has its own retry loop (up to 500ms of GetDC+BitBlt
+         * retries). If it STILL fails, the desktop handle or token is stale.
+         * Re-check the actual desktop state to decide what to do. */
         nWorkerConsecutiveFailures++;
         
-        /* FIX (v6.3): Intelligent adaptive retry. Instead of blindly clearing
-         * debounce after 2 failures (which caused release-mode regression —
-         * worker failed because Sleep was too short, then debounce got cleared,
-         * then Winlogon was abandoned even though the OS was still on it),
-         * we now RE-CHECK the actual desktop state before deciding what to do.
-         *
-         * - If OS is still on Winlogon: increase worker sleep (self-tuning)
-         *   and keep retrying. The failure was a timing issue, not stale handle.
-         * - If OS left Winlogon: clear debounce for fast exit. */
         if (nWorkerConsecutiveFailures >= 2) {
             DESKTOP_STATE eRecheck = Desktop_DetectState(pCapture->pDesktopContext);
             if (eRecheck == DESKTOP_STATE_WINLOGON) {
-                if (nWorkerSleepMs >= WORKER_SLEEP_MAX_MS) {
-                    /* FIX (v6.4): INTELLIGENT RECURSIVE RE-ACQUISITION.
-                     * Sleep is already at max and worker still fails. The
-                     * desktop handle or token is stale (common on second
-                     * Winlogon entry in release mode). Tear down the
-                     * entire Winlogon state and let the NEXT frame do a
-                     * fresh SwitchToWinlogon from scratch. This is the
-                     * "recursive" fix — rebuild the capture stack. */
-                    ScreenLog("[CAPTURE] Worker failed at max sleep - forcing re-acquisition\r\n");
-                    Input_ClearWinlogonDesktop();
-                    Desktop_RestoreHome(pCapture->pDesktopContext);
-                    pCapture->pDesktopContext->bOnWinlogonDesktop = FALSE;
-                    if (pCapture->pDesktopContext->hWinlogonDesktop) {
-                        CloseDesktop(pCapture->pDesktopContext->hWinlogonDesktop);
-                        pCapture->pDesktopContext->hWinlogonDesktop = NULL;
-                    }
-                    nWorkerSleepMs = WORKER_SLEEP_BASE_MS;
-                    dwLastWinlogonTime = GetTickCount();
-                } else {
-                    /* OS confirms still on Winlogon — failure is a timing issue.
-                     * Increase the adaptive sleep so the next worker attempt
-                     * gives more time for SetThreadDesktop to finalize. */
-                    nWorkerSleepMs = nWorkerSleepMs + WORKER_SLEEP_STEP_MS;
-                    if (nWorkerSleepMs > WORKER_SLEEP_MAX_MS)
-                        nWorkerSleepMs = WORKER_SLEEP_MAX_MS;
-                    ScreenLog("[CAPTURE] Worker failed 2x but OS still on Winlogon - increasing sleep\r\n");
+                /* OS confirms still on Winlogon but worker fails repeatedly.
+                 * The desktop handle or token is stale. Tear down and let
+                 * the NEXT frame do a fresh SwitchToWinlogon from scratch. */
+                ScreenLog("[CAPTURE] Worker failed 2x - forcing re-acquisition\r\n");
+                Input_ClearWinlogonDesktop();
+                Desktop_RestoreHome(pCapture->pDesktopContext);
+                pCapture->pDesktopContext->bOnWinlogonDesktop = FALSE;
+                if (pCapture->pDesktopContext->hWinlogonDesktop) {
+                    CloseDesktop(pCapture->pDesktopContext->hWinlogonDesktop);
+                    pCapture->pDesktopContext->hWinlogonDesktop = NULL;
                 }
+                dwLastWinlogonTime = GetTickCount();
             } else {
                 /* OS left Winlogon — clear debounce for immediate exit */
                 ScreenLog("[CAPTURE] Worker failed 2x and OS left Winlogon - clearing debounce\r\n");
@@ -940,11 +904,7 @@ int ScreenCapture_CaptureScreen(PSCREEN_CAPTURE pCapture)
             }
             nWorkerConsecutiveFailures = 0;
         } else {
-            /* First failure: increase sleep slightly for next attempt */
-            nWorkerSleepMs = nWorkerSleepMs + WORKER_SLEEP_STEP_MS;
-            if (nWorkerSleepMs > WORKER_SLEEP_MAX_MS)
-                nWorkerSleepMs = WORKER_SLEEP_MAX_MS;
-            ScreenLog("[CAPTURE] Worker thread capture failed - increasing sleep, will retry next frame\r\n");
+            ScreenLog("[CAPTURE] Worker thread capture failed - will retry next frame\r\n");
         }
         return RD2K_ERR_SCREEN;
     }
@@ -1218,19 +1178,10 @@ int FindDirtyRects(const BYTE *pOldFrame, const BYTE *pNewFrame,
     int blockSize = 32;
     int stride = ((width * bytesPerPixel + 3) & ~3);
     int bx, by;
-    char buf[256];
-    
-    sprintf(buf, "[FINDDIRTY] ENTER: old=%p new=%p w=%d h=%d bpp=%d max=%d\r\n", 
-            (void*)pOldFrame, (void*)pNewFrame, width, height, bytesPerPixel, maxRects);
-    ScreenLog(buf);
     
     if (!pOldFrame || !pNewFrame || !pRects || maxRects <= 0) {
-        ScreenLog("[FINDDIRTY] EARLY EXIT: null pointer or invalid maxRects\r\n");
         return 0;
     }
-    
-    sprintf(buf, "[FINDDIRTY] Starting scan loop: stride=%d blockSize=%d\r\n", stride, blockSize);
-    ScreenLog(buf);
     
     for (by = 0; by < height && numRects < maxRects; by += blockSize) {
         for (bx = 0; bx < width && numRects < maxRects; bx += blockSize) {
@@ -1247,10 +1198,6 @@ int FindDirtyRects(const BYTE *pOldFrame, const BYTE *pNewFrame,
             }
             
             if (dirty) {
-                sprintf(buf, "[FINDDIRTY] Found dirty block at (%d,%d) size %dx%d - rect %d\r\n", 
-                        bx, by, blockW, blockH, numRects);
-                ScreenLog(buf);
-                
                 pRects[numRects].left = bx;
                 pRects[numRects].top = by;
                 pRects[numRects].right = bx + blockW;
@@ -1259,9 +1206,6 @@ int FindDirtyRects(const BYTE *pOldFrame, const BYTE *pNewFrame,
             }
         }
     }
-    
-    sprintf(buf, "[FINDDIRTY] COMPLETE: found %d rectangles\r\n", numRects);
-    ScreenLog(buf);
     
     return numRects;
 }

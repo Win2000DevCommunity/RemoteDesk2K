@@ -43,30 +43,37 @@ static int WaitForSocketReady(SOCKET sock, BOOL bWrite, int timeoutMs)
 static int SendRelayPacket(SOCKET sock, BYTE msgType, const BYTE *data, DWORD dataLength)
 {
     RELAY_HEADER header;
-    BYTE *packet;
     DWORD packetSize;
     int result;
+    /* Reusable send buffer — avoids malloc+free per packet. During screen
+     * updates, this is called 9-500+ times per frame (once per dirty rect).
+     * Malloc overhead was a major source of lag when browsing Explorer. */
+    static BYTE *s_sendBuf = NULL;
+    static DWORD s_sendBufSize = 0;
     
     if (sock == INVALID_SOCKET) return RD2K_ERR_SOCKET;
     
     packetSize = sizeof(RELAY_HEADER) + dataLength;
-    packet = (BYTE*)malloc(packetSize);
-    if (!packet) return RD2K_ERR_MEMORY;
+    if (packetSize > s_sendBufSize) {
+        BYTE *pNew = (BYTE*)realloc(s_sendBuf, packetSize);
+        if (!pNew) return RD2K_ERR_MEMORY;
+        s_sendBuf = pNew;
+        s_sendBufSize = packetSize;
+    }
     
     header.msgType = msgType;
     header.flags = 0x01;  /* Flag: encrypted */
     header.reserved = 0;
     header.dataLength = dataLength;
     
-    CopyMemory(packet, &header, sizeof(RELAY_HEADER));
+    CopyMemory(s_sendBuf, &header, sizeof(RELAY_HEADER));
     if (data && dataLength > 0) {
-        CopyMemory(packet + sizeof(RELAY_HEADER), data, dataLength);
+        CopyMemory(s_sendBuf + sizeof(RELAY_HEADER), data, dataLength);
         /* XOR encrypt the data portion */
-        Crypto_Encrypt(packet + sizeof(RELAY_HEADER), dataLength);
+        Crypto_Encrypt(s_sendBuf + sizeof(RELAY_HEADER), dataLength);
     }
     
-    result = send(sock, (const char*)packet, packetSize, 0);
-    free(packet);
+    result = send(sock, (const char*)s_sendBuf, packetSize, 0);
     
     if (result == SOCKET_ERROR) {
         return RD2K_ERR_SEND;
